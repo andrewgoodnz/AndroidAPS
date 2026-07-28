@@ -299,3 +299,8 @@ a stable `pumpId`, which is what makes reconnect dedup work.
   `FileSystemException: ... used by another process`.
 - `JAVA_HOME` must be set for `gradlew.bat`; the Android Studio JBR
   (`C:\Program Files\Android\Android Studio\jbr`) works.
+- `:app:kspFullDebugKotlin` can fail spuriously with
+  `ComponentProcessingStep was unable to process 'app.aaps.di.AppComponent' because
+  'app.aaps.di.ActivitiesModule_ContributesHistoryBrowseActivity' could not be resolved` after the
+  build inputs change underneath a stale incremental state. It is not a real error — the named type
+  is unrelated Dagger-generated code. `./gradlew :app:clean` then rebuild fixes it.
