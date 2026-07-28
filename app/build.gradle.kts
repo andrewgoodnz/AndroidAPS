@@ -196,6 +196,7 @@ dependencies {
     implementation(project(":pump:omnipod:dash"))
     implementation(project(":pump:rileylink"))
     implementation(project(":pump:virtual"))
+    implementation(project(":pump:ypsopump"))
     implementation(project(":workflow"))
 
     testImplementation(project(":shared:tests"))

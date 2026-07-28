@@ -1,0 +1,733 @@
+package app.aaps.pump.ypsopump.handlers
+
+import com.google.gson.Gson
+import com.google.gson.GsonBuilder
+import dagger.android.HasAndroidInjector
+import app.aaps.core.data.model.BS
+import app.aaps.core.data.model.TE
+import app.aaps.core.interfaces.pump.DetailedBolusInfo
+import app.aaps.core.interfaces.profile.Profile
+import app.aaps.core.interfaces.pump.PumpSync
+import app.aaps.pump.common.defs.PumpRunningState
+import app.aaps.core.data.pump.defs.PumpType
+import app.aaps.pump.common.defs.TempBasalPair
+import app.aaps.core.utils.DateTimeUtil
+import app.aaps.core.utils.StringUtil
+import app.aaps.pump.ypsopump.comm.ble.defs.YpsoPumpNotificationType
+import app.aaps.pump.ypsopump.comm.data.LastEntryType
+import app.aaps.pump.ypsopump.comm.data.YpsoPumpStatusEntry
+import app.aaps.pump.ypsopump.data.*
+import app.aaps.pump.ypsopump.database.HistoryMapper
+import app.aaps.pump.ypsopump.database.HistoryRecordEntity
+import app.aaps.pump.ypsopump.database.YpsoPumpHistory
+import app.aaps.pump.ypsopump.defs.YpsoPumpEventType
+import app.aaps.pump.ypsopump.driver.YpsopumpPumpStatus
+import app.aaps.pump.ypsopump.util.YpsoPumpConst
+import app.aaps.pump.ypsopump.util.YpsoPumpUtil
+import app.aaps.core.interfaces.logging.AAPSLogger
+import app.aaps.core.interfaces.logging.LTag
+import java.util.*
+import java.util.stream.Collectors
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class YpsoPumpHistoryHandler @Inject constructor(var ypsoPumpHistory: YpsoPumpHistory,
+                                                 var pumpSync: PumpSync,
+                                                 var aapsLogger: AAPSLogger,
+                                                 var pumpStatus: YpsopumpPumpStatus,
+                                                 val historyMapper: HistoryMapper,
+                                                 var hasAndroidInjector: HasAndroidInjector,
+                                                 var pumpUtil: YpsoPumpUtil) {
+
+    /**
+     * On First read
+     *  - we need to determine the status of pump, so we need to get PUMP_MODE_CHANGED
+     *  - read from last record and all SequenceNumbers that are running
+     *
+     * On Every 5 minutes read:
+     *  - read all new records, and any records that were running in last read
+     *  - we process new entries, and make sure if we get PUMP_MODE_CHANGED
+     *
+     * After Action read:
+     *  - read new entries and send them to pumpSync
+     *  - reset 5 minutes read
+     */
+
+    var gson: Gson = GsonBuilder().setPrettyPrinting().create()
+
+    //var gsonNotPretty: Gson = GsonBuilder().setPrettyPrinting().create()
+    var prefix: String = "DB: "
+
+    fun getFullPumpHistory() {
+
+        Thread {
+
+            val pumpStatusValues = pumpStatus.getPumpStatusValuesForSelectedPump()
+
+            if (pumpStatusValues == null) {
+                aapsLogger.debug(LTag.PUMP, prefix + "PumpStatusValues could not be loaded, skipping history reading.")
+                return@Thread
+            }
+
+            if (!getPumpEvents(pumpStatusValues))
+                return@Thread
+
+            // TODO save
+
+            // TODO
+            if (true)
+                return@Thread
+
+            if (!getPumpAlarms(pumpStatusValues))
+                return@Thread
+
+            // TODO save
+            // TODO systemEntry we are ignoring this for now
+
+            //pumpStatus.setPumpStatusValues(pumpStatusValues)
+
+        }.start()
+    }
+
+    private fun getPumpEvents(pumpStatusValues: YpsoPumpStatusEntry): Boolean {
+        // events
+        val lastSequenceNumber: Int? = pumpStatusValues.lastEventSequenceNumber
+        var targetSequenceNumber: Int? = lastSequenceNumber
+
+        // if (lastSequenceNumber == null) { // this would be null only on first time
+        //     lastSequenceNumber = 0
+        //     targetSequenceNumber = 0
+        // }
+
+        var runningSequences = pumpStatusValues.runningEventsSequences
+
+        if (runningSequences == null) {
+            pumpStatusValues.runningEventsSequences = mutableSetOf()
+        } else {
+            if (lastSequenceNumber != null && lastSequenceNumber != 0) {
+                for (sequence in runningSequences) {
+                    if (targetSequenceNumber!! > sequence) {
+                        targetSequenceNumber = sequence
+                    }
+                }
+            }
+        }
+
+        aapsLogger.warn(LTag.PUMPCOMM, "DB: GetEvents")
+
+        // DEFERRED: Andy read events via his `GetEvents` BLE command against YpsoPumpBLE. That stack
+        // is not part of this port; history reading must come back through the connector seam
+        // (YpsoPumpConnectorInterface.getPumpHistory) once a real connector exists. Everything below
+        // this point - preprocessing, DB write, PumpSync fan-out - is Andy's original logic and is
+        // left intact so it is ready to receive events. See PORTING_NOTES.md.
+        val result = readEventsFromPump(targetSequenceNumber)
+
+        aapsLogger.warn(LTag.PUMPCOMM, prefix + "readEventsFromPump -> ${result != null}")
+
+        if (result != null) {
+            val dataEvents = result
+            var newLastEvent = 0
+            var runningSet: MutableSet<Int> = mutableSetOf()
+
+            if (dataEvents != null && dataEvents.size != 0) {
+                for (dataEvent in dataEvents) {
+                    if (dataEvent.eventSequenceNumber > newLastEvent) {
+                        newLastEvent = dataEvent.eventSequenceNumber
+                    }
+
+                    if (YpsoPumpEventType.isRunningEvent(dataEvent.entryType)) {
+                        runningSet.add(dataEvent.eventSequenceNumber)
+                    }
+                }
+
+                pumpStatusValues.lastEventSequenceNumber = newLastEvent
+                pumpStatusValues.runningEventsSequences = runningSet
+
+                aapsLogger.warn(LTag.PUMPCOMM, prefix + "Data Events size=${dataEvents.size}")
+                //aapsLogger.warn(LTag.PUMPCOMM, "DD: Data Events " + gson.toJson(dataEvents))
+
+                val events = preProcessHistory(dataEvents)
+
+                aapsLogger.warn(LTag.PUMPCOMM, prefix + "Preprocessed Events size=${events.size}")
+                //aapsLogger.warn(LTag.PUMPCOMM, "DD: Events, after preprocess: " + gson.toJson(events))
+
+                // // TODO
+                // if (true)
+                //     return@Thread
+
+                addHistoryToDatabase(
+                    entityList = events,
+                    sendToPumpSync = true,
+                    pumpStatusEntry = pumpStatusValues
+                )
+
+            }
+            return true
+
+        } else {
+            return false  // if any of commands fails we stop execution
+        }
+    }
+
+    /**
+     * DEFERRED: pump history reads. Returns null (= "read failed") until a real connector exists.
+     * See [getPumpEvents] and PORTING_NOTES.md.
+     */
+    private fun readEventsFromPump(fromSequenceNumber: Int?): MutableList<EventDto>? {
+        aapsLogger.warn(LTag.PUMPCOMM, prefix + "readEventsFromPump(from=$fromSequenceNumber): not implemented (no connector).")
+        return null
+    }
+
+    /**
+     * DEFERRED: see [readEventsFromPump].
+     */
+    private fun readAlarmsFromPump(fromSequenceNumber: Int?): MutableList<EventDto>? {
+        aapsLogger.warn(LTag.PUMPCOMM, prefix + "readAlarmsFromPump(from=$fromSequenceNumber): not implemented (no connector).")
+        return null
+    }
+
+    private fun getPumpAlarms(pumpStatusValues: YpsoPumpStatusEntry): Boolean {
+        // alarms
+
+        val resultAlarms = readAlarmsFromPump(
+            if (pumpStatusValues.lastAlarmSequenceNumber == 0) null else pumpStatusValues.lastAlarmSequenceNumber
+        )
+
+        if (resultAlarms != null) {
+            val dataEvents = resultAlarms
+            var newLastEvent = 0
+
+            if (dataEvents != null && dataEvents.size != 0) {
+                for (dataEvent in dataEvents) {
+                    if (dataEvent.eventSequenceNumber > newLastEvent) {
+                        newLastEvent = dataEvent.eventSequenceNumber
+                    }
+                }
+
+                //dataDump("DB DATA DUMP - ALARM", pumpUtil.gsonRegular.toJson(dataEvents))
+
+                pumpStatusValues.lastAlarmSequenceNumber = newLastEvent
+
+                addHistoryToDatabase(
+                    entityList = dataEvents,
+                    sendToPumpSync = false,
+                    pumpStatusEntry = pumpStatusValues
+                )
+            }
+
+            return true
+
+        } else {
+            return false  // if any of commands fails we stop execution
+        }
+    }
+
+    private fun preProcessHistory(dataEventsInput: MutableList<EventDto>): MutableList<EventDto> {
+
+        // TODO check if configuration changed and update it
+        // TODO basal profile changed put together...
+        // TODO preprocess TBRs for STOP/START of pump
+
+        //dataDump("DB DATA DUMP - EVENTS", pumpUtil.gsonRegular.toJson(dataEventsInput))
+
+        var historyProcessingDto: HistoryProcessingDto = HistoryProcessingDto(dataEventsInput)
+
+
+        aapsLogger.warn(LTag.PUMPCOMM, prefix + "Process - Before size=${dataEventsInput.size}")
+
+        var dataEvents = preProcessBasalProfiles(dataEventsInput)  // TODO
+
+        aapsLogger.warn(LTag.PUMPCOMM, prefix + "Process - After Basal Profiles [size=${dataEventsInput.size}]")
+
+        dataEvents = preProcessConfigurationItems(dataEvents)  // TODO
+
+        aapsLogger.warn(LTag.PUMPCOMM, prefix + "Process - After Configuration [size=${dataEventsInput.size}]")
+
+        dataEvents = preProcessDeliverySuspendItems(dataEvents)  // TODO
+
+        aapsLogger.warn(LTag.PUMPCOMM, prefix + "Process - After Delivery Suspend [size=${dataEventsInput.size}]")
+
+        // if (medtronicHistoryData.hasRelevantConfigurationChanged()) {
+        //     scheduleNextRefresh(MedtronicStatusRefreshType.Configuration, -1)
+        // }
+        // if (medtronicHistoryData.hasPumpTimeChanged()) {
+        //     scheduleNextRefresh(MedtronicStatusRefreshType.PumpTime, -1)
+        // }
+        // if (medtronicPumpStatus.basalProfileStatus !== BasalProfileStatus.NotInitialized
+        //     && medtronicHistoryData.hasBasalProfileChanged()) {
+        //     medtronicHistoryData.processLastBasalProfileChange(pumpDescription.pumpType, medtronicPumpStatus)
+        // }
+        // val previousState = pumpState
+        // if (medtronicHistoryData.isPumpSuspended()) {
+        //     pumpState = PumpDriverState.Suspended
+        //     aapsLogger.debug(LTag.PUMP, logPrefix + "isPumpSuspended: true")
+        // } else {
+        //     if (previousState === PumpDriverState.Suspended) {
+        //         pumpState = PumpDriverState.Ready
+        //     }
+        //     aapsLogger.debug(LTag.PUMP, logPrefix + "isPumpSuspended: false")
+        // }
+
+        // TODO 'Delivery Suspend'
+        // val suspends: MutableList<TempBasalProcessDTO>
+        // suspends = try {
+        //     getSuspendRecords()
+        // } catch (ex: Exception) {
+        //     aapsLogger.error("ProcessHistoryData: Error getting Suspend entries: " + ex.message, ex)
+        //     throw ex
+        // }
+        // aapsLogger.debug(LTag.PUMP, String.format(Locale.ENGLISH, "ProcessHistoryData: 'Delivery Suspend' Processed [count=%d, items=%s]", suspends.size,
+        //     gson.toJson(suspends)))
+        // if (suspends.isNotEmpty()) {
+        //     try {
+        //         processSuspends(suspends)  // TODO not tested yet
+        //     } catch (ex: Exception) {
+        //         aapsLogger.error(LTag.PUMP, "ProcessHistoryData: Error processing Suspends entries: " + ex.message, ex)
+        //         throw ex
+        //     }
+        // }
+
+        return dataEvents
+
+    }
+
+    private fun dataDump(prefix: String, data: String) {
+        val splitStringList = StringUtil.splitString(data, 3900)
+
+        var i = 1
+        for (entry in splitStringList) {
+            aapsLogger.warn(LTag.PUMPBTCOMM, "$prefix $i\n $entry")
+            i++
+        }
+    }
+
+    private fun preProcessBasalProfiles(historyProcessingDto: HistoryProcessingDto) {
+
+    }
+
+    private fun preProcessBasalProfiles(dataEvents: MutableList<EventDto>): MutableList<EventDto> {
+        // TODO DB - check if profiles correct
+        //val dataEvents = dataEventsInput
+
+        aapsLogger.debug(LTag.PUMPCOMM, prefix + "Full Events before: ${dataEvents.size}")
+
+        var listBasalProfiles = dataEvents.stream()
+            .filter { pre ->
+                pre.entryType == YpsoPumpEventType.BASAL_PROFILE_A_PATTERN_CHANGED ||
+                    pre.entryType == YpsoPumpEventType.BASAL_PROFILE_B_PATTERN_CHANGED
+            }
+            .collect(Collectors.toList())
+
+        aapsLogger.debug(LTag.PUMPCOMM, prefix + "Basal Items found: ${listBasalProfiles.size}")
+
+        //var basals: MutableMap<Long, MutableList<EventDto>> = mutableMapOf()
+
+        var basalProfilesNew: MutableList<EventDto> = mutableListOf()
+
+        var listFirstItems: MutableList<Int> = mutableListOf()
+
+        for (basalProfile in listBasalProfiles) {
+
+            var basalProfilePattern = basalProfile.subObject as BasalProfileEntry
+
+            if (basalProfilePattern.hour == 0) {
+                listFirstItems.add(basalProfile.eventSequenceNumber)
+            }
+        }
+
+        aapsLogger.debug(LTag.PUMPCOMM, prefix + "Basal first Items found: ${listFirstItems.size}")
+
+        //var listProfiles: MutableList<BasalProfilePatternDto> = mutableListOf()
+
+        for (firstItem in listFirstItems) {
+
+            val profile = BasalProfilePatternDto(firstItem, firstItem + 24)
+
+            for (basalProfile in listBasalProfiles) {
+                if (basalProfile.eventSequenceNumber >= profile.firstIndex &&
+                    basalProfile.eventSequenceNumber <= profile.lastIndex) {
+                    profile.mapOfProfilePattens[basalProfile.value1] = basalProfile
+                }
+            }
+
+            aapsLogger.debug(LTag.PUMPCOMM, prefix + "Basal Profile Items found: ${profile.mapOfProfilePattens.size}")
+
+            if (profile.mapOfProfilePattens.size == 24) {
+                val lastPattern = profile.mapOfProfilePattens[23]!!
+
+                val isA = if (lastPattern.entryType == YpsoPumpEventType.BASAL_PROFILE_A_PATTERN_CHANGED) true else false
+
+                val newProfile = EventDto(
+                    id = lastPattern.eventSequenceNumber,
+                    serial = lastPattern.serial,
+                    historyEntryType = lastPattern.historyEntryType,
+                    dateTime = lastPattern.dateTime,
+                    entryType = if (isA) YpsoPumpEventType.BASAL_PROFILE_A_CHANGED else YpsoPumpEventType.BASAL_PROFILE_B_CHANGED,
+                    entryTypeAsInt = if (isA) 4000 else 4001,
+                    value1 = lastPattern.value1,
+                    value2 = lastPattern.value2,
+                    value3 = lastPattern.value3,
+                    eventSequenceNumber = lastPattern.eventSequenceNumber,
+                    subObject = null,
+                    subObject2 = null,
+                    created = System.currentTimeMillis(),
+                    updated = System.currentTimeMillis()
+                )
+
+                val profileSub = BasalProfile(hashMapOf())
+
+                for (i in 0 until 23) {
+                    val entry = profile.mapOfProfilePattens[i]!!.subObject as BasalProfileEntry
+                    profileSub.profile[i] = entry
+                }
+
+                newProfile.subObject = profileSub
+
+                aapsLogger.debug(LTag.PUMPCOMM, prefix + "New Basal Profile: ${gson.to(newProfile)}")
+
+                basalProfilesNew.add(newProfile)
+
+            } else {
+                aapsLogger.warn(LTag.PUMPCOMM, prefix + "Basal Profile incomplete, invalid. Ignoring.")
+            }
+        }
+
+        //aapsLogger.debug(LTag.PUMPCOMM, "Basal first Items found: ${listFirstItems.size}")
+
+        aapsLogger.debug(LTag.PUMPCOMM, prefix + "Basal Profiles found: ${basalProfilesNew.size}")
+
+        dataEvents.removeAll(listBasalProfiles)
+
+        aapsLogger.debug(LTag.PUMPCOMM, prefix + "Full Events after remove: ${dataEvents.size}")
+
+        dataEvents.addAll(basalProfilesNew)
+
+        aapsLogger.debug(LTag.PUMPCOMM, prefix + "Full Events after addng new profiles: ${dataEvents.size}")
+
+        // 1. we check if basal has changed, if yes, we need:
+        //   a.) combine records into one
+        //   b.) remove old records
+        //   c.) apply records to the driver
+
+        return dataEvents
+    }
+
+    private fun preProcessConfigurationItems(dataEvents: MutableList<EventDto>): MutableList<EventDto> {
+        //var dataEventsOut = preProcessBasalProfiles(dataEvents)
+        // 2. we try to find all other configuration changes and apply them to the system
+
+        val update = pumpStatus.lastConfigurationUpdate
+
+        val listConfiguration = dataEvents.stream()
+            .filter { pre ->
+                (pre.entryType == YpsoPumpEventType.BOLUS_STEP_CHANGED ||
+                    pre.entryType == YpsoPumpEventType.BASAL_PROFILE_SWITCHED ||
+                    pre.entryType == YpsoPumpEventType.BOLUS_AMOUNT_CAP_CHANGED ||
+                    pre.entryType == YpsoPumpEventType.BASAL_RATE_CAP_CHANGED)
+            }
+            .collect(Collectors.toList())
+
+        var newUpdateDate = 0L
+
+        for (eventDto in listConfiguration) {
+
+            if (eventDto.dateTime.toATechDate() > update) {
+                when (eventDto.entryType) {
+                    YpsoPumpEventType.BOLUS_STEP_CHANGED       -> {
+                        pumpStatus.bolusStep = eventDto.value1 / 100.0
+                        pumpStatus.pumpDescription.bolusStep = pumpStatus.bolusStep
+                        YpsoPumpConst.Prefs.BolusSize
+                    }
+
+                    YpsoPumpEventType.BASAL_PROFILE_SWITCHED   -> {
+                        val basalProfileConfig = eventDto.subObject as ConfigurationChanged
+                        pumpStatus.activeProfileName = basalProfileConfig.value
+                        if (!"A".equals(basalProfileConfig.value)) {
+                            pumpUtil.sendNotification(
+                                notificationType = YpsoPumpNotificationType.PumpIncorrectBasalProfileSelected,
+                                "A")
+                        }
+                    }
+
+                    YpsoPumpEventType.BOLUS_AMOUNT_CAP_CHANGED -> {
+                        pumpStatus.maxBolus = eventDto.value1 / 100.0
+                        //pumpStatus.pumpDescription.bolusM
+                    }
+
+                    YpsoPumpEventType.BASAL_RATE_CAP_CHANGED   -> {
+                        pumpStatus.maxBasal = eventDto.value1 / 100.0
+                        pumpStatus.pumpDescription.basalMaximumRate = pumpStatus.maxBasal!!
+                    }
+
+                    else                                       -> {
+                    }
+                } // when
+
+                if (newUpdateDate < eventDto.dateTime.toATechDate()) {
+                    newUpdateDate = eventDto.dateTime.toATechDate()
+                }
+
+            } // if after last update
+
+        }
+
+        if (newUpdateDate > 0L) {
+            pumpStatus.lastConfigurationUpdate = newUpdateDate
+            pumpStatus.configChanged = true
+        }
+
+
+
+        return dataEvents
+    }
+
+    private fun preProcessDeliverySuspendItems(dataEvents: MutableList<EventDto>): MutableList<EventDto> {
+        // TODO
+
+        var listDelivery = dataEvents.stream()
+            .filter { pre ->
+                pre.entryType == YpsoPumpEventType.DELIVERY_STATUS_CHANGED ||
+                    pre.entryType == YpsoPumpEventType.PUMP_MODE_CHANGED
+            }
+            .collect(Collectors.toList())
+
+        // 1. find any delivery suspend items
+        // 2. apply it to the system
+        // 3. create TBR records for suspend (retrive data from db if necessarry)
+
+        return dataEvents
+    }
+
+    fun getLastEventAndSendItToPumpSync(bolusInfo: DetailedBolusInfo? = null,
+                                        tempBasalInfo: TempBasalPair? = null,
+                                        profile: Profile? = null) {
+        Thread {
+            // DEFERRED: Andy read the just-written event back off the pump via his `GetLastEvent` BLE
+            // command, then pushed it to PumpSync. Without a connector there is nothing to read back,
+            // so this is a no-op. NOTE: this is also the path that would confirm a delivery actually
+            // happened - it must be reinstated together with any delivery support.
+            // See PORTING_NOTES.md.
+            val dataEvents: List<EventDto>? = readLastEventFromPump(bolusInfo, tempBasalInfo)
+
+            if (dataEvents != null) {
+
+                if (!dataEvents.isNullOrEmpty()) {
+
+                    aapsLogger.debug(LTag.PUMP, "Got ${dataEvents.size} items.")
+
+                    if (dataEvents.size == 1) {
+                        val eventDto = dataEvents[0]
+
+                        aapsLogger.debug(LTag.PUMP, "Event: " + pumpUtil.gson.toJson(eventDto))
+
+                        if (bolusInfo != null && bolusInfo.bolusType != BS.Type.NORMAL) {
+                            val bolus = eventDto.subObject as Bolus
+                            bolus.bolusType = if (bolusInfo.bolusType == BS.Type.SMB) BolusType.SMB else BolusType.Priming
+                            eventDto.subObject = bolus
+                        }
+
+                        val entity = historyMapper.domainToEntity(eventDto)
+
+                        sendDataToPumpSync(entity, null)
+
+                    } else {
+                        aapsLogger.warn(LTag.PUMP, "There should be only one response returned (${dataEvents.size}).")
+                    }
+
+                } else {
+                    aapsLogger.warn(LTag.PUMP, "No events found.")
+                    return@Thread
+                }
+
+            } else {
+                aapsLogger.warn(LTag.PUMP, "Problem reading last event: not implemented (no connector).")
+                return@Thread  // if any of commands fails we stop execution
+            }
+
+        }.start()
+    }
+
+    /**
+     * DEFERRED: see [getLastEventAndSendItToPumpSync]. Returns null (= "read failed").
+     */
+    private fun readLastEventFromPump(bolusInfo: DetailedBolusInfo?, tempBasalInfo: TempBasalPair?): List<EventDto>? {
+        aapsLogger.warn(LTag.PUMPCOMM, prefix + "readLastEventFromPump: not implemented (no connector).")
+        return null
+    }
+
+    fun addHistoryToDatabase(entityList: List<EventDto>,
+                             pumpStatusEntry: YpsoPumpStatusEntry? = null,
+                             sendToPumpSync: Boolean = false) {
+
+        aapsLogger.warn(LTag.PUMPCOMM, prefix + "addHistoryToDatabase [${entityList.size}]")
+
+        var first = true
+        var counter: Int = 0
+        for (historyRecordEntity in entityList) {
+            if (first) {
+                // for bolus type
+                first = false
+            }
+
+            aapsLogger.debug(LTag.PUMP, prefix + "Add history to Database: ${counter}\n ${gson.toJson(historyRecordEntity)}")
+
+            val changedItem = ypsoPumpHistory.insertOrUpdate(event = historyRecordEntity)
+
+            if (sendToPumpSync && changedItem != null) {
+                sendDataToPumpSync(changedItem, pumpStatusEntry)
+            }
+        }
+    }
+
+    private fun sendDataToPumpSync(entity: HistoryRecordEntity, pumpStatusEntry: YpsoPumpStatusEntry?) {
+        Thread {
+            val date = DateTimeUtil.toMillisFromATD(entity.date)
+
+            if (entity.bolusRecord != null) {
+                val bolusRecord = entity.bolusRecord!!
+                if (bolusRecord.bolusType == BolusType.Normal ||
+                    bolusRecord.bolusType == BolusType.SMB ||
+                    bolusRecord.bolusType == BolusType.Priming) {
+
+                    val bolusType = when (bolusRecord.bolusType) {
+                        BolusType.Normal  -> BS.Type.NORMAL
+                        BolusType.SMB     -> BS.Type.SMB
+                        BolusType.Priming -> BS.Type.PRIMING
+                        else              -> BS.Type.NORMAL
+                    }
+
+                    val result = pumpSync.syncBolusWithPumpId(
+                        timestamp = date,
+                        amount = bolusRecord.immediateAmount!!,
+                        type = bolusType,
+                        pumpId = entity.eventSequenceNumber.toLong(),
+                        pumpType = PumpType.YPSOPUMP,
+                        pumpSerial = entity.serial.toString())
+                    val insulin = String.format(Locale.ROOT, "%.2f", bolusRecord.immediateAmount!!)
+                    aapsLogger.debug(LTag.PUMP, "syncBolusWithPumpId [date=$date, " +
+                        "type=${bolusType.name}, pumpId=${entity.eventSequenceNumber}, " +
+                        "insulin=$insulin, " +
+                        "pumpSerial=${entity.serial}] - Result: $result")
+                } else if (bolusRecord.bolusType == BolusType.Extended) {
+                    val result = pumpSync.syncExtendedBolusWithPumpId(
+                        timestamp = date,
+                        amount = bolusRecord.extendedAmount!!,
+                        duration = (bolusRecord.durationMin!! * 60L * 1000L),
+                        isEmulatingTB = false,
+                        pumpId = entity.eventSequenceNumber.toLong(),
+                        pumpType = PumpType.YPSOPUMP,
+                        pumpSerial = entity.serial.toString())
+                    val insulin = String.format(Locale.ROOT, "%.2f", bolusRecord.extendedAmount!!)
+                    aapsLogger.debug(LTag.PUMP, "syncExtendedBolusWithPumpId [date=$date, " +
+                        "type=EXTENDED, pumpId=${entity.eventSequenceNumber}, " +
+                        "insulin=$insulin, " +
+                        "pumpSerial=${entity.serial}] - Result: $result")
+                } else {
+                    val result = pumpSync.syncBolusWithPumpId(
+                        timestamp = date,
+                        amount = bolusRecord.immediateAmount!!,
+                        type = BS.Type.NORMAL,
+                        pumpId = entity.eventSequenceNumber.toLong(),
+                        pumpType = PumpType.YPSOPUMP,
+                        pumpSerial = entity.serial.toString())
+                    val insulinNo = String.format(Locale.ROOT, "%.2f", bolusRecord.immediateAmount!!)
+                    aapsLogger.debug(LTag.PUMP, "syncBolusWithPumpId [date=$date, " +
+                        "type=NORMAL, pumpId=${entity.eventSequenceNumber}, " +
+                        "insulin=$insulinNo, " +
+                        "pumpSerial=${entity.serial}] - Result: $result")
+                    val result2 = pumpSync.syncExtendedBolusWithPumpId(
+                        timestamp = date,
+                        amount = bolusRecord.extendedAmount!!,
+                        duration = (bolusRecord.durationMin!! * 60L * 1000L),
+                        isEmulatingTB = false,
+                        pumpId = entity.eventSequenceNumber.toLong(),
+                        pumpType = PumpType.YPSOPUMP,
+                        pumpSerial = entity.serial.toString())
+                    val insulinEx = String.format(Locale.ROOT, "%.2f", bolusRecord.extendedAmount!!)
+                    aapsLogger.debug(LTag.PUMP, "syncExtendedBolusWithPumpId [date=$date, " +
+                        "type=EXTENDED, pumpId=${entity.eventSequenceNumber}, " +
+                        "insulin=$insulinEx, " +
+                        "pumpSerial=${entity.serial}] - Result: $result2")
+                }
+            } else if (entity.temporaryBasalRecord != null) {
+                val tbrRecord = entity.temporaryBasalRecord!!
+                val result = pumpSync.syncTemporaryBasalWithPumpId(
+                    timestamp = DateTimeUtil.toMillisFromATD(entity.date),
+                    rate = tbrRecord.percent.toDouble(),
+                    duration = tbrRecord.minutes * 60L * 1000L,
+                    isAbsolute = false,
+                    type = tbrRecord.temporaryBasalType,
+                    pumpId = entity.eventSequenceNumber.toLong(),
+                    pumpType = PumpType.YPSOPUMP,
+                    pumpSerial = entity.serial.toString())
+                aapsLogger.debug(LTag.PUMP, "syncTemporaryBasalWithPumpId [date=$date, " +
+                    "pumpId=${entity.eventSequenceNumber}, rate=${tbrRecord.percent} %%, " +
+                    "duration=${tbrRecord.minutes} min, pumpSerial=${entity.serial}] - Result: $result")
+            } else if (entity.tddRecord != null) {
+                val tdiRecord = entity.tddRecord!!
+                val result = pumpSync.createOrUpdateTotalDailyDose(
+                    timestamp = date,
+                    bolusAmount = tdiRecord.bolus,
+                    basalAmount = tdiRecord.basal,
+                    totalAmount = tdiRecord.total,
+                    pumpId = entity.eventSequenceNumber.toLong(),
+                    pumpType = PumpType.YPSOPUMP,
+                    pumpSerial = entity.serial.toString())
+                aapsLogger.debug(LTag.PUMP, "createOrUpdateTotalDailyDose [date=$date, " +
+                    "pumpId=${entity.eventSequenceNumber}, bolus=${tdiRecord.bolus}, " +
+                    "basal=${tdiRecord.basal} , total=${tdiRecord.total}, pumpSerial=${entity.serial}] - Result: $result")
+            } else if (entity.entryType == YpsoPumpEventType.REWIND) {
+                // Rewind (for marking insulin change)
+                uploadCareportalEventIfFoundInHistory(
+                    historyRecord = entity,
+                    lastEntryType = LastEntryType.Rewind,
+                    eventType = TE.Type.INSULIN_CHANGE,
+                    pumpStatusEntry = pumpStatusEntry!!)
+            } else if (entity.entryType == YpsoPumpEventType.PRIMING) {
+                // Prime (for resetting autosense)
+                uploadCareportalEventIfFoundInHistory(
+                    historyRecord = entity,
+                    lastEntryType = LastEntryType.Prime,
+                    eventType = TE.Type.CANNULA_CHANGE,
+                    pumpStatusEntry = pumpStatusEntry!!)
+            }
+        }.start()
+
+    }
+
+    private fun uploadCareportalEventIfFoundInHistory(historyRecord: HistoryRecordEntity,
+                                                      lastEntryType: LastEntryType,
+                                                      eventType: TE.Type,
+                                                      pumpStatusEntry: YpsoPumpStatusEntry) {
+        val lastEntry = pumpStatusEntry.getLastEntry(lastEntryType)
+
+        if (lastEntry == null || historyRecord.eventSequenceNumber > lastEntry) {
+            val result = pumpSync.insertTherapyEventIfNewWithTimestamp(
+                DateTimeUtil.toMillisFromATD(historyRecord.date),
+                eventType, null,
+                historyRecord.eventSequenceNumber.toLong(),
+                PumpType.YPSOPUMP,
+                pumpStatus.serialNumber.toString())
+
+            aapsLogger.debug(LTag.PUMP, "insertTherapyEventIfNewWithTimestamp [date=${historyRecord.date}, " +
+                "eventType=${eventType}, pumpId=${historyRecord.eventSequenceNumber}, " +
+                "pumpSerial=${pumpStatus.serialNumber}] - Result: ${result}")
+
+            pumpStatusEntry.setLastEntry(lastEntryType, historyRecord.eventSequenceNumber)
+        }
+    }
+
+    fun readCurrentStatusOfPump() {
+        val latestDeliveryStatusChangedEntry = ypsoPumpHistory.getLatestDeliveryStatusChangedEntry()
+
+        if (latestDeliveryStatusChangedEntry != null) {
+            val pumpStatusValues = pumpStatus.getPumpStatusValuesForSelectedPump()
+            val isRunning = (latestDeliveryStatusChangedEntry.pumpStatusRecord!!.pumpStatusType == PumpStatusType.PumpRunning)
+            pumpStatusValues!!.isPumpRunning = isRunning
+            pumpStatus.setPumpStatusValues(pumpStatusValues)
+            pumpStatus.pumpRunningState = if (isRunning) PumpRunningState.Running else PumpRunningState.Suspended
+        }
+    }
+
+}
