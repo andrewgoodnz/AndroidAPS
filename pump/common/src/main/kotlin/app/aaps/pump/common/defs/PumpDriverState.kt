@@ -17,7 +17,12 @@ enum class PumpDriverState(var resourceId: Int) {
     Suspended(R.string.pump_status_suspended), //
     ExecutingCommand(R.string.pump_status_executing_command),
     Disconnecting(app.aaps.core.interfaces.R.string.disconnecting),
-    Disconnected(app.aaps.core.ui.R.string.disconnected);
+    Disconnected(app.aaps.core.ui.R.string.disconnected),
+
+    // Restored for the ypsopump driver: Andy Rozman's original pump-common carried these two and his
+    // driver's state machine is built on them. Purely additive - no existing driver references them.
+    Sleeping(R.string.pump_status_sleeping),
+    ErrorCommunicatingWithPump(R.string.pump_status_error_communicating);
 
     fun isConnected(): Boolean = this == Connected || this == Initialized || this == Busy || this == Suspended
     fun isInitialized(): Boolean = this == Initialized || this == Busy || this == Suspended
