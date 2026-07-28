@@ -233,11 +233,16 @@ a stable `pumpId`, which is what makes reconnect dedup work.
   pattern — `pump:common` still ships the `pump_history_activity.xml` layout and
   `PumpHistoryDataProvider`/`PumpHistoryEntry` interfaces, and
   `YpsopumpPumpHistoryDataProvider` is already ported and wired).
-- **BLE config screen**: `YpsoPumpBLEConfigActivity` was dropped; `pump:common` ships a generic
-  `PumpBLEConfigActivity` and `YpsoPumpBLESelector` is already ported to the current interface.
-  `res/xml/pref_ypsopump.xml` still points its intent at the old
-  `info.nightscout.androidaps.plugins.pump.common.ui.PumpBLEConfigActivity` action — **this must be
-  repointed or the preference entry will do nothing.**
+- **BLE config screen — will not launch yet.** `YpsoPumpBLEConfigActivity` was dropped;
+  `pump:common` ships a generic `PumpBLEConfigActivity` and `YpsoPumpBLESelector` is already ported
+  to the current interface and returned by `YpsopumpPumpDriverConfiguration`.
+  `res/xml/pref_ypsopump.xml` has been repointed to
+  `app.aaps.pump.common.driver.ui.PumpBLEConfigActivity`, **but that is an intent *action* string and
+  `PumpBLEConfigActivity` is declared in no `AndroidManifest.xml` anywhere in the tree** (pump:common's
+  manifest is empty), so nothing resolves it. Either declare the activity with a matching
+  `<intent-filter>`, or switch the preference to an explicit component
+  (`android:targetPackage` + `android:targetClass`, as Medtronic does for its own activities) and
+  declare it in the ypsopump manifest. Until then the "YpsoPump Configuration" preference does nothing.
 - **Bonding is not wired.** `PumpBLESelector.onDeviceSelected` used to register a `BondStateReceiver`
   (also deleted upstream) and call `createBond()`. It now only stores address/name/serial.
 
@@ -257,9 +262,10 @@ a stable `pumpId`, which is what makes reconnect dedup work.
 
 ## 4. Recommended order for the next session
 
-1. **Repoint the BLE-config preference intent** in `res/xml/pref_ypsopump.xml` to
-   `app.aaps.pump.common.driver.ui.PumpBLEConfigActivity`, and register that activity in the module
-   manifest. Without this you cannot select a pump at all. Small, unblocks everything.
+1. **Make the BLE-config screen actually launch.** The preference intent is already repointed at
+   `app.aaps.pump.common.driver.ui.PumpBLEConfigActivity`, but that activity is declared in no
+   manifest, so the intent resolves to nothing (see §3c for the two options). Without this you
+   cannot select a pump at all. Small, and it unblocks everything else.
 2. **Restore bonding** in `YpsoPumpBLESelector.onDeviceSelected` (port `BondStateReceiver` into the
    module — it was ~70 lines).
 3. **Extend `YpsoPumpConnectorInterface`** before writing any implementation:
