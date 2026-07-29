@@ -55,6 +55,13 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
         /** `CHAR_SYSTEM_TIME` payload: hour u8, minute u8, second u8. */
         private const val TIME_PAYLOAD_BYTES = 3
 
+        /**
+         * `BluetoothGatt.GATT_INVALID_ATTRIBUTE_LENGTH`. The pump's answer to a write of the wrong
+         * length, and the one negative signal this firmware gives reliably — it is refused by the
+         * ATT layer, so nothing reaches the pump's application.
+         */
+        private const val GATT_INVALID_ATTRIBUTE_LENGTH = 13
+
         /** Salt used by vicktor's SDK, verified against firmware V05.02.03. */
         val AUTH_SALT_SDK = byteArrayOf(
             0x4F, 0xC2.toByte(), 0x45, 0x4D, 0x9B.toByte(),
@@ -620,19 +627,57 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
     }
 
     /**
-     * Writes a fixed-length command payload bare, recording what the attribute looks like first.
+     * How a command payload is wrapped for a write-only characteristic.
      *
-     * Phase 1 established the envelope across four separate attributes — auth password, GLB,
-     * system date and system time — all bare. This still logs the control characteristic's
-     * properties and current contents before writing, because that is the evidence the next
-     * command's wire format will be argued from, and it costs one round trip.
+     * The pump uses different conventions on different attributes and does not advertise which:
+     * simple registers take the payload bare (the clock, §4e; GLB safe variables, §4b), while the
+     * command and status channels carry a CRC-16 (the status *read* is 18 bytes plus its CRC,
+     * §4a). Upstream wrapped everything as `frame(payload + CRC)`.
+     */
+    private enum class CommandEnvelope(val label: String) {
+
+        /** Payload plus CRC-16, no framing header. Matches the shape of the status reply. */
+        CRC("payload+CRC"),
+
+        /** Upstream's shape: a 1-byte framing header over the CRC-terminated payload. */
+        FRAMED_CRC("frame(payload+CRC)"),
+
+        /** Bare, as the clock and GLB writes take it. */
+        BARE("payload"),
+
+        /** Framing header, no CRC. */
+        FRAMED("frame(payload)");
+
+        fun wrap(payload: ByteArray): ByteArray = when (this) {
+            CRC        -> YpsoCrc.appendCrc(payload)
+            FRAMED_CRC -> YpsoFraming.chunkPayload(YpsoCrc.appendCrc(payload)).first()
+            BARE       -> payload
+            FRAMED     -> YpsoFraming.chunkPayload(payload).first()
+        }
+    }
+
+    /** Envelope the pump has accepted for a given command characteristic, once one is known. */
+    private val learnedEnvelopes = mutableMapOf<UUID, CommandEnvelope>()
+
+    /**
+     * Writes a command payload to a **write-only** characteristic, discovering the envelope.
      *
-     * Unlike the clock, the write is **not** gated on that read: a control characteristic's read
-     * value need not share the shape of its write, so an unrecognised read here would be normal
-     * rather than a warning. Getting the length wrong is refused at the ATT layer with
-     * `GATT_INVALID_ATTRIBUTE_LENGTH` and never reaches the pump's application — loud and
-     * harmless. Getting the *content* wrong is neither, which is why every caller confirms the
-     * effect against the pump rather than against this result.
+     * `CHAR_BOLUS_START_STOP` has properties `0x08` — write only — so unlike the clock there is
+     * nothing to read the envelope from, and the pump does not advertise the attribute's length.
+     * A 13-byte bare write was refused with `GATT_INVALID_ATTRIBUTE_LENGTH` (13), so the candidates
+     * are tried in order until one stops being refused, and the winner is remembered per
+     * characteristic so later commands go straight out.
+     *
+     * **Why trying candidates is safe here.** Every candidate is a *complete, correct* encoding of
+     * the same command, differing only in its envelope — never a truncated or padded guess. A
+     * wrong length is rejected by the ATT layer and never reaches the pump's application, so a
+     * refused attempt cannot deliver anything. And because the attribute is fixed-length (that is
+     * what status 13 tells us), at most one candidate can be accepted.
+     *
+     * **What this does not protect against** is a length that is right while the *field layout*
+     * inside is wrong — the pump would then act on a command it misread. Nothing at this level can
+     * see that, which is why the caller checks the total the pump echoes back and cancels on a
+     * disagreement.
      */
     private fun writeCommandPayload(
         char: BluetoothGattCharacteristic,
@@ -640,25 +685,59 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
         what: String,
         callback: (Boolean) -> Unit
     ) {
-        val send = {
-            log("$what: writing ${payload.size}B bare to ${char.uuid}: ${payload.toHexString()}")
-            writeShortMessage(char, payload, withCrc = false, callback)
-        }
-
-        if (char.properties and BluetoothGattCharacteristic.PROPERTY_READ == 0) {
-            log("$what: ${char.uuid} is write-only (properties=0x%02X)".format(char.properties))
-            send()
+        learnedEnvelopes[char.uuid]?.let { known ->
+            val bytes = known.wrap(payload)
+            log("$what: writing ${bytes.size}B to ${char.uuid} as ${known.label}: ${bytes.toHexString()}")
+            writeCharacteristic(char, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                .with { _, _ -> callback(true) }
+                .fail { _, status ->
+                    // The envelope worked before, so this is a real failure rather than a wrong
+                    // guess. Forget it so the next attempt rediscovers instead of repeating.
+                    log("$what: write failed (GATT status=$status) using the previously accepted ${known.label}; forgetting it")
+                    learnedEnvelopes.remove(char.uuid)
+                    callback(false)
+                }
+                .enqueue()
             return
         }
 
-        readCharacteristic(char).with { _, data ->
-            val raw = data.value
-            log("$what: ${char.uuid} currently reads ${raw?.size ?: 0}B = ${raw?.toHexString() ?: "(empty)"}")
-            send()
-        }.fail { _, status ->
-            log("$what: ${char.uuid} read failed (GATT status=$status), writing anyway")
-            send()
-        }.enqueue()
+        log("$what: ${char.uuid} is write-only (properties=0x%02X), discovering the envelope".format(char.properties))
+        tryEnvelopes(char, payload, what, CommandEnvelope.entries.toList(), callback)
+    }
+
+    private fun tryEnvelopes(
+        char: BluetoothGattCharacteristic,
+        payload: ByteArray,
+        what: String,
+        remaining: List<CommandEnvelope>,
+        callback: (Boolean) -> Unit
+    ) {
+        val envelope = remaining.firstOrNull()
+        if (envelope == null) {
+            log("$what: every envelope was refused — the ${payload.size}-byte payload layout is wrong, not just its wrapper")
+            callback(false)
+            return
+        }
+
+        val bytes = envelope.wrap(payload)
+        log("$what: trying ${envelope.label} = ${bytes.size}B: ${bytes.toHexString()}")
+        writeCharacteristic(char, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+            .with { _, _ ->
+                log("$what: ACCEPTED as ${envelope.label} (${bytes.size}B) — remembering it for ${char.uuid}")
+                learnedEnvelopes[char.uuid] = envelope
+                callback(true)
+            }
+            .fail { _, status ->
+                if (status == GATT_INVALID_ATTRIBUTE_LENGTH) {
+                    // Wrong length: refused by the ATT layer, nothing reached the pump. Next.
+                    log("$what: ${envelope.label} refused as the wrong length (status=13)")
+                    tryEnvelopes(char, payload, what, remaining.drop(1), callback)
+                } else {
+                    log("$what: ${envelope.label} failed with GATT status=$status — not a length problem, stopping")
+                    callback(false)
+                }
+            }
+            .enqueue()
     }
 
     /**

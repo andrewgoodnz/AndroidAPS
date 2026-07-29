@@ -94,8 +94,11 @@ class YpsoPumpManagerImpl private constructor(
          */
         private const val CLOCK_MATCH_TOLERANCE_MS = 90_000L
 
-        /** How often the pump's bolus status is read while a bolus runs. */
-        private const val BOLUS_POLL_INTERVAL_MS = 1_000L
+        /**
+         * How often the pump's bolus status is read while a bolus runs. At 12 U/min this bounds how
+         * much can go in between the pump echoing a total we did not ask for and the cancel.
+         */
+        private const val BOLUS_POLL_INTERVAL_MS = 500L
 
         /**
          * Slack on top of the calculated delivery time, covering the command round trip and the
@@ -583,8 +586,11 @@ class YpsoPumpManagerImpl private constructor(
         var cancelled = false
         var mismatch: String? = null
 
+        var firstPoll = true
         while (System.currentTimeMillis() - startedAt < timeoutMs) {
-            delay(BOLUS_POLL_INTERVAL_MS)
+            // The first read happens immediately: it carries the total the pump understood, and
+            // the sooner a disagreement is seen the less has gone in by the time we cancel.
+            if (firstPoll) firstPoll = false else delay(BOLUS_POLL_INTERVAL_MS)
             val status = suspendGetBolusStatus() ?: continue
 
             // The pump's own idea of what it was asked for. A disagreement here means the 13-byte
