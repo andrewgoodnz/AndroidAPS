@@ -8,15 +8,15 @@ active program, the 24-slot basal profile, the active temporary basal and the ev
 history — every value cross-checked against the pump's own display or against actions performed
 on the pump minutes earlier.
 
-**Session 3 added exactly one write, and it is not tested yet.** Setting the pump's clock
-(§4e) is now implemented and reachable from the YPSO tab. Everything that could move insulin is
-still refused: there is no code path from AAPS to a delivery command.
+**Session 3: the write path is open. [verified] on hardware, 2026-07-30.** Setting the pump's
+clock (§4e) is implemented, and it worked: with the pump's clock deliberately wound back 14
+months, the driver wrote the phone's date and time, read them back, and the pump's own display
+and its own history log both agree. That is the first write this driver has ever made that
+changed the pump's state.
 
-**No write that changes pump state has ever succeeded** — that is what the clock write is the
-canary for, and `SALINE_TEST_PROCEDURE.md` phase 1 is what has to pass before the sentence can
-change. Note this is narrower than "no write has succeeded": the auth password and the
-setting/history index writes demonstrably land, which is what makes the unframed hypothesis in
-§4e more than a guess.
+Everything that could move insulin is **still refused**: there is no code path from AAPS to a
+delivery command. Phase 2 of `SALINE_TEST_PROCEDURE.md` (standard bolus, on saline) is the next
+gate and has no code yet.
 
 Test pump: **YpsoPump_10074292**, MAC `EC:2A:F0:01:22:34`, firmware V05.02.03 — the unit whose
 settings are in the decrypted Lotus export. (Serial 10178681 is a *different*, standard pump
@@ -233,7 +233,7 @@ the integrity check. History counts are the same shape.
 against AAPS profile, so that would report a mismatch on a correct profile forever once writes
 exist. Divide in Double.
 
-### 4e. Short writes: observe the envelope, do not assume it
+### 4e. Short writes are bare — observed, not assumed **[verified]**
 
 #### ⚠ Correction: writes to this pump already work — just not *command* writes
 
@@ -290,15 +290,44 @@ upstream's write: `CHAR_SYSTEM_DATE` as year u16 LE + month u8 + day u8, `CHAR_S
 hour + minute + second. If the pump's clock decodes to a date that matches its own display, the
 layout is right.
 
-**The clock write itself has not run against hardware yet.** Phase 1 of
-`SALINE_TEST_PROCEDURE.md` records the raw bytes of both characteristics, which is the finding
-this section is waiting for. Fill in the table below from the log and this stops being an
-inference:
+#### ⚠ [verified] Both clock characteristics are bare — no framing, no CRC
 
-| Characteristic | Bytes observed | Envelope |
-|---|---|---|
-| `CHAR_SYSTEM_DATE` (`…fcbedc3b7bc5`) | *not yet read* | *unknown* |
-| `CHAR_SYSTEM_TIME` (`…fcbedd3b7bc5`) | *not yet read* | *unknown* |
+Read from the pump on 2026-07-30. The reply is exactly the payload length in both cases:
+
+| Characteristic | Bytes observed | Envelope | Decodes to |
+|---|---|---|---|
+| `CHAR_SYSTEM_DATE` (`…fcbedc3b7bc5`) | `E9 07 05 1C` (4B) | **bare** | 2025-05-28 |
+| `CHAR_SYSTEM_TIME` (`…fcbedd3b7bc5`) | `01 08 32` (3B) | **bare** | 01:08:50 |
+
+So the fixed-length reading is right, and it now rests on **four** observed messages rather than
+an inference: the auth write (16B bare), the GLB write (8B bare), and both of these.
+Upstream's `chunkPayload(appendCrc(datePayload))` would have offered 7 bytes where the pump
+wants 4, and been refused with `GATT_INVALID_ATTRIBUTE_LENGTH` exactly as §4b's GLB write was.
+
+**The field layout is confirmed too** — year u16 LE, month u8, day u8 / hour, minute, second.
+The clock was read as 2025-05-28 01:08 while the pump's own screen displayed 28/05/2025 01:08,
+and successive reads advanced in step with real time, which is what rules out these being a
+static build date rather than the live system clock. (Their UUIDs sit in the same family as
+`CHAR_BASE_VERSION` and `CHAR_SETTINGS_VERSION`, so that was worth ruling out.)
+
+#### ⚠ [verified] The write works, confirmed four independent ways
+
+With the clock deliberately wound back 14 months (skew −37,000,842 s):
+
+```
+WRITE  …fcbedc3b7bc5 : EA 07 07 1E    0x07EA=2026, 07, 0x1E=30   = 2026-07-30
+WRITE  …fcbedd3b7bc5 : 07 09 20       = 07:09:32
+read   back           : EA 07 07 1E / 07 09 20    ← identical
+```
+
+1. **Read-back** of both characteristics returned exactly the bytes written; final skew −1 s.
+2. **The pump's own display** showed the correct date and time afterwards.
+3. The status screen's pump-clock row read `In sync with phone (1 s)`.
+4. **The pump's own history logged the change**, through a path that does not touch these
+   characteristics at all — see §5.
+
+That fourth one is the strongest, because it is the pump describing what happened to it rather
+than the driver reading back its own write.
 
 **The bolus and TBR payloads still go out framed** — `sendBolusCommand`, `startTbr` and
 `cancelTbr` all still call `chunkPayload`, as do the generic `sendCommand` and `writeMultiFrame`.
@@ -320,13 +349,14 @@ Two predictions worth writing down before they are tested, so they can be scored
 path has, in a sense, already been exercised — every basal profile *read* writes a setting index
 through it, and those reads work.
 
-**If the clock characteristics turn out not to be readable**, the fallback is a length probe —
-try candidates in ascending length and treat status 13 as "wrong length, next". Each candidate
-is a complete correct encoding differing only in envelope, so a rejected one never reaches the
-pump's application layer, which makes the probe safe. It is deliberately not implemented,
-because an unreadable characteristic also means no read-back, and a write that cannot be
-confirmed is one this driver should not be making (§0). That trade-off wants the phase-1
-evidence before it is decided.
+The read-before-write approach paid for itself immediately and should be reused: it cost one
+round trip, it removed the guess about the envelope, and the same read is the confirmation
+channel. Any future short write should do the same rather than hard-coding "bare" from this
+finding — the bolus and TBR characteristics are different attributes and have not been observed.
+
+(A length probe was designed as a fallback in case the characteristics would not read — try
+candidates in ascending length, treat status 13 as "wrong length, next". It was never needed
+and is not implemented.)
 
 ### What is read, and what was verified
 
@@ -486,6 +516,29 @@ chronologically trustworthy. `toHistoryEvent` does not map type 12, so nothing r
 from it — keep it that way, and be careful if `sincePosition` filtering ever sorts by timestamp
 rather than sequence.
 
+### ⚠ [verified] Clock-change entries, and what they proved about the write
+
+Setting the clock over BLE (§4e) produced these two entries, the two newest in the log:
+
+| idx | seq | type | v1 | v2 | v3 | meaning |
+|---|---|---|---|---|---|---|
+| 1 | 160285 | 12 Date Changed | 30 | 7 | 26 | new date **2026-07-30** |
+| 0 | 160286 | 13 Time Changed | 7 | 9 | 32 | new time **07:09:32** |
+
+`07:09:32` is exactly the payload that went out (`07 09 20`), so the pump independently
+described the change the driver made. Because this arrives through the history characteristics
+rather than the clock ones, it is the confirmation that does not depend on the driver reading
+back its own write.
+
+**New: `13 Time Changed` carries the new time as `v1/v2/v3` = hour/minute/second**, the same
+shape as type 12's day/month/year. Earlier revisions recorded type 12's fields but not type 13's.
+A manual clock change made on the pump minutes earlier logged the same pair (`28/5/25` and
+`0/51/0`), so the encoding is the same whether the change came over BLE or from the pump's
+own menus.
+
+Neither type is mapped to PumpSync, and both should stay unmapped: their timestamps are
+pre-change, so syncing them would place therapy records at the wrong time.
+
 **`24 Battery Removed` is unverified, but nothing observed argues against it.** Three of these
 appear in the log, all dated **2026-03-29** — 122 days before the cartridge change, and not
 corresponding to anything done in the bring-up session. Today's cartridge change logged a
@@ -585,11 +638,21 @@ pairing screen makes the user confirm the serial before bonding. **Never select 
 6. **History.** "Read history" on the YPSO tab. Compare types and timestamps against the pump's
    history screen. **[verified]** — the `idx`/`seq` question this step used to open is answered
    in §5, and index 0 is the newest entry.
-7. Leave `YpsoSyncHistoryToAaps` off until `sincePosition` filtering is decided (§8 item 7).
-8. **Only then, the write path:** phase 1 of `SALINE_TEST_PROCEDURE.md`. Everything from here on
-   is a write, and every write is its own hardware gate.
+7. Leave `YpsoSyncHistoryToAaps` off until `sincePosition` filtering is decided (§8, last item).
+8. **The clock write** — phase 1 of `SALINE_TEST_PROCEDURE.md`. **[verified]** Also the quickest
+   way to prove the write path still works after any change to the framing code.
 
 Firmware confirmed **V05.02.03**.
+
+**Two cosmetic decode faults noticed while running phase 1, neither blocking:**
+
+- `ypso_serial_number` is stored as `10074292 ` — `getStringValue(0)` on the device-name
+  characteristic keeps the NUL terminator. It is harmless on screen but it also feeds
+  `pumpSerial` on every `PumpSync` call, so it wants fixing **before** `YpsoSyncHistoryToAaps`
+  is switched on, or records could split on a serial mismatch.
+- Firmware displays as `0.2.2.1` where the pump says **V05.02.03**. `formatVersion` joins the
+  raw bytes as decimal, which is not this characteristic's encoding. Cosmetic, but it is the
+  field a user would quote in a bug report.
 
 ---
 
@@ -600,20 +663,19 @@ status bytes are fully mapped (§4, including byte 10 as TBR percent), and the h
 verified against actions performed on the pump (§5). What is left is the write path, and it is
 gated one step at a time by `SALINE_TEST_PROCEDURE.md`.
 
-**The gate that blocks everything else:**
+**Phase 1 is done.** ✅ The clock write passed on hardware on 2026-07-30 (§4e), so the write
+path is open and the envelope rule is observed rather than guessed.
 
-1. **Run phase 1 — the clock write.** No write of any kind has ever succeeded against this pump.
-   §4e is an *inference* about the envelope until the phase-1 log says otherwise, and the two
-   raw-byte lines it asks for are the finding the rest of the write path is waiting on. Nothing
-   below should be built on a guess about what phase 1 will show.
+**Next, in order, one refusal per hardware test:**
 
-**Then, in order, one refusal per hardware test:**
-
-2. **Standard bolus** (phase 2). Add the `YpsoService` entry point and the `YpsoPlugin` override
-   → `deliverStandardBolus`. Check the 13-byte payload against §4e first — it currently goes out
-   framed. **Abort is part of this phase, not a follow-up:** wire AAPS's bolus-stop to
-   `cancelBolus()` and confirm a partial delivery in history before the phase counts as done.
-   Confirm every bolus by the history entry (type 2, `v1` in centi-units), never by the write.
+1. **Standard bolus** (phase 2). Add the `YpsoService` entry point and the `YpsoPlugin` override
+   → `deliverStandardBolus`. **Read `CHAR_BOLUS_START_STOP` before writing it**, the way
+   `syncTime` reads the clock characteristics — the 13-byte payload currently goes out framed
+   and CRC'd, which §4e says will be refused, but "bare" should be confirmed on that specific
+   attribute rather than assumed from the clock's. **Abort is part of this phase, not a
+   follow-up:** wire AAPS's bolus-stop to `cancelBolus()` and confirm a partial delivery in
+   history before the phase counts as done. Confirm every bolus by the history entry (type 2,
+   `v1` in centi-units), never by the write.
 3. **Bolus progress** — collect `pumpEvents` / the bolus-notification characteristic into
    `EventOverviewBolusProgress`. A Flow collection, not Medtrum's sleep-poll. Scale the
    completion timeout to the configured bolus speed (`YpsoBolusSpeed`, 12 U/min); a progress bar

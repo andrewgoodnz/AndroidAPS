@@ -3,11 +3,10 @@
 Hardware procedures for the YpsoPump driver's write path. Companion to `PORTING_NOTES.md`,
 which records what the pump has actually been observed to do.
 
-**Only phase 1 is implemented.** Phases 2–4 are written up here so the procedure exists before
-the code does, and so each phase's confirmation check is decided while nobody is under pressure
-to accept a weaker one. Their code is deliberately not written yet: the bolus, TBR and basal
-payloads all go out through the same framing that phase 1 exists to characterise, and writing
-them against a guess would mean removing several refusals on one untested assumption.
+**Phase 1 has passed on hardware. Phases 2–4 have procedures but no code.** They are written up
+here so each phase's confirmation check is decided while nobody is under pressure to accept a
+weaker one. Their code is deliberately not written yet: each removes a refusal that lets insulin
+move, and each gets its own saline test.
 
 ---
 
@@ -44,7 +43,17 @@ pass/fail in the app is a summary of it.
 
 ---
 
-## Phase 1 — the write path, via the pump clock
+## Phase 1 — the write path, via the pump clock ✅ **PASSED 2026-07-30**
+
+> **Result.** All four confirmation checks passed on pump 10074292, firmware V05.02.03.
+> Both clock characteristics are **bare** — `CHAR_SYSTEM_DATE` 4 bytes, `CHAR_SYSTEM_TIME`
+> 3 bytes, no framing header and no CRC. With the clock wound back 14 months, the driver wrote
+> `EA 07 07 1E` / `07 09 20`, read back identical bytes, the pump's display showed the correct
+> date and time, and the pump's history logged `12 Date Changed v1=30 v2=7 v3=26` and
+> `13 Time Changed v1=7 v2=9 v3=32`. Final skew −1 s. Details in `PORTING_NOTES` §4e and §5.
+>
+> Keep this procedure: it is the cheapest regression test for the write path, and worth
+> re-running after any change to the framing code.
 
 **What is being proven:** that this driver can write something that **changes the pump's state**,
 and that we know the wire envelope for such a write. Nothing here can move insulin. If the
@@ -159,12 +168,16 @@ whole point of the canary is that it fails cheaply.
 **What will be proven:** that a delivery command reaches the pump, that its progress can be
 followed, and — before anything else — that it can be stopped.
 
-**Before writing this code**, check the bolus payload against what phase 1 learned. The 13-byte
-bolus payload currently goes out as `chunkPayload(appendCrc(payload))` on
-`CHAR_BOLUS_START_STOP` — 16 bytes with a framing header. If phase 1 showed short writes are
-unframed, this is almost certainly refused with status 13 in exactly the same way the GLB write
-was, and the framing must come off first. A "sent" result means nothing until the pump's history
-says otherwise.
+**Before writing this code**, apply what phase 1 learned. Phase 1 showed short writes on this
+firmware are **bare** — no framing header, no CRC — so the 13-byte bolus payload, currently sent
+as `chunkPayload(appendCrc(payload))` (16 bytes with a header) on `CHAR_BOLUS_START_STOP`, will
+almost certainly be refused with status 13 exactly as the GLB write was. The framing has to come
+off.
+
+**But read that characteristic before writing it**, the way `syncTime` reads the clock ones,
+rather than hard-coding "bare" from phase 1. `CHAR_BOLUS_START_STOP` is a different attribute and
+has never been observed; the read costs one round trip and turns an assumption into a fact.
+A "sent" result means nothing until the pump's history says otherwise.
 
 **Abort is not optional and is not deferred.** Wiring AAPS's bolus-stop to `cancelBolus()` is part
 of this phase, not a follow-up to it. A bolus that has started and cannot be stopped is the
