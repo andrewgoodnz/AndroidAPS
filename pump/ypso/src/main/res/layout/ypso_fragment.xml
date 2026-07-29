@@ -187,6 +187,21 @@
                     android:layout_height="wrap_content"
                     tools:text="---" />
             </TableRow>
+
+            <TableRow>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:paddingEnd="8dp"
+                    android:text="@string/ypso_clock_label" />
+
+                <TextView
+                    android:id="@+id/pump_clock"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    tools:text="In sync with phone (2 s)" />
+            </TableRow>
         </TableLayout>
 
         <LinearLayout
@@ -210,6 +225,14 @@
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
                 android:text="@string/ypso_read_history" />
+
+            <Button
+                android:id="@+id/set_clock"
+                style="@style/GrayButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/ypso_set_clock" />
         </LinearLayout>
     </LinearLayout>
 </ScrollView>

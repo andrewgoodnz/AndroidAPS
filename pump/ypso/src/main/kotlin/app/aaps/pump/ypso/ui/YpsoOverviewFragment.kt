@@ -23,13 +23,19 @@ import dagger.android.support.DaggerFragment
 import io.reactivex.rxjava3.disposables.CompositeDisposable
 import io.reactivex.rxjava3.kotlin.plusAssign
 import javax.inject.Inject
+import kotlin.math.abs
 
 /**
- * Read-only status screen.
+ * Pump status screen.
  *
- * Its real job this session is the firmware parity check: every value shown here is meant to be
- * compared against the same value on the pump's own display. The history dump is deliberately
- * raw for the same reason.
+ * Its real job is the firmware parity check: every value shown here is meant to be compared
+ * against the same value on the pump's own display. The history dump is deliberately raw for the
+ * same reason, and the pump-clock row is deliberately a skew rather than a timestamp — both
+ * clocks keep running, so the offset stays true while a captured reading does not.
+ *
+ * "Set pump clock" is the one control here that writes to the pump, and the only write in the
+ * driver. It is confirmation-gated, and what it reports back is the pump's own clock read
+ * afterwards, not the result of the write.
  */
 class YpsoOverviewFragment : DaggerFragment() {
 
@@ -77,6 +83,43 @@ class YpsoOverviewFragment : DaggerFragment() {
                 }
             })
         }
+
+        // The only button here that writes to the pump, so it asks first. What it reports
+        // afterwards is what reading the pump's clock back said, not whether the write was
+        // accepted — the pump accepts bad writes silently.
+        binding.setClock.setOnClickListener {
+            val host = activity ?: return@setOnClickListener
+            OKDialog.showConfirmation(
+                host,
+                rh.gs(R.string.ypso_set_clock_confirm_title),
+                rh.gs(R.string.ypso_set_clock_confirm_message),
+                Runnable { setPumpClock() }
+            )
+        }
+    }
+
+    private fun setPumpClock() {
+        binding.setClock.isEnabled = false
+        commandQueue.customCommand(YpsoSyncTimeCommand(), object : app.aaps.core.interfaces.queue.Callback() {
+            override fun run() {
+                activity?.runOnUiThread {
+                    if (_binding != null) binding.setClock.isEnabled = true
+                    showClockWriteResult()
+                }
+            }
+        })
+    }
+
+    /**
+     * Reports the outcome from [YpsoPump.lastClockWriteConfirmed] rather than from the queue
+     * callback's `result`, which is a `lateinit` left unset whenever a command is dropped. A
+     * dropped command therefore reads as "not confirmed", which is the truthful answer.
+     */
+    private fun showClockWriteResult() {
+        val confirmed = ypsoPump.lastClockWriteConfirmed == true
+        val message = rh.gs(if (confirmed) R.string.ypso_clock_set_ok else R.string.ypso_clock_set_failed)
+        activity?.let { OKDialog.show(it, rh.gs(R.string.ypso_clock_result_title), message) }
+        aapsLogger.info(LTag.PUMP, "Clock write result shown: confirmed=$confirmed")
     }
 
     override fun onResume() {
@@ -140,6 +183,15 @@ class YpsoOverviewFragment : DaggerFragment() {
             ?.let { rh.gs(R.string.ypso_tbr_value, it.percentage, it.remainingMinutes) }
             ?: if (ypsoPump.isTbrRunning) rh.gs(R.string.ypso_tbr_running_no_detail) else PLACEHOLDER
 
+        binding.pumpClock.text = ypsoPump.pumpClockSkewMs?.let { skew ->
+            val magnitude = durationText(abs(skew))
+            when {
+                abs(skew) <= CLOCK_IN_SYNC_MS -> rh.gs(R.string.ypso_clock_in_sync, magnitude)
+                skew > 0                      -> rh.gs(R.string.ypso_clock_ahead, magnitude)
+                else                          -> rh.gs(R.string.ypso_clock_behind, magnitude)
+            }
+        } ?: PLACEHOLDER
+
         binding.connectionStatus.text = when {
             ypsoPlugin.isConnected()  -> rh.gs(R.string.ypso_connected)
             ypsoPlugin.isConnecting() -> rh.gs(R.string.ypso_connecting)
@@ -147,8 +199,24 @@ class YpsoOverviewFragment : DaggerFragment() {
         }
     }
 
+    /** Coarse, signed-magnitude rendering — the number that matters here is the order of it. */
+    private fun durationText(millis: Long): String {
+        val seconds = millis / 1000
+        return when {
+            seconds < 60    -> "$seconds s"
+            seconds < 3600  -> "${seconds / 60} min"
+            else            -> "%d h %02d min".format(seconds / 3600, (seconds % 3600) / 60)
+        }
+    }
+
     companion object {
 
         private const val PLACEHOLDER = "---"
+
+        /**
+         * Skew below which the two clocks are called agreed. Comfortably above the round trip a
+         * clock read costs, and far below the offset the saline procedure dials in deliberately.
+         */
+        private const val CLOCK_IN_SYNC_MS = 90_000L
     }
 }

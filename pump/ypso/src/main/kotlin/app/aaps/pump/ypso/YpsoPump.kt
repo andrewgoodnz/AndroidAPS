@@ -75,22 +75,36 @@ class YpsoPump @Inject constructor(
     var isDelivering: Boolean = false
 
     /**
-     * Whether the pump says a temporary basal is running.
-     *
-     * Separate from [activeTbr] on purpose: the system-status characteristic reports only the
-     * delivery mode, so this can be true while the percentage and remaining time are still
-     * unknown. Session 3 needs to find where the pump exposes that detail.
+     * Whether the pump says a temporary basal is running — the boolean form of
+     * "status byte 10 is not 100".
      */
     var isTbrRunning: Boolean = false
 
     /** Full temporary basal detail, or null when none is running *or* it has not been read. */
     var activeTbr: ActiveTbr? = null
 
+    /**
+     * How far the pump's clock sat from the phone's at the last read, in milliseconds; positive
+     * means the pump is ahead. Null until read, and null again after a failed read — a skew left
+     * over from an earlier session is indistinguishable on screen from a fresh one.
+     */
+    var pumpClockSkewMs: Long? = null
+
     /** 24 hourly rates in U/h for the active program, empty until read. */
     var basalProfileRates: List<Double> = emptyList()
 
     /** Last raw history dump, kept in memory only, for the firmware parity check. */
     var lastHistoryDump: List<String> = emptyList()
+
+    /**
+     * Outcome of the last clock write: true only when the pump's clock was read back and agreed
+     * with the phone's, false when it did not, null when the clock has never been written.
+     *
+     * Held here rather than taken from the command queue's callback because
+     * [app.aaps.core.interfaces.queue.Callback.result] is a `lateinit` that is never set when a
+     * command is dropped, and reading it then throws.
+     */
+    var lastClockWriteConfirmed: Boolean? = null
 
     val isPaired: Boolean get() = pumpMac.isNotBlank()
 
@@ -130,7 +144,9 @@ class YpsoPump @Inject constructor(
         isDelivering = false
         isTbrRunning = false
         activeTbr = null
+        pumpClockSkewMs = null
         basalProfileRates = emptyList()
         lastHistoryDump = emptyList()
+        lastClockWriteConfirmed = null
     }
 }

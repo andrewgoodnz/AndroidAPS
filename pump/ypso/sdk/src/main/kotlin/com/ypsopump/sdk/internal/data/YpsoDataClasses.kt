@@ -5,6 +5,7 @@ import com.ypsopump.sdk.internal.protocol.EventType
 import com.ypsopump.sdk.internal.protocol.YpsoCrc
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Calendar
 
 /**
  * Datos de estado del sistema de la bomba, obtenidos descifrando la característica
@@ -46,6 +47,55 @@ internal data class SystemStatusData(
 
         /** The pump reports 100% when no temporary basal is active. */
         const val TBR_PERCENT_NONE = 100
+    }
+}
+
+/**
+ * The pump's own date and time, read back from `CHAR_SYSTEM_DATE` and `CHAR_SYSTEM_TIME`.
+ *
+ * Held as separate calendar fields rather than as a timestamp so that a wrong field layout is
+ * visible as nonsense — month 34 rather than a plausible-looking millisecond value. That is what
+ * [isPlausible] checks, and it is the reason the clock is read before it is ever written: the
+ * read confirms the layout this code assumes.
+ *
+ * @property dateWire raw bytes of the date characteristic, as hex.
+ * @property timeWire raw bytes of the time characteristic, as hex. Together these are the only
+ *   record of what this firmware actually puts on the wire for the clock, and the write path
+ *   derives its envelope from the same read — see `YpsoBleManager.syncTime`.
+ */
+internal data class PumpClockData(
+    val year: Int,
+    val month: Int,
+    val day: Int,
+    val hour: Int,
+    val minute: Int,
+    val second: Int,
+    val dateWire: String,
+    val timeWire: String
+) {
+
+    /** Interpreted in the phone's own zone, which is the clock the pump is meant to agree with. */
+    fun epochMillis(): Long = Calendar.getInstance().apply {
+        clear()
+        set(year, month - 1, day, hour, minute, second)
+    }.timeInMillis
+
+    fun formatted(): String = "%04d-%02d-%02d %02d:%02d:%02d".format(year, month, day, hour, minute, second)
+
+    /**
+     * Whether these fields could be a real date at all.
+     *
+     * A read that fails this did not come from the layout this code assumes, so nothing may be
+     * written back to those characteristics on the strength of it.
+     */
+    val isPlausible: Boolean
+        get() = year in PLAUSIBLE_YEARS && month in 1..12 && day in 1..31 &&
+            hour in 0..23 && minute in 0..59 && second in 0..59
+
+    companion object {
+
+        /** The pump counts from 2000-01-01, so nothing outside this century is a real reading. */
+        private val PLAUSIBLE_YEARS = 2000..2099
     }
 }
 

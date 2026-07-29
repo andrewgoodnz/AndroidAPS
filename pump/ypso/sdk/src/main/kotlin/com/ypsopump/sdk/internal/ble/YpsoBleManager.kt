@@ -8,6 +8,7 @@ import android.content.Context
 import android.util.Log
 import com.ypsopump.sdk.internal.data.BolusStatusData
 import com.ypsopump.sdk.internal.data.HistoryEntry
+import com.ypsopump.sdk.internal.data.PumpClockData
 import com.ypsopump.sdk.internal.data.SystemStatusData
 import com.ypsopump.sdk.internal.protocol.BolusNotificationStatus
 import com.ypsopump.sdk.internal.protocol.DeliveryMode
@@ -24,6 +25,7 @@ import no.nordicsemi.android.ble.observer.ConnectionObserver
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
+import java.util.Calendar
 import java.util.UUID
 
 /**
@@ -53,6 +55,12 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
 
         /** Bytes of system status the driver decodes, before the 2-byte CRC. */
         private const val STATUS_PAYLOAD_BYTES = 18
+
+        /** `CHAR_SYSTEM_DATE` payload: year u16 LE, month u8, day u8. */
+        private const val DATE_PAYLOAD_BYTES = 4
+
+        /** `CHAR_SYSTEM_TIME` payload: hour u8, minute u8, second u8. */
+        private const val TIME_PAYLOAD_BYTES = 3
 
         /** Salt used by vicktor's SDK, verified against firmware V05.02.03. */
         val AUTH_SALT_SDK = byteArrayOf(
@@ -722,56 +730,203 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
         sendBolusCommand(payload, callback)
     }
 
+    // ==================== SYSTEM CLOCK ====================
+
     /**
-     * Sincroniza la fecha y la hora del sistema Android con la bomba.
+     * A short fixed-length message as the pump itself laid it out.
      *
-     * Escribe primero la fecha (año 2B LE + mes 1B + día 1B) en
-     * [YpsoPumpUuids.CHAR_SYSTEM_DATE] y, si tiene éxito, la hora
-     * (hora 1B + minutos 1B + segundos 1B) en [YpsoPumpUuids.CHAR_SYSTEM_TIME].
-     * Ambos payloads llevan CRC.
+     * [hasCrc] is the point of the whole type: it is observed on the pump's own reply rather than
+     * assumed, so a write to the same characteristic can be wrapped exactly the way the pump
+     * wraps its answers there.
+     */
+    private class ShortMessage(val payload: ByteArray, val hasCrc: Boolean, val raw: ByteArray)
+
+    /**
+     * Reads a short fixed-length characteristic, reporting its payload and whether this firmware
+     * terminates it with a CRC.
      *
-     * @param callback Llamado con `true` si tanto la fecha como la hora se escribieron correctamente.
+     * V05.02.03 uses fixed-length attributes for these short messages: a write of any other
+     * length is refused at the ATT layer with `GATT_INVALID_ATTRIBUTE_LENGTH` (13), which is
+     * exactly what the framing header did to every GLB write (see [writeGlb]). Reading first
+     * costs one round trip and replaces a guess about the envelope with an observation of it.
+     *
+     * Returns null — logging the raw bytes — when the reply is neither [payloadBytes] bare nor
+     * [payloadBytes] followed by a valid CRC. There is no third shape this code knows how to
+     * write, and guessing at one is how you set a pump's clock to garbage.
+     */
+    private fun readShortMessage(
+        char: BluetoothGattCharacteristic,
+        payloadBytes: Int,
+        callback: (ShortMessage?) -> Unit
+    ) {
+        readCharacteristic(char).with { _, data ->
+            val raw = data.value
+            if (raw == null) {
+                log("readShortMessage(${char.uuid}): empty read")
+                callback(null)
+                return@with
+            }
+            log("readShortMessage(${char.uuid}): ${raw.size}B = ${raw.toHexString()}")
+            when {
+                raw.size == payloadBytes                              ->
+                    callback(ShortMessage(raw, hasCrc = false, raw = raw))
+
+                raw.size == payloadBytes + 2 && YpsoCrc.isValid(raw)  ->
+                    callback(ShortMessage(raw.copyOfRange(0, payloadBytes), hasCrc = true, raw = raw))
+
+                else                                                  -> {
+                    log(
+                        "readShortMessage(${char.uuid}): unrecognised shape — expected ${payloadBytes}B bare " +
+                            "or ${payloadBytes + 2}B ending in a valid CRC, got ${raw.size}B ${raw.toHexString()}"
+                    )
+                    callback(null)
+                }
+            }
+        }.fail { _, status ->
+            log("readShortMessage(${char.uuid}) failed (GATT status=$status)")
+            callback(null)
+        }.enqueue()
+    }
+
+    /**
+     * Reads the pump's own date and time.
+     *
+     * Read-only and harmless, and it does three jobs at once: it surfaces the pump's clock for
+     * comparison against the phone, it proves the field layout this code assumes for those two
+     * characteristics, and it is the read-back that confirms [syncTime] actually took effect.
+     *
+     * Returns null if either characteristic will not read, or if the decoded fields could not be
+     * a real date — see [PumpClockData.isPlausible].
+     */
+    fun readClock(callback: (PumpClockData?) -> Unit) {
+        val dateChar = findCharacteristic(YpsoPumpUuids.CHAR_SYSTEM_DATE)
+        val timeChar = findCharacteristic(YpsoPumpUuids.CHAR_SYSTEM_TIME)
+        if (dateChar == null || timeChar == null) {
+            log("readClock: system date/time characteristic not found")
+            callback(null)
+            return
+        }
+
+        readShortMessage(dateChar, DATE_PAYLOAD_BYTES) { dateMsg ->
+            if (dateMsg == null) {
+                callback(null)
+                return@readShortMessage
+            }
+            readShortMessage(timeChar, TIME_PAYLOAD_BYTES) { timeMsg ->
+                if (timeMsg == null) {
+                    callback(null)
+                    return@readShortMessage
+                }
+
+                val date = ByteBuffer.wrap(dateMsg.payload).order(ByteOrder.LITTLE_ENDIAN)
+                val clock = PumpClockData(
+                    year = date.short.toInt() and 0xFFFF,
+                    month = date.get().toInt() and 0xFF,
+                    day = date.get().toInt() and 0xFF,
+                    hour = timeMsg.payload[0].toInt() and 0xFF,
+                    minute = timeMsg.payload[1].toInt() and 0xFF,
+                    second = timeMsg.payload[2].toInt() and 0xFF,
+                    dateWire = dateMsg.raw.toHexString(),
+                    timeWire = timeMsg.raw.toHexString()
+                )
+
+                if (!clock.isPlausible) {
+                    log(
+                        "readClock: implausible reading ${clock.formatted()} from date=${clock.dateWire} " +
+                            "time=${clock.timeWire} — these characteristics do not carry the layout this code " +
+                            "assumes, so the clock will not be written"
+                    )
+                    callback(null)
+                    return@readShortMessage
+                }
+
+                log(
+                    "Pump clock: ${clock.formatted()} (date wire ${clock.dateWire}" +
+                        "${if (dateMsg.hasCrc) " +CRC" else " bare"}, time wire ${clock.timeWire}" +
+                        "${if (timeMsg.hasCrc) " +CRC" else " bare"})"
+                )
+                callback(clock)
+            }
+        }
+    }
+
+    /**
+     * Sets the pump's clock from the phone's, with no framing header.
+     *
+     * Upstream sent both payloads CRC-terminated *and* framed through
+     * [writeFramesSequentially]; §4b of PORTING_NOTES showed this firmware refuses framed short
+     * writes outright. Rather than swap one assumption for another, this reads each
+     * characteristic first and matches whatever envelope came back — see [readShortMessage].
+     * If either read does not produce a shape this code can write, nothing is written at all.
+     *
+     * **`true` here means only that the bytes went out.** This pump does not NAK a bad write
+     * (PORTING_NOTES §3), so the caller must confirm the clock by reading it back; only
+     * `YpsoPumpManagerImpl.syncDateTime` may call a clock change successful.
      */
     fun syncTime(callback: (Boolean) -> Unit) {
-        val now = java.util.Calendar.getInstance()
-
-        val datePayload = ByteBuffer.allocate(4)
-            .order(ByteOrder.LITTLE_ENDIAN)
-            .putShort(now.get(java.util.Calendar.YEAR).toShort())
-            .put((now.get(java.util.Calendar.MONTH) + 1).toByte())
-            .put(now.get(java.util.Calendar.DAY_OF_MONTH).toByte())
-            .array()
-
-        val timePayload = byteArrayOf(
-            now.get(java.util.Calendar.HOUR_OF_DAY).toByte(),
-            now.get(java.util.Calendar.MINUTE).toByte(),
-            now.get(java.util.Calendar.SECOND).toByte()
-        )
-
         val dateChar = findCharacteristic(YpsoPumpUuids.CHAR_SYSTEM_DATE)
-        if (dateChar == null) {
+        val timeChar = findCharacteristic(YpsoPumpUuids.CHAR_SYSTEM_TIME)
+        if (dateChar == null || timeChar == null) {
+            log("syncTime: system date/time characteristic not found")
             callback(false)
             return
         }
 
-        val dateFrames = YpsoFraming.chunkPayload(YpsoCrc.appendCrc(datePayload))
-
-        writeFramesSequentially(dateChar, dateFrames, 0) { dateSuccess ->
-            if (!dateSuccess) {
+        readShortMessage(dateChar, DATE_PAYLOAD_BYTES) { dateShape ->
+            if (dateShape == null) {
+                log("syncTime aborted: the date characteristic did not read back in a shape this code can write")
                 callback(false)
-                return@writeFramesSequentially
+                return@readShortMessage
             }
+            readShortMessage(timeChar, TIME_PAYLOAD_BYTES) { timeShape ->
+                if (timeShape == null) {
+                    log("syncTime aborted: the time characteristic did not read back in a shape this code can write")
+                    callback(false)
+                    return@readShortMessage
+                }
 
-            val timeFrames = YpsoFraming.chunkPayload(YpsoCrc.appendCrc(timePayload))
-            val timeChar = findCharacteristic(YpsoPumpUuids.CHAR_SYSTEM_TIME)
+                // One snapshot for both payloads, so a write that straddles midnight cannot pair
+                // tomorrow's date with today's time.
+                val now = Calendar.getInstance()
+                val datePayload = ByteBuffer.allocate(DATE_PAYLOAD_BYTES)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .putShort(now.get(Calendar.YEAR).toShort())
+                    .put((now.get(Calendar.MONTH) + 1).toByte())
+                    .put(now.get(Calendar.DAY_OF_MONTH).toByte())
+                    .array()
+                val timePayload = byteArrayOf(
+                    now.get(Calendar.HOUR_OF_DAY).toByte(),
+                    now.get(Calendar.MINUTE).toByte(),
+                    now.get(Calendar.SECOND).toByte()
+                )
 
-            if (timeChar == null) {
-                callback(false)
-                return@writeFramesSequentially
+                writeShortMessage(dateChar, datePayload, dateShape.hasCrc) { dateWritten ->
+                    if (!dateWritten) {
+                        callback(false)
+                        return@writeShortMessage
+                    }
+                    writeShortMessage(timeChar, timePayload, timeShape.hasCrc, callback)
+                }
             }
-
-            writeFramesSequentially(timeChar, timeFrames, 0, callback)
         }
+    }
+
+    /** Writes a short message in the envelope [readShortMessage] observed, with no framing header. */
+    private fun writeShortMessage(
+        char: BluetoothGattCharacteristic,
+        payload: ByteArray,
+        withCrc: Boolean,
+        callback: (Boolean) -> Unit
+    ) {
+        val bytes = if (withCrc) YpsoCrc.appendCrc(payload) else payload
+        log("Writing ${bytes.size}B to ${char.uuid}: ${bytes.toHexString()}")
+        writeCharacteristic(char, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+            .with { _, _ -> callback(true) }
+            .fail { _, status ->
+                log("Short write to ${char.uuid} failed (GATT status=$status)")
+                callback(false)
+            }
+            .enqueue()
     }
 
     /**

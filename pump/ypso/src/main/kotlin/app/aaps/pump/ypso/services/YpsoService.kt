@@ -52,9 +52,10 @@ import javax.inject.Inject
  * calls into pump drivers from its own thread and expects a synchronous answer. Everything below
  * that line stays suspending.
  *
- * **This build reads and never writes.** The service exposes no bolus, TBR, basal-write or
- * clock-set entry point at all, so there is no code path from AAPS to a delivery command —
- * not a flag to check, an absence of method. Session 3 adds them, on saline.
+ * **This build reads, and writes only the clock.** The service exposes [syncPumpTime] and nothing
+ * else that writes: there is still no bolus, temporary-basal or basal-profile entry point on it
+ * at all, so there is no code path from AAPS to a delivery command — not a flag to check, an
+ * absence of method. Each of those is added on its own, behind its own saline test.
  */
 class YpsoService : DaggerService() {
 
@@ -142,6 +143,13 @@ class YpsoService : DaggerService() {
         scope.launch {
             pumpManager.isTbrActive.collect { active ->
                 ypsoPump.isTbrRunning = active
+                rxBus.send(EventYpsoPumpDataChanged())
+            }
+        }
+
+        scope.launch {
+            pumpManager.pumpClockSkewMs.collect { skew ->
+                ypsoPump.pumpClockSkewMs = skew
                 rxBus.send(EventYpsoPumpDataChanged())
             }
         }
@@ -285,6 +293,31 @@ class YpsoService : DaggerService() {
     /** Reads one of the pump's two basal programs without making it active. */
     fun readBasalProfile(profileId: Int): List<Double>? = awaitResult("readBasalProfile", null) {
         pumpManager.readBasalProfile(profileId)?.blocks?.map { it.basalRate }
+    }
+
+    // ==================== WRITES ====================
+
+    /**
+     * Sets the pump's clock from the phone's — the only write this build performs.
+     *
+     * It is deliberately the first one: no insulin can move, so a wrong wire format costs a
+     * refused GATT write rather than a dose. The result is whatever reading the clock back said,
+     * never what the write callback said — see `YpsoPumpManagerImpl.syncDateTime`.
+     *
+     * Every other write (bolus, temporary basal, basal profile) is still refused below the
+     * service, and each one is its own saline test before it is unblocked.
+     */
+    fun syncPumpTime(): Boolean = awaitResult("syncPumpTime", false) {
+        rxBus.send(EventPumpStatusChanged(rh.gs(R.string.ypso_setting_pump_clock)))
+        // Pessimistic up front, so an exception escaping into awaitResult's catch leaves
+        // "not confirmed" behind rather than whatever the previous attempt reported.
+        ypsoPump.lastClockWriteConfirmed = false
+        val confirmed = pumpManager.syncDateTime()
+        ypsoPump.lastClockWriteConfirmed = confirmed
+        if (confirmed) ypsoPump.onConnectionSucceeded()
+        aapsLogger.info(LTag.PUMP, "syncPumpTime: pump ${if (confirmed) "adopted" else "did NOT adopt"} the phone's clock")
+        rxBus.send(EventYpsoPumpDataChanged())
+        confirmed
     }
 
     // ==================== PUMPSYNC ====================

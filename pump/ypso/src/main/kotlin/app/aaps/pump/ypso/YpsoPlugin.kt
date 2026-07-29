@@ -43,6 +43,7 @@ import app.aaps.pump.ypso.keys.YpsoStringNonKey
 import app.aaps.pump.ypso.services.YpsoService
 import app.aaps.pump.ypso.ui.YpsoLoadHistoryCommand
 import app.aaps.pump.ypso.ui.YpsoOverviewFragment
+import app.aaps.pump.ypso.ui.YpsoSyncTimeCommand
 import io.reactivex.rxjava3.disposables.CompositeDisposable
 import io.reactivex.rxjava3.kotlin.plusAssign
 import javax.inject.Inject
@@ -55,10 +56,15 @@ import javax.inject.Singleton
  * Shaped on `MedtrumPlugin`: the plugin binds [YpsoService] and forwards to it; the service owns
  * the connection. See [YpsoService] for why there is no delivery path in this build.
  *
- * **Read-only.** Every method on the [Pump] interface that would move insulin or change pump
+ * **No delivery.** Every method on the [Pump] interface that would move insulin or change pump
  * configuration returns a failed [PumpEnactResult] without contacting the pump. They are
  * individually overridden rather than left to a default so that "does nothing" is visible at
  * each call site and a future edit has to be deliberate.
+ *
+ * The single exception is the clock: [YpsoSyncTimeCommand] reaches
+ * [YpsoService.syncPumpTime][app.aaps.pump.ypso.services.YpsoService.syncPumpTime] and does write
+ * to the pump. It is not a [Pump] method, it cannot move insulin, and it only ever runs when the
+ * user asks for it — it exists to prove the write path before anything that matters uses it.
  */
 @Singleton
 class YpsoPlugin @Inject constructor(
@@ -173,21 +179,33 @@ class YpsoPlugin @Inject constructor(
         append("Firmware: ${ypsoPump.firmwareVersion.ifBlank { "?" }}")
         if (!veryShort) {
             append("\nMode: ${ypsoPump.deliveryModeName.ifBlank { "?" }}")
-            append("\nRead-only build")
+            append("\nNo delivery (clock write only)")
         }
     }
 
     /**
-     * Reads the pump's history from inside a queued command, so it shares the normal
+     * Runs the driver's own commands inside a queued command, so they share the normal
      * connect/disconnect cycle instead of opening a second BLE session from the UI thread.
      */
     override fun executeCustomCommand(customCommand: CustomCommand): PumpEnactResult? =
         when (customCommand) {
             is YpsoLoadHistoryCommand -> pumpEnactResultProvider.get().success(ypsoService?.loadHistory() == true)
+
+            // The clock write. `confirmed` is what the pump's own clock read back as, not what
+            // the GATT write returned, so reporting it as enacted is a claim about the pump
+            // rather than about the phone.
+            is YpsoSyncTimeCommand    -> {
+                val confirmed = ypsoService?.syncPumpTime() == true
+                pumpEnactResultProvider.get()
+                    .success(confirmed)
+                    .enacted(confirmed)
+                    .comment(rh.gs(if (confirmed) R.string.ypso_clock_set_ok else R.string.ypso_clock_set_failed))
+            }
+
             else                      -> null
         }
 
-    // ==================== READ-ONLY: NOTHING BELOW TOUCHES THE PUMP ====================
+    // ==================== NO DELIVERY: NOTHING BELOW TOUCHES THE PUMP ====================
 
     override fun isThisProfileSet(profile: Profile): Boolean {
         // Claiming the profile is set would let AAPS believe the pump matches when it has never

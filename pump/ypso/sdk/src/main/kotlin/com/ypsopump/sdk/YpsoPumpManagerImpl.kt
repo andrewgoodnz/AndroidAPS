@@ -23,6 +23,7 @@ import com.pump.common.PumpStatus
 import com.ypsopump.sdk.internal.ble.DataEvent
 import com.ypsopump.sdk.internal.ble.YpsoBleManager
 import com.ypsopump.sdk.internal.data.HistoryEntry
+import com.ypsopump.sdk.internal.data.PumpClockData
 import com.ypsopump.sdk.internal.data.SystemStatusData
 import com.ypsopump.sdk.internal.parsing.PumpEventProcessor
 import com.ypsopump.sdk.internal.protocol.DeliveryMode
@@ -40,6 +41,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.resume
+import kotlin.math.abs
 
 /**
  * Plaintext [PumpManager] implementation for the YpsoPump, derived from vicktor's SDK.
@@ -61,8 +63,10 @@ import kotlin.coroutines.resume
  * MD5(6 MAC bytes ‖ 10-byte salt) and writes it to `CHAR_AUTH_PASSWORD`. Nothing is stored
  * and nothing is asked of the user.
  *
- * Every delivery entry point ([deliverStandardBolus], [setTbr], [writeBasalProfile], …) fails
- * without touching the pump. Wiring them up is session 3's job, on saline.
+ * Every delivery entry point ([deliverStandardBolus], [setTbr], [writeBasalProfile], …) still
+ * fails without touching the pump. The one write this build makes is [syncDateTime], which moves
+ * no insulin and exists to prove the write path — and which reports success only after reading
+ * the pump's clock back.
  */
 class YpsoPumpManagerImpl private constructor(
     private val context: Context
@@ -75,6 +79,19 @@ class YpsoPumpManagerImpl private constructor(
 
         /** Pump needs a moment after the auth write before it answers reads. */
         private const val POST_AUTH_SETTLE_MS = 300L
+
+        /** Breathing room between writing the clock and reading it back. */
+        private const val CLOCK_SETTLE_MS = 500L
+
+        /**
+         * How far the pump's clock may sit from the phone's and still count as adopted.
+         *
+         * Generous next to the round trip it has to cover — two reads, two writes and a settle —
+         * and far tighter than the offset the saline procedure deliberately dials in, so it
+         * separates "the pump took our time" from "the pump ignored us" without being fooled by
+         * BLE latency.
+         */
+        private const val CLOCK_MATCH_TOLERANCE_MS = 90_000L
 
         fun create(context: Context): YpsoPumpManagerImpl = YpsoPumpManagerImpl(context.applicationContext)
     }
@@ -117,6 +134,17 @@ class YpsoPumpManagerImpl private constructor(
      */
     private val _isTbrActive = MutableStateFlow(false)
     val isTbrActive: StateFlow<Boolean> = _isTbrActive
+
+    /**
+     * How far the pump's clock sat from the phone's at the last read, in milliseconds; positive
+     * means the pump is ahead. Null until it has been read, and null again whenever a read fails.
+     *
+     * The skew rather than the reading itself, because both clocks keep running: a pump time
+     * captured five minutes ago is misleading on screen, while the offset between the two stays
+     * true until something changes it.
+     */
+    private val _pumpClockSkewMs = MutableStateFlow<Long?>(null)
+    val pumpClockSkewMs: StateFlow<Long?> = _pumpClockSkewMs
 
     override val isPaired: Boolean get() = pairedMac != null
     override val pairedAddress: String? get() = pairedMac
@@ -322,6 +350,11 @@ class YpsoPumpManagerImpl private constructor(
         }
         _activeProfileId.value = profileId
         _pumpStatus.value = (_pumpStatus.value ?: PumpStatus()).copy(activeProfileId = profileId)
+
+        // Read-only, and the surface the clock canary is judged on: it tells the user how far the
+        // pump's clock has drifted before anyone asks for it to be written.
+        _pumpClockSkewMs.value = suspendReadClock()?.let { it.epochMillis() - System.currentTimeMillis() }
+
         _pumpStatus.value!!
     }
 
@@ -469,10 +502,70 @@ class YpsoPumpManagerImpl private constructor(
         (entry.value3 and 0xFF).toByte(), ((entry.value3 shr 8) and 0xFF).toByte()
     )
 
+    // ==================== SYSTEM CLOCK — THE ONLY WRITE IN THIS BUILD ====================
+
+    /**
+     * Sets the pump's clock from the phone's. This is the driver's first write of any kind.
+     *
+     * It is the canary for the write path precisely because nothing here can move insulin: if the
+     * wire format is wrong the pump refuses the write at the ATT layer and the clock is untouched,
+     * and if the format is right but the layout is wrong the read-back says so.
+     *
+     * **Success is decided by reading the clock back, never by the write callback.** This pump
+     * does not NAK a bad write — the wrong auth password produced a perfectly successful GATT
+     * write and only failed on the next read (PORTING_NOTES §3) — so a write callback tells us
+     * only that the ATT layer liked the length. The clock is an effect we can go and look at, so
+     * we look.
+     *
+     * Returns false, having written nothing, if the clock cannot be read first: without a
+     * read-back there is no way to confirm the write, and an unconfirmable write is one this
+     * driver does not make.
+     */
+    override suspend fun syncDateTime(): Boolean = withConnection {
+        val before = suspendReadClock()
+        if (before == null) {
+            log("syncDateTime refused: the pump's clock did not read back, so a write could not be confirmed")
+            _pumpClockSkewMs.value = null
+            return@withConnection false
+        }
+        val skewBefore = before.epochMillis() - System.currentTimeMillis()
+        _pumpClockSkewMs.value = skewBefore
+        log("Pump clock before the write: ${before.formatted()} (${skewBefore / 1000}s from the phone)")
+
+        if (!suspendSyncTime()) {
+            log("syncDateTime: the clock write did not go out; the pump's clock is unchanged")
+            return@withConnection false
+        }
+        delay(CLOCK_SETTLE_MS)
+
+        val after = suspendReadClock()
+        if (after == null) {
+            // The write went out and we cannot see what it did. Say so loudly rather than
+            // reporting either outcome.
+            log("syncDateTime: the clock did not read back after the write — the pump's clock is now UNKNOWN, check it on the pump")
+            _pumpClockSkewMs.value = null
+            return@withConnection false
+        }
+
+        val skewAfter = after.epochMillis() - System.currentTimeMillis()
+        _pumpClockSkewMs.value = skewAfter
+        val adopted = abs(skewAfter) <= CLOCK_MATCH_TOLERANCE_MS
+        if (adopted) {
+            log("syncDateTime confirmed by read-back: pump clock is now ${after.formatted()}, ${skewAfter / 1000}s from the phone")
+        } else {
+            log(
+                "syncDateTime FAILED: the write was accepted but the pump clock still reads " +
+                    "${after.formatted()}, ${skewAfter / 1000}s from the phone"
+            )
+        }
+        adopted
+    }
+
     // ==================== DELIVERY — NOT IMPLEMENTED ====================
     //
     // Nothing below touches the pump. These exist only to satisfy the PumpManager contract;
-    // this build reads, it never delivers. Session 3 wires them up against saline.
+    // this build sets the clock, reads, and never delivers. Each of these is its own hardware
+    // gate on saline, to be opened one at a time — never as a batch.
 
     override suspend fun deliverStandardBolus(amount: Double): BolusDeliveryResult =
         refuseDelivery("deliverStandardBolus($amount)")
@@ -498,11 +591,6 @@ class YpsoPumpManagerImpl private constructor(
 
     override suspend fun cancelTbr(): Boolean {
         log("REFUSED cancelTbr — $NOT_IMPLEMENTED")
-        return false
-    }
-
-    override suspend fun syncDateTime(): Boolean {
-        log("REFUSED syncDateTime — $NOT_IMPLEMENTED")
         return false
     }
 
@@ -540,6 +628,12 @@ class YpsoPumpManagerImpl private constructor(
 
     private suspend fun suspendGetSystemStatus(): SystemStatusData? =
         suspendCancellableCoroutine { cont -> bleManager.getSystemStatus { cont.resume(it) } }
+
+    private suspend fun suspendReadClock(): PumpClockData? =
+        suspendCancellableCoroutine { cont -> bleManager.readClock { cont.resume(it) } }
+
+    private suspend fun suspendSyncTime(): Boolean =
+        suspendCancellableCoroutine { cont -> bleManager.syncTime { cont.resume(it) } }
 
     // ==================== INTERNAL ====================
 
