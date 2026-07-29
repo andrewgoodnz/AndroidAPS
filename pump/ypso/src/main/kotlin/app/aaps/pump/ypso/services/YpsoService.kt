@@ -8,11 +8,13 @@ import app.aaps.core.data.model.TE
 import app.aaps.core.data.pump.defs.PumpType
 import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.logging.LTag
+import app.aaps.core.interfaces.pump.BolusProgressData
 import app.aaps.core.interfaces.pump.PumpSync
 import app.aaps.core.interfaces.resources.ResourceHelper
 import app.aaps.core.interfaces.rx.AapsSchedulers
 import app.aaps.core.interfaces.rx.bus.RxBus
 import app.aaps.core.interfaces.rx.events.EventAppExit
+import app.aaps.core.interfaces.rx.events.EventOverviewBolusProgress
 import app.aaps.core.interfaces.rx.events.EventPreferenceChange
 import app.aaps.core.interfaces.rx.events.EventPumpStatusChanged
 import app.aaps.core.interfaces.utils.DateUtil
@@ -24,6 +26,8 @@ import app.aaps.pump.ypso.events.EventYpsoPumpDataChanged
 import app.aaps.pump.ypso.events.EventYpsoPumpDeviceChanged
 import app.aaps.pump.ypso.keys.YpsoBooleanKey
 import app.aaps.pump.ypso.keys.YpsoIntKey
+import app.aaps.pump.ypso.keys.YpsoStringKey
+import com.pump.common.BolusDeliveryResult
 import com.pump.common.PumpConnectionState
 import com.pump.common.PumpHistoryEvent
 import com.ypsopump.sdk.YpsoEventTypes
@@ -52,10 +56,11 @@ import javax.inject.Inject
  * calls into pump drivers from its own thread and expects a synchronous answer. Everything below
  * that line stays suspending.
  *
- * **This build reads, and writes only the clock.** The service exposes [syncPumpTime] and nothing
- * else that writes: there is still no bolus, temporary-basal or basal-profile entry point on it
- * at all, so there is no code path from AAPS to a delivery command — not a flag to check, an
- * absence of method. Each of those is added on its own, behind its own saline test.
+ * **This build can set the clock and deliver a standard bolus, and nothing else.** There is still
+ * no temporary-basal or basal-profile entry point on this service at all — an absence of method,
+ * not a flag to check. Each is added on its own, behind its own saline test.
+ *
+ * [deliverBolus] is under test on saline and writes nothing to `PumpSync`; see its comment.
  */
 class YpsoService : DaggerService() {
 
@@ -151,6 +156,17 @@ class YpsoService : DaggerService() {
             pumpManager.pumpClockSkewMs.collect { skew ->
                 ypsoPump.pumpClockSkewMs = skew
                 rxBus.send(EventYpsoPumpDataChanged())
+            }
+        }
+
+        // Bolus progress, straight from the pump's own injected figure. Collecting a Flow rather
+        // than Medtrum's sleep-poll, and the value is never an estimate from elapsed time — an
+        // estimate would keep climbing through an occlusion and show insulin that never went in.
+        scope.launch {
+            pumpManager.bolusProgress.collect { progress ->
+                progress ?: return@collect
+                BolusProgressData.delivered = progress.deliveredUnits
+                rxBus.send(EventOverviewBolusProgress(rh, progress.deliveredUnits))
             }
         }
     }
@@ -319,6 +335,54 @@ class YpsoService : DaggerService() {
         rxBus.send(EventYpsoPumpDataChanged())
         confirmed
     }
+
+    /**
+     * Delivers a standard bolus and reports what the **pump** says went in.
+     *
+     * Saline testing note: this deliberately writes **nothing to `PumpSync`**. During phase 2 the
+     * pump is on saline and off-body, so a treatment record would be a lie in the therapy log.
+     * Recording boluses is part of enabling [YpsoBooleanKey.YpsoSyncHistoryToAaps], which is its
+     * own gate — and doing it here as well would need a `pumpId` scheme that agrees with the
+     * sequence numbers history sync uses, or the two would duplicate every bolus.
+     */
+    fun deliverBolus(insulin: Double): BolusDeliveryResult =
+        awaitResult("deliverBolus", BolusDeliveryResult(success = false, errorMessage = "Bolus failed", deliveredUnits = 0f)) {
+            pumpManager.bolusSpeedUnitsPerMinute = configuredBolusSpeedUnitsPerMinute()
+            val result = pumpManager.deliverStandardBolus(insulin)
+            aapsLogger.info(
+                LTag.PUMP,
+                "deliverBolus: asked ${insulin}U, pump delivered ${result.deliveredUnits}U, success=${result.success}" +
+                    (result.errorMessage?.let { ", $it" } ?: "")
+            )
+            result.deliveredUnits?.let { delivered ->
+                if (delivered > 0f) {
+                    ypsoPump.lastBolusAmount = delivered.toDouble()
+                    ypsoPump.lastBolusTime = dateUtil.now()
+                }
+            }
+            rxBus.send(EventYpsoPumpDataChanged())
+            result
+        }
+
+    /**
+     * Asks the pump to stop the running bolus.
+     *
+     * Launched rather than awaited: AAPS calls this from the UI thread while [deliverBolus] is
+     * still blocking the command-queue thread, so waiting here would deadlock the stop against
+     * the delivery it is trying to stop.
+     */
+    fun stopBolus() {
+        aapsLogger.info(LTag.PUMP, "stopBolus requested")
+        scope.launch { pumpManager.cancelBolus(null) }
+    }
+
+    /** The pump's own speed index: `0` = 3 U/min, `1` = 12 U/min, `2` = 33.3 U/min. */
+    private fun configuredBolusSpeedUnitsPerMinute(): Double =
+        when (preferences.get(YpsoStringKey.YpsoBolusSpeed)) {
+            "0"  -> 3.0
+            "2"  -> 33.3
+            else -> 12.0
+        }
 
     // ==================== PUMPSYNC ====================
 

@@ -21,11 +21,13 @@ import com.pump.common.PumpManager
 import com.pump.common.PumpStatus
 import com.ypsopump.sdk.internal.ble.DataEvent
 import com.ypsopump.sdk.internal.ble.YpsoBleManager
+import com.ypsopump.sdk.internal.data.BolusStatusData
 import com.ypsopump.sdk.internal.data.HistoryEntry
 import com.ypsopump.sdk.internal.data.PumpClockData
 import com.ypsopump.sdk.internal.data.SystemStatusData
 import com.ypsopump.sdk.internal.parsing.PumpEventProcessor
 import com.ypsopump.sdk.internal.parsing.YpsoHistoryMapper
+import com.ypsopump.sdk.internal.protocol.BolusNotificationStatus
 import com.ypsopump.sdk.internal.protocol.DeliveryMode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -92,6 +94,23 @@ class YpsoPumpManagerImpl private constructor(
          */
         private const val CLOCK_MATCH_TOLERANCE_MS = 90_000L
 
+        /** How often the pump's bolus status is read while a bolus runs. */
+        private const val BOLUS_POLL_INTERVAL_MS = 1_000L
+
+        /**
+         * Slack on top of the calculated delivery time, covering the command round trip and the
+         * pump's own start-up. Finishing the wait early is the dangerous direction — it would
+         * report a bolus as done while the pump is still delivering — so this is generous.
+         */
+        private const val BOLUS_TIMEOUT_SLACK_SECONDS = 60.0
+
+        /**
+         * Tolerance when comparing insulin amounts, half of the pump's 0.01 U resolution. Used
+         * both to decide a bolus completed and to catch the pump reporting a total that is not
+         * what was asked for.
+         */
+        private const val BOLUS_AMOUNT_EPSILON = 0.005
+
         fun create(context: Context): YpsoPumpManagerImpl = YpsoPumpManagerImpl(context.applicationContext)
     }
 
@@ -144,6 +163,33 @@ class YpsoPumpManagerImpl private constructor(
      */
     private val _pumpClockSkewMs = MutableStateFlow<Long?>(null)
     val pumpClockSkewMs: StateFlow<Long?> = _pumpClockSkewMs
+
+    /**
+     * Progress of the bolus currently running, or the last one to finish.
+     *
+     * [deliveredUnits] is always the pump's own figure, read from `CHAR_BOLUS_STATUS` — never an
+     * estimate from elapsed time, because an estimate would keep advancing after an occlusion or
+     * a stall and show insulin that never went in.
+     */
+    data class BolusProgress(
+        val deliveredUnits: Double,
+        val requestedUnits: Double,
+        val finished: Boolean,
+        val cancelled: Boolean
+    )
+
+    private val _bolusProgress = MutableStateFlow<BolusProgress?>(null)
+    val bolusProgress: StateFlow<BolusProgress?> = _bolusProgress
+
+    /**
+     * Bolus speed in U/min, mirrored from the driver preference; sets the completion timeout.
+     * Defaults to the 12 U/min the Lotus export had configured.
+     */
+    var bolusSpeedUnitsPerMinute: Double = 12.0
+
+    /** Set by [cancelBolus] from another thread, read by the delivery loop. */
+    @Volatile
+    private var cancelRequested: Boolean = false
 
     override val isPaired: Boolean get() = pairedMac != null
     override val pairedAddress: String? get() = pairedMac
@@ -492,14 +538,147 @@ class YpsoPumpManagerImpl private constructor(
         adopted
     }
 
+    // ==================== STANDARD BOLUS ====================
+
+    /**
+     * Delivers a standard bolus, reporting only what the pump says it actually delivered.
+     *
+     * The write result is ignored as evidence, per §0: this pump accepts a bad write silently.
+     * Progress and the final amount both come from reading `CHAR_BOLUS_STATUS`, which carries the
+     * pump's own injected/total figures.
+     *
+     * **The pump echoes back the total it understood, and that is checked.** If it does not match
+     * what was asked, the payload was misparsed and the pump is about to deliver the wrong dose,
+     * so delivery is cancelled immediately rather than allowed to run. That is the single most
+     * valuable check here — it catches a wrong payload *layout*, which a length check cannot.
+     */
+    override suspend fun deliverStandardBolus(amount: Double): BolusDeliveryResult = withConnection {
+        if (amount <= 0.0) {
+            return@withConnection bolusFailure(amount, "Bolus amount must be greater than zero")
+        }
+        if (amount > maxBolusAmount) {
+            return@withConnection bolusFailure(amount, "Bolus of $amount U exceeds the pump maximum of $maxBolusAmount U")
+        }
+
+        cancelRequested = false
+        _bolusProgress.value = BolusProgress(0.0, amount, finished = false, cancelled = false)
+
+        val before = suspendGetBolusStatus()
+        log(
+            "Bolus $amount U requested. Pump bolus status before: status=${before?.fastStatus} " +
+                "seq=${before?.fastSequence} injected=${before?.fastInjected} total=${before?.fastTotal}"
+        )
+
+        if (!suspendStartBolus(amount)) {
+            _bolusProgress.value = BolusProgress(0.0, amount, finished = true, cancelled = false)
+            return@withConnection bolusFailure(amount, "The pump refused the bolus command")
+        }
+
+        val timeoutMs = bolusTimeoutMs(amount)
+        val startedAt = System.currentTimeMillis()
+        log("Bolus sent. Waiting up to ${timeoutMs / 1000}s at $bolusSpeedUnitsPerMinute U/min")
+
+        var delivered = 0.0
+        var finishedByPump = false
+        var cancelled = false
+        var mismatch: String? = null
+
+        while (System.currentTimeMillis() - startedAt < timeoutMs) {
+            delay(BOLUS_POLL_INTERVAL_MS)
+            val status = suspendGetBolusStatus() ?: continue
+
+            // The pump's own idea of what it was asked for. A disagreement here means the 13-byte
+            // payload was not parsed the way this code laid it out.
+            if (status.fastTotal > 0f && abs(status.fastTotal - amount) > BOLUS_AMOUNT_EPSILON) {
+                mismatch = "pump reports a bolus total of ${status.fastTotal} U but $amount U was requested"
+                log("BOLUS MISMATCH: $mismatch — cancelling immediately")
+                suspendCancelBolus()
+                cancelled = true
+                delivered = status.fastInjected.toDouble()
+                break
+            }
+
+            delivered = status.fastInjected.toDouble()
+            _bolusProgress.value = BolusProgress(delivered, amount, finished = false, cancelled = cancelRequested)
+
+            if (BolusNotificationStatus.isTerminal(status.fastStatus)) {
+                finishedByPump = true
+                cancelled = status.fastStatus == BolusNotificationStatus.CANCELLED
+                log("Bolus finished: pump status ${BolusNotificationStatus.name(status.fastStatus)}, injected $delivered U")
+                break
+            }
+        }
+
+        // One last read, so the reported amount is the pump's final word rather than the last
+        // sample taken mid-delivery.
+        suspendGetBolusStatus()?.let { delivered = it.fastInjected.toDouble() }
+        _bolusProgress.value = BolusProgress(delivered, amount, finished = true, cancelled = cancelled)
+
+        val complete = finishedByPump && !cancelled && abs(delivered - amount) <= BOLUS_AMOUNT_EPSILON
+        val error = when {
+            mismatch != null -> mismatch
+            cancelled        -> "Bolus cancelled after $delivered U of $amount U"
+            !finishedByPump  -> "Timed out waiting for the pump to finish; it reported $delivered U of $amount U"
+            !complete        -> "Pump delivered $delivered U of the $amount U requested"
+            else             -> null
+        }
+        error?.let { log("Bolus result: $it") }
+            ?: log("Bolus complete and confirmed by the pump: $delivered U")
+
+        BolusDeliveryResult(
+            success = complete,
+            errorMessage = error,
+            deliveredUnits = delivered.toFloat(),
+            requestedUnits = amount.toFloat()
+        )
+    }
+
+    /**
+     * Asks the pump to stop the running bolus.
+     *
+     * **Deliberately does not take the connection lock.** [deliverStandardBolus] holds it for the
+     * whole delivery, and a stop request that has to queue behind the thing it is stopping is not
+     * a stop request. Nordic's `BleManager` serialises the GATT operations themselves, so issuing
+     * the write from another thread is safe.
+     *
+     * A `true` means the cancel command was sent, not that delivery stopped — how much actually
+     * went in comes from the pump, and [deliverStandardBolus] reports it.
+     */
+    override suspend fun cancelBolus(bolusId: Int?): Boolean {
+        cancelRequested = true
+        if (!isConnected) {
+            log("cancelBolus: not connected, nothing sent")
+            return false
+        }
+        val sent = suspendCancelBolus()
+        log("cancelBolus command sent=$sent — the amount delivered comes from the pump, not from this result")
+        return sent
+    }
+
+    private fun bolusFailure(amount: Double, reason: String): BolusDeliveryResult {
+        log("Bolus refused: $reason")
+        return BolusDeliveryResult(
+            success = false,
+            errorMessage = reason,
+            deliveredUnits = 0f,
+            requestedUnits = amount.toFloat()
+        )
+    }
+
+    /**
+     * How long to wait for the pump to finish, from the configured bolus speed plus slack for the
+     * command round trip and the pump's own start-up.
+     */
+    private fun bolusTimeoutMs(amount: Double): Long {
+        val deliverySeconds = amount / (bolusSpeedUnitsPerMinute / 60.0)
+        return ((deliverySeconds + BOLUS_TIMEOUT_SLACK_SECONDS) * 1000).toLong()
+    }
+
     // ==================== DELIVERY — NOT IMPLEMENTED ====================
     //
     // Nothing below touches the pump. These exist only to satisfy the PumpManager contract;
     // this build sets the clock, reads, and never delivers. Each of these is its own hardware
     // gate on saline, to be opened one at a time — never as a batch.
-
-    override suspend fun deliverStandardBolus(amount: Double): BolusDeliveryResult =
-        refuseDelivery("deliverStandardBolus($amount)")
 
     override suspend fun deliverExtendedBolus(amount: Double, durationMinutes: Int): BolusDeliveryResult =
         refuseDelivery("deliverExtendedBolus($amount, $durationMinutes)")
@@ -509,11 +688,6 @@ class YpsoPumpManagerImpl private constructor(
         extendedAmount: Double,
         durationMinutes: Int
     ): BolusDeliveryResult = refuseDelivery("deliverMultiwaveBolus($immediateAmount, $extendedAmount, $durationMinutes)")
-
-    override suspend fun cancelBolus(bolusId: Int?): Boolean {
-        log("REFUSED cancelBolus — $NOT_IMPLEMENTED")
-        return false
-    }
 
     override suspend fun setTbr(percentage: Int, durationMinutes: Int): Boolean {
         log("REFUSED setTbr($percentage%, ${durationMinutes}min) — $NOT_IMPLEMENTED")
@@ -565,6 +739,15 @@ class YpsoPumpManagerImpl private constructor(
 
     private suspend fun suspendSyncTime(): Boolean =
         suspendCancellableCoroutine { cont -> bleManager.syncTime { cont.resume(it) } }
+
+    private suspend fun suspendGetBolusStatus(): BolusStatusData? =
+        suspendCancellableCoroutine { cont -> bleManager.getBolusStatus { cont.resume(it) } }
+
+    private suspend fun suspendStartBolus(amount: Double): Boolean =
+        suspendCancellableCoroutine { cont -> bleManager.startBolus(amount.toFloat()) { cont.resume(it) } }
+
+    private suspend fun suspendCancelBolus(): Boolean =
+        suspendCancellableCoroutine { cont -> bleManager.cancelBolus("fast") { cont.resume(it) } }
 
     // ==================== INTERNAL ====================
 

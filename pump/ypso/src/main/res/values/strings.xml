@@ -7,7 +7,7 @@
     <string name="ypso_pump_setting">YpsoPump settings</string>
 
     <string name="ypso_read_only_build">This driver does not deliver insulin</string>
-    <string name="ypso_read_only_banner">No delivery — no bolus, no temp basal, no basal write. Setting the pump clock is the only write.</string>
+    <string name="ypso_read_only_banner">SALINE TEST BUILD — standard bolus is enabled and under test. No temp basal, no basal write.</string>
 
     <string name="ypso_pairing_title">Pair YpsoPump</string>
     <string name="ypso_pairing_summary">Scan for your pump and bond to it. Confirm the code shown on the pump.</string>
@@ -59,6 +59,9 @@
     <string name="ypso_clock_result_title">Pump clock</string>
     <string name="ypso_clock_set_ok">Pump clock set, and confirmed by reading it back from the pump.</string>
     <string name="ypso_clock_set_failed">Pump clock NOT confirmed. Check the clock on the pump itself and read the log before trying again.</string>
+
+    <string name="ypso_bolus_not_connected">Pump not connected — no bolus was sent</string>
+    <string name="ypso_bolus_over_pump_max">Bolus of %1$.2f U exceeds the pump maximum of %2$.2f U</string>
 
     <string name="ypso_bolus_speed_title">Bolus speed</string>
     <string name="ypso_nano_bolus_title">Nano bolus</string>

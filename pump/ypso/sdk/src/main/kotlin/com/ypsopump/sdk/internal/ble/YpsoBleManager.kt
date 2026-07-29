@@ -599,23 +599,66 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
     }
 
     /**
-     * Envía un comando de bolo a la característica dedicada [YpsoPumpUuids.CHAR_BOLUS_START_STOP].
+     * Sends a 13-byte bolus command to [YpsoPumpUuids.CHAR_BOLUS_START_STOP], unframed.
      *
-     * Equivalente a [sendCommand] pero siempre usa la característica de bolo. El flujo es:
-     * añadir CRC → trocear en tramas → escribir.
+     * Upstream sent this CRC-terminated *and* framed, which would offer 16 bytes where the pump
+     * wants 13 — the same mistake §4b found in the GLB write, and phase 1 confirmed the firmware
+     * uses fixed-length attributes throughout.
      *
-     * @param payload Payload del bolo de 13 bytes (totalScaled, durationMinutes, immediateScaled, bolusType).
-     * @param callback Llamado con `true` si el comando fue aceptado por la bomba.
+     * **A `true` here means the bytes went out and nothing more.** The pump does not NAK a bad
+     * write, so the amount actually delivered has to come from the pump's own bolus status or its
+     * history, never from this callback.
      */
     fun sendBolusCommand(payload: ByteArray, callback: (Boolean) -> Unit) {
         val char = charBolusStartStop
         if (char == null) {
+            log("sendBolusCommand: CHAR_BOLUS_START_STOP not found")
             callback(false)
             return
         }
+        writeCommandPayload(char, payload, "bolus", callback)
+    }
 
-        val frames = YpsoFraming.chunkPayload(YpsoCrc.appendCrc(payload))
-        writeFramesSequentially(char, frames, 0, callback)
+    /**
+     * Writes a fixed-length command payload bare, recording what the attribute looks like first.
+     *
+     * Phase 1 established the envelope across four separate attributes — auth password, GLB,
+     * system date and system time — all bare. This still logs the control characteristic's
+     * properties and current contents before writing, because that is the evidence the next
+     * command's wire format will be argued from, and it costs one round trip.
+     *
+     * Unlike the clock, the write is **not** gated on that read: a control characteristic's read
+     * value need not share the shape of its write, so an unrecognised read here would be normal
+     * rather than a warning. Getting the length wrong is refused at the ATT layer with
+     * `GATT_INVALID_ATTRIBUTE_LENGTH` and never reaches the pump's application — loud and
+     * harmless. Getting the *content* wrong is neither, which is why every caller confirms the
+     * effect against the pump rather than against this result.
+     */
+    private fun writeCommandPayload(
+        char: BluetoothGattCharacteristic,
+        payload: ByteArray,
+        what: String,
+        callback: (Boolean) -> Unit
+    ) {
+        val send = {
+            log("$what: writing ${payload.size}B bare to ${char.uuid}: ${payload.toHexString()}")
+            writeShortMessage(char, payload, withCrc = false, callback)
+        }
+
+        if (char.properties and BluetoothGattCharacteristic.PROPERTY_READ == 0) {
+            log("$what: ${char.uuid} is write-only (properties=0x%02X)".format(char.properties))
+            send()
+            return
+        }
+
+        readCharacteristic(char).with { _, data ->
+            val raw = data.value
+            log("$what: ${char.uuid} currently reads ${raw?.size ?: 0}B = ${raw?.toHexString() ?: "(empty)"}")
+            send()
+        }.fail { _, status ->
+            log("$what: ${char.uuid} read failed (GATT status=$status), writing anyway")
+            send()
+        }.enqueue()
     }
 
     /**

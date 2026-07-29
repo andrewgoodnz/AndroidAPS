@@ -56,15 +56,15 @@ import javax.inject.Singleton
  * Shaped on `MedtrumPlugin`: the plugin binds [YpsoService] and forwards to it; the service owns
  * the connection. See [YpsoService] for why there is no delivery path in this build.
  *
- * **No delivery.** Every method on the [Pump] interface that would move insulin or change pump
- * configuration returns a failed [PumpEnactResult] without contacting the pump. They are
- * individually overridden rather than left to a default so that "does nothing" is visible at
- * each call site and a future edit has to be deliberate.
+ * **Saline test build.** Two things reach the pump: the clock, via [YpsoSyncTimeCommand], and a
+ * **standard bolus**, via [deliverTreatment]. Everything else that would move insulin or change
+ * pump configuration — temporary basal, extended bolus, basal profile — still returns a failed
+ * [PumpEnactResult] without contacting the pump. Those are overridden individually rather than
+ * left to a default, so that "does nothing" is visible at each call site and enabling one has to
+ * be a deliberate act with its own hardware test.
  *
- * The single exception is the clock: [YpsoSyncTimeCommand] reaches
- * [YpsoService.syncPumpTime][app.aaps.pump.ypso.services.YpsoService.syncPumpTime] and does write
- * to the pump. It is not a [Pump] method, it cannot move insulin, and it only ever runs when the
- * user asks for it — it exists to prove the write path before anything that matters uses it.
+ * The bolus path reports the amount the **pump** says it delivered, never the amount asked for,
+ * and `success` is true only when the two agree.
  */
 @Singleton
 class YpsoPlugin @Inject constructor(
@@ -179,7 +179,7 @@ class YpsoPlugin @Inject constructor(
         append("Firmware: ${ypsoPump.firmwareVersion.ifBlank { "?" }}")
         if (!veryShort) {
             append("\nMode: ${ypsoPump.deliveryModeName.ifBlank { "?" }}")
-            append("\nNo delivery (clock write only)")
+            append("\nSaline test build: bolus only")
         }
     }
 
@@ -216,11 +216,49 @@ class YpsoPlugin @Inject constructor(
 
     override fun setNewBasalProfile(profile: Profile): PumpEnactResult = notImplemented("setNewBasalProfile")
 
-    override fun deliverTreatment(detailedBolusInfo: DetailedBolusInfo): PumpEnactResult =
-        notImplemented("deliverTreatment(${detailedBolusInfo.insulin}U)")
+    /**
+     * Delivers a standard bolus. **Under saline test — see SALINE_TEST_PROCEDURE.md phase 2.**
+     *
+     * `bolusDelivered` is what the pump reported injecting, not what was asked for, and `success`
+     * is only true when the two agree. A cancelled or short bolus therefore reports failure while
+     * still carrying the partial amount, which is the combination the caller needs to get IOB
+     * right.
+     */
+    @Synchronized
+    override fun deliverTreatment(detailedBolusInfo: DetailedBolusInfo): PumpEnactResult {
+        require(detailedBolusInfo.carbs == 0.0) { detailedBolusInfo.toString() }
+        require(detailedBolusInfo.insulin > 0) { detailedBolusInfo.toString() }
+
+        val result = pumpEnactResultProvider.get()
+        val service = ypsoService
+        if (!isInitialized() || service == null) {
+            aapsLogger.error(LTag.PUMP, "deliverTreatment refused: pump not initialised")
+            return result.success(false).enacted(false).comment(rh.gs(R.string.ypso_bolus_not_connected))
+        }
+
+        // Clamp to the pump's own maximum. AAPS's SafetyMaxBolus is the user's setting and is
+        // applied by the command queue; this is the separate, pump-side cap.
+        val pumpMax = preferences.get(YpsoDoubleNonKey.MaxBolus)
+        val requested = detailedBolusInfo.insulin
+        if (requested > pumpMax) {
+            aapsLogger.error(LTag.PUMP, "deliverTreatment refused: ${requested}U exceeds the pump maximum of ${pumpMax}U")
+            return result.success(false).enacted(false).comment(rh.gs(R.string.ypso_bolus_over_pump_max, requested, pumpMax))
+        }
+
+        aapsLogger.info(LTag.PUMP, "deliverTreatment: ${requested}U")
+        val delivery = service.deliverBolus(requested)
+        val delivered = delivery.deliveredUnits?.toDouble() ?: 0.0
+
+        result.bolusDelivered = delivered
+        result.success(delivery.success).enacted(delivered > 0.0)
+        result.comment(delivery.errorMessage ?: rh.gs(app.aaps.core.ui.R.string.ok))
+        aapsLogger.info(LTag.PUMP, "deliverTreatment done: asked ${requested}U, pump delivered ${delivered}U, success=${delivery.success}")
+        return result
+    }
 
     override fun stopBolusDelivering() {
-        aapsLogger.warn(LTag.PUMP, "stopBolusDelivering ignored: this build never starts a bolus")
+        aapsLogger.info(LTag.PUMP, "stopBolusDelivering")
+        ypsoService?.stopBolus()
     }
 
     override fun setTempBasalAbsolute(
