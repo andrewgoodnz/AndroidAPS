@@ -129,21 +129,16 @@ internal class PumpEventProcessor {
         lastReservoirUnits = status.insulinRemaining
 
         if (lastDeliveryMode >= 0 && status.deliveryMode != lastDeliveryMode) {
-            val oldName = DeliveryMode.name(lastDeliveryMode)
-            val newName = DeliveryMode.name(status.deliveryMode)
+            val oldName = DeliveryMode.nameFor(lastDeliveryMode)
+            val newName = DeliveryMode.nameFor(status.deliveryMode)
             events.add(PumpEvent.DeliveryModeChanged(oldName, newName))
 
-            when (status.deliveryMode) {
-                DeliveryMode.STOPPED -> events.add(PumpEvent.DeliveryStopped("Pump stopped"))
-                DeliveryMode.TBR -> {
-                    if (lastDeliveryMode != DeliveryMode.TBR) {
-                        events.add(PumpEvent.TbrStarted(0, 0))
-                    }
-                }
-            }
-
-            if (lastDeliveryMode == DeliveryMode.TBR && status.deliveryMode == DeliveryMode.BASAL) {
-                events.add(PumpEvent.TbrCompleted(100))
+            // Upstream mapped specific raw values onto "stopped", "TBR started" and so on.
+            // Those values are wrong for firmware V05.02.03 (see DeliveryMode), so emitting
+            // them would announce state changes that never happened. Only the fact that the
+            // mode changed is trustworthy until the mapping is confirmed on hardware.
+            if (DeliveryMode.isDeliveringOrNull(status.deliveryMode) == false) {
+                events.add(PumpEvent.DeliveryStopped("Pump reports not delivering"))
             }
         }
         lastDeliveryMode = status.deliveryMode

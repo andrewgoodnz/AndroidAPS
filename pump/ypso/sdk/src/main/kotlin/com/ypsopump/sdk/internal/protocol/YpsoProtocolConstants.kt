@@ -10,6 +10,20 @@ package com.ypsopump.sdk.internal.protocol
  * La función [name] convierte un valor numérico en una cadena legible para la UI.
  */
 internal object DeliveryMode {
+
+    /**
+     * **Upstream's table, and it does not match firmware V05.02.03.**
+     *
+     * Checked against the pump's own status screen: with the pump displaying **Stopped**, byte 0
+     * of the system status read `3`, which this table calls `BOLUS_FAST`. Reporting that as a
+     * bolus in progress also made [isDelivering] true, so AAPS believed a stopped pump was
+     * running basal — the opposite of the truth, and the direction that matters, because
+     * anything reasoning about insulin on board would have assumed background delivery that was
+     * not happening.
+     *
+     * These constants are kept only for reference. Use [nameFor] and [isDeliveringOrNull], which
+     * report what has actually been confirmed on hardware and nothing more.
+     */
     const val STOPPED = 0
     const val BASAL = 1
     const val TBR = 2
@@ -19,16 +33,26 @@ internal object DeliveryMode {
     const val PRIMING = 6
     const val PAUSED = 7
 
-    fun name(mode: Int): String = when (mode) {
-        STOPPED -> "Stopped"
-        BASAL -> "Basal"
-        TBR -> "TBR Active"
-        BOLUS_FAST -> "Fast Bolus"
-        BOLUS_EXTENDED -> "Extended Bolus"
-        BOLUS_AND_BASAL -> "Bolus + Basal"
-        PRIMING -> "Priming"
-        PAUSED -> "Paused"
-        else -> "Unknown($mode)"
+    /** Raw byte-0 value seen while the pump displayed "Stopped". The one verified data point. */
+    const val V05_STOPPED = 3
+
+    /** Raw values confirmed against the pump screen to mean "not delivering". */
+    private val CONFIRMED_NOT_DELIVERING = setOf(V05_STOPPED)
+
+    /**
+     * Whether the pump is delivering, or `null` when the raw value has never been checked
+     * against the pump's display.
+     *
+     * No value has yet been confirmed to *mean* delivery — building that mapping needs the pump
+     * started, which this read-only build will not do. Callers should treat `null` as "don't
+     * know" and must not turn it into "delivering".
+     */
+    fun isDeliveringOrNull(mode: Int): Boolean? = if (mode in CONFIRMED_NOT_DELIVERING) false else null
+
+    /** Names only what has been verified; anything else says plainly that it is a guess. */
+    fun nameFor(mode: Int): String = when (mode) {
+        V05_STOPPED -> "Stopped"
+        else        -> "Unverified mode $mode"
     }
 }
 

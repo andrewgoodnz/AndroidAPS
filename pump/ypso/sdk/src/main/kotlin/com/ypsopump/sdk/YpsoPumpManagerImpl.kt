@@ -534,12 +534,18 @@ class YpsoPumpManagerImpl private constructor(
     // ==================== INTERNAL ====================
 
     private fun updateStatusFromSystem(status: SystemStatusData) {
-        _isTbrActive.value = status.deliveryMode == DeliveryMode.TBR
+        // Upstream's TBR mode value is from a different firmware and cannot be trusted here.
+        // Claiming "no TBR" is the safe direction: it does not invent a temporary basal.
+        _isTbrActive.value = false
+
+        // Only assert delivery where it has been confirmed against the pump's own display.
+        // An unverified mode reads as "not delivering" rather than "delivering", because
+        // wrongly telling AAPS that basal is running is the error that actually hurts.
         _pumpStatus.value = (_pumpStatus.value ?: PumpStatus()).copy(
             batteryPercent = status.batteryPercent,
             reservoirUnits = status.insulinRemaining.toDouble(),
             deliveryModeName = status.deliveryModeName,
-            isDelivering = status.deliveryMode != DeliveryMode.STOPPED && status.deliveryMode != DeliveryMode.PAUSED
+            isDelivering = DeliveryMode.isDeliveringOrNull(status.deliveryMode) == true
         )
     }
 

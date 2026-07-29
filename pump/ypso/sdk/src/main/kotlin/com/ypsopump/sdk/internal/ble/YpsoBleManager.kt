@@ -644,7 +644,7 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
                     val bars = payload[5].toInt() and 0xFF
                     val status = SystemStatusData(
                         deliveryMode = mode,
-                        deliveryModeName = DeliveryMode.name(mode),
+                        deliveryModeName = DeliveryMode.nameFor(mode),
                         insulinRemaining = insulinRaw / 100f,
                         batteryPercent = (bars.coerceIn(0, BATTERY_BARS_MAX) * 100) / BATTERY_BARS_MAX,
                         batteryBars = bars
