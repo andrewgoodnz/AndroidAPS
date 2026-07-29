@@ -214,8 +214,12 @@ class YpsoOverviewFragment : DaggerFragment() {
         private const val PLACEHOLDER = "---"
 
         /**
-         * Skew below which the two clocks are called agreed. Comfortably above the round trip a
-         * clock read costs, and far below the offset the saline procedure dials in deliberately.
+         * Skew below which this screen calls the two clocks agreed.
+         *
+         * Deliberately the same figure as `YpsoPumpManagerImpl.CLOCK_MATCH_TOLERANCE_MS`, which
+         * is what decides whether a clock write is reported as confirmed. They cannot share a
+         * constant across the module boundary, so keep them in step by hand: if this one is
+         * looser, the row can read "in sync" for a write the driver called a failure.
          */
         private const val CLOCK_IN_SYNC_MS = 90_000L
     }
