@@ -347,8 +347,14 @@ Carried forward from session 1, all still true:
   **Revert the suffix before committing.**
 - The guard is evaluated when `:app` is *configured*, which happens even for module-only tasks
   like `:pump:ypso:compileFullDebugKotlin`.
-- Keep Android Studio closed while building from the CLI — its Gradle daemon holds
-  `core/interfaces/build/.../classes.jar` open and the build fails with `FileSystemException`.
+- `FileSystemException: core/interfaces/build/.../classes.jar: The process cannot access the
+  file because it is being used by another process` means **two Gradle daemons are fighting over
+  the build directory**. `./gradlew --stop`, then rebuild.
+  - Android Studio being open is one way to get there, and is what session 1 recorded — but it
+    is not the only way, and the fix is the same either way. Session 2 hit this twice with
+    Android Studio **closed**: invoking `gradlew` alternately from PowerShell and from Git Bash
+    starts a second daemon, because the differing environment doesn't match the first daemon's
+    JVM args. Pick one shell for Gradle in this repo and stay in it.
 - `JAVA_HOME` must be set for `gradlew.bat`; the Android Studio JBR
   (`C:\Program Files\Android\Android Studio\jbr`) works.
 - `:app:kspFullDebugKotlin` can fail spuriously with `ComponentProcessingStep was unable to
