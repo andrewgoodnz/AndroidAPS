@@ -8,21 +8,19 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
-import android.content.BroadcastReceiver
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.widget.BaseAdapter
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
-import androidx.core.content.IntentCompat
 import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.logging.LTag
 import app.aaps.core.interfaces.pump.BlePreCheck
@@ -63,9 +61,12 @@ class YpsoBLEScanActivity : TranslatedDaggerAppCompatActivity() {
     private var listAdapter: ListAdapter? = null
     private val devices = ArrayList<BluetoothDeviceItem>()
 
-    private var bondReceiver: BroadcastReceiver? = null
+    private val bondPollHandler = Handler(Looper.getMainLooper())
+    private var bondPoll: Runnable? = null
     private var bondDialog: AlertDialog? = null
     private var bondingDevice: String? = null
+    private var sawBonding = false
+    private var bondDeadline = 0L
 
     private val bluetoothAdapter: BluetoothAdapter?
         get() = (context.getSystemService(BLUETOOTH_SERVICE) as BluetoothManager?)?.adapter
@@ -110,7 +111,7 @@ class YpsoBLEScanActivity : TranslatedDaggerAppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         // Both hold a reference to this activity; leaving either behind leaks it.
-        unregisterBondReceiver()
+        stopBondPoll()
         bondDialog?.dismiss()
         bondDialog = null
         binding.bleScannerListview.adapter = null
@@ -203,23 +204,19 @@ class YpsoBLEScanActivity : TranslatedDaggerAppCompatActivity() {
             @SuppressLint("MissingPermission")
             private fun bondTo(item: BluetoothDeviceItem) {
                 val device = item.device
-                preferences.put(YpsoStringNonKey.MacAddress, device.address)
-                preferences.put(YpsoStringNonKey.DeviceName, item.name)
-                preferences.put(YpsoStringNonKey.SerialNumber, item.name.removePrefix(YPSOPUMP_NAME_PREFIX))
-
                 if (device.bondState == BluetoothDevice.BOND_BONDED) {
                     aapsLogger.debug(LTag.PUMPBTCOMM, "${device.address} already bonded")
-                    finishPairing(bonded = true)
+                    commitPairing(item)
                     return
                 }
 
                 // Bonding needs the user: Android raises a pairing dialog and the pump shows the
                 // code to match. Wait for it here rather than closing straight away — the driver
                 // must not be told about this pump until the bond exists, or the command queue
-                // will try to connect mid-bond and fail with an opaque BLE error.
+                // will start trying to connect to a pump that isn't bonded yet.
                 stopScan()
                 aapsLogger.debug(LTag.PUMPBTCOMM, "Bonding ${device.address}")
-                awaitBondFor(device)
+                awaitBondFor(item)
                 if (!device.createBond()) {
                     aapsLogger.error(LTag.PUMPBTCOMM, "createBond() refused for ${device.address}")
                     cancelBondWait()
@@ -239,14 +236,24 @@ class YpsoBLEScanActivity : TranslatedDaggerAppCompatActivity() {
     // ==================== BONDING ====================
 
     /**
-     * Blocks the screen with a progress dialog until [device] finishes bonding.
+     * Blocks the screen with a dialog until the pump finishes bonding.
      *
-     * The driver is only told about the pump once the bond exists — see the call site. A failed
-     * or dismissed bond leaves the user on the scan list to try again.
+     * Polls [BluetoothDevice.getBondState] rather than listening for
+     * `ACTION_BOND_STATE_CHANGED`. The broadcast route is what upstream used, but it depends on
+     * getting receiver-export semantics right across API levels, and when it silently doesn't
+     * fire there is nothing to see: the bond completes, the pump says "paired", and the app sits
+     * on this dialog forever. That is exactly what happened on the first hardware run. Polling
+     * reads the same state the system would have broadcast, and cannot miss it.
+     *
+     * The driver is told about the pump only once the bond exists — see [commitPairing].
      */
     @SuppressLint("MissingPermission")
-    private fun awaitBondFor(device: BluetoothDevice) {
+    private fun awaitBondFor(item: BluetoothDeviceItem) {
+        val device = item.device
         bondingDevice = device.address
+        sawBonding = false
+        bondDeadline = SystemClock.elapsedRealtime() + BOND_TIMEOUT_MS
+
         bondDialog = AlertDialog.Builder(this)
             .setTitle(rh.gs(R.string.ypso_bonding_title))
             .setMessage(rh.gs(R.string.ypso_bonding_message))
@@ -254,63 +261,76 @@ class YpsoBLEScanActivity : TranslatedDaggerAppCompatActivity() {
             .setNegativeButton(app.aaps.core.ui.R.string.cancel) { _, _ -> cancelBondWait() }
             .show()
 
-        bondReceiver = object : BroadcastReceiver() {
-            override fun onReceive(ctx: Context?, intent: Intent?) {
-                if (intent?.action != BluetoothDevice.ACTION_BOND_STATE_CHANGED) return
-                val changed = IntentCompat.getParcelableExtra(intent, BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
-                if (changed?.address != bondingDevice) return
-
-                when (intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.BOND_NONE)) {
+        val poll = object : Runnable {
+            @SuppressLint("MissingPermission")
+            override fun run() {
+                when (device.bondState) {
                     BluetoothDevice.BOND_BONDED  -> {
-                        aapsLogger.debug(LTag.PUMPBTCOMM, "Bonded to $bondingDevice")
-                        finishPairing(bonded = true)
+                        aapsLogger.debug(LTag.PUMPBTCOMM, "Bonded to ${device.address}")
+                        commitPairing(item)
+                        return
                     }
 
-                    BluetoothDevice.BOND_NONE    -> {
-                        aapsLogger.error(LTag.PUMPBTCOMM, "Bonding failed for $bondingDevice")
+                    BluetoothDevice.BOND_BONDING -> sawBonding = true
+
+                    // BOND_NONE before bonding starts is normal; after it started, it means the
+                    // request was refused or the user dismissed the system dialog.
+                    else                         -> if (sawBonding) {
+                        aapsLogger.error(LTag.PUMPBTCOMM, "Bonding failed for ${device.address}")
                         cancelBondWait()
                         ToastUtils.errorToast(context, rh.gs(R.string.ypso_bonding_failed))
+                        return
                     }
-
-                    else                         -> Unit // BOND_BONDING, still waiting
                 }
+
+                if (SystemClock.elapsedRealtime() > bondDeadline) {
+                    aapsLogger.error(LTag.PUMPBTCOMM, "Bonding timed out for ${device.address}")
+                    cancelBondWait()
+                    ToastUtils.errorToast(context, rh.gs(R.string.ypso_bonding_failed))
+                    return
+                }
+                bondPollHandler.postDelayed(this, BOND_POLL_MS)
             }
         }
-        // ACTION_BOND_STATE_CHANGED is a protected system broadcast, so it still reaches a
-        // non-exported receiver.
-        ContextCompat.registerReceiver(
-            this, bondReceiver, IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED),
-            ContextCompat.RECEIVER_NOT_EXPORTED
-        )
+        bondPoll = poll
+        bondPollHandler.post(poll)
     }
 
     /** Stops waiting and leaves the user on the scan list. */
     private fun cancelBondWait() {
-        unregisterBondReceiver()
+        stopBondPoll()
         bondDialog?.dismiss()
         bondDialog = null
         bondingDevice = null
         startScan()
     }
 
-    /** Tells the driver which pump to use, now that it is actually bonded, and closes. */
-    private fun finishPairing(bonded: Boolean) {
-        unregisterBondReceiver()
+    /**
+     * Records the chosen pump and tells the driver about it.
+     *
+     * Nothing is written until the bond exists. Storing the MAC earlier makes the plugin look
+     * paired, and AAPS's command queue immediately starts trying to connect to a pump that is
+     * still mid-bond — on the first hardware run that produced a connect attempt every second
+     * for the whole bonding window.
+     */
+    @SuppressLint("MissingPermission")
+    private fun commitPairing(item: BluetoothDeviceItem) {
+        stopBondPoll()
         bondDialog?.dismiss()
         bondDialog = null
-        if (bonded) rxBus.send(EventYpsoPumpDeviceChanged())
+
+        preferences.put(YpsoStringNonKey.MacAddress, item.device.address)
+        preferences.put(YpsoStringNonKey.DeviceName, item.name)
+        preferences.put(YpsoStringNonKey.SerialNumber, item.name.removePrefix(YPSOPUMP_NAME_PREFIX))
+        aapsLogger.debug(LTag.PUMPBTCOMM, "Paired to ${item.name} (${item.device.address})")
+
+        rxBus.send(EventYpsoPumpDeviceChanged())
         finish()
     }
 
-    private fun unregisterBondReceiver() {
-        bondReceiver?.let {
-            try {
-                unregisterReceiver(it)
-            } catch (_: IllegalArgumentException) {
-                // Already unregistered.
-            }
-        }
-        bondReceiver = null
+    private fun stopBondPoll() {
+        bondPoll?.let { bondPollHandler.removeCallbacks(it) }
+        bondPoll = null
     }
 
     inner class BluetoothDeviceItem internal constructor(val device: BluetoothDevice, val rssi: Int) {
@@ -328,5 +348,11 @@ class YpsoBLEScanActivity : TranslatedDaggerAppCompatActivity() {
 
         /** vicktor's `YPSOPUMP_NAME_PREFIX`; the serial follows it, e.g. `YpsoPump_10178681`. */
         private const val YPSOPUMP_NAME_PREFIX = "YpsoPump_"
+
+        /** How often to re-read the bond state while the bonding dialog is up. */
+        private const val BOND_POLL_MS = 300L
+
+        /** Bonding needs the user to confirm on both the tablet and the pump, so allow time. */
+        private const val BOND_TIMEOUT_MS = 120_000L
     }
 }

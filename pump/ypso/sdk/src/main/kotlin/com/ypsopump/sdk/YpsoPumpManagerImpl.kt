@@ -178,16 +178,21 @@ class YpsoPumpManagerImpl private constructor(
      * [PumpConnectionState.Ready]; AAPS closes it again through [disconnect].
      */
     override suspend fun connect() {
+        // Each of these used to return silently, which made a refused connect invisible: the
+        // caller logged "connect from: …" and then nothing at all appeared. Say why.
         val mac = pairedMac
         if (mac == null) {
+            log("connect refused: no paired MAC set on the SDK yet")
             _connectionState.value = PumpConnectionState.NotPaired
             return
         }
         if (!hasBluetoothPermissions()) {
+            log("connect refused: missing BLUETOOTH_SCAN/BLUETOOTH_CONNECT permission")
             _connectionState.value = PumpConnectionState.Error("Missing Bluetooth permissions")
             return
         }
         if (bluetoothAdapter?.isEnabled != true) {
+            log("connect refused: Bluetooth is off")
             _connectionState.value = PumpConnectionState.Error("Bluetooth is disabled")
             return
         }
