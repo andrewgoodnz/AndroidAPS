@@ -1150,9 +1150,15 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
                 return@readHistoryCount
             }
 
-            val startIdx = if (maxEntries > 0) maxOf(0, count - maxEntries) else 0
+            // Index 0 is the MOST RECENT entry, not the oldest. Verified on hardware: across a
+            // 50-entry read the pump's own sequence number rose strictly as the index fell, and
+            // so did the timestamps. Upstream read `count - maxEntries` .. `count - 1`, assuming
+            // the opposite, and so returned the *oldest* slots in the log — on the test pump
+            // that meant entries from four months earlier, with the day's activity missing
+            // entirely. Read from 0 upwards to get the newest.
+            val lastIdx = (if (maxEntries > 0) minOf(maxEntries, count) else count) - 1
             val entries = mutableListOf<HistoryEntry>()
-            readHistoryEntriesSequential(indexChar, valueUuid, startIdx, count - 1, entries, callback)
+            readHistoryEntriesSequential(indexChar, valueUuid, 0, lastIdx, entries, callback)
         }
     }
 

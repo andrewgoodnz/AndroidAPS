@@ -403,7 +403,17 @@ class YpsoPumpManagerImpl private constructor(
 
     private fun toHistoryEvent(entry: HistoryEntry): PumpHistoryEvent? {
         val ts = entry.timestamp * 1000L
-        val pos = entry.index.toLong()
+
+        // `position` becomes the PumpSync pumpId, so it has to be stable for the life of the
+        // event. The slot index is NOT: index 0 is the most recent entry, so every new event
+        // renumbers every older one, and today's bolus inherits yesterday's index. Using it
+        // would make PumpSync merge unrelated boluses or reject real ones as duplicates —
+        // silent, persistent IOB corruption.
+        //
+        // The pump's own sequence number is the stable identifier: verified monotonic and
+        // unique across a 50-entry read, and it does not move when new events arrive. This
+        // deliberately departs from plan section 4, which specified the slot index.
+        val pos = entry.sequence
         return when (entry.entryType) {
             EventType.BOLUS_IMMEDIATE       ->
                 PumpHistoryEvent.BolusDelivered(entry.value1 / 100.0, BolusType.STANDARD, ts, pos)

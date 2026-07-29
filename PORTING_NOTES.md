@@ -3,8 +3,9 @@
 Driver for an **unlocked plaintext research YpsoPump** on current AndroidAPS (3.4.2.4).
 
 **Status after session 2: verified on hardware.** The driver bonds, connects, authenticates in
-plaintext with no key exchange, and reads reservoir, battery, delivery state, active program and
-the 24-slot basal profile — each cross-checked against the pump's own display. It cannot deliver
+plaintext with no key exchange, and reads reservoir, battery, delivery state, active program,
+the 24-slot basal profile and the event and alert history — the live values each cross-checked
+against the pump's own display. It cannot deliver
 insulin: there is no code path from AAPS to a delivery command.
 
 Test pump: **YpsoPump_10074292**, MAC `EC:2A:F0:01:22:34`, firmware V05.02.03 — the unit whose
@@ -284,28 +285,45 @@ entry layout, the timestamp epoch (the pump counts from 2000-01-01, converted in
 the event-type IDs. Read history, then check the dump's timestamps and types against the pump's
 own history screen before trusting any of it.
 
-### ⚠ Writing history into AAPS is disabled by default — settle this before enabling
+### ⚠ [verified] Index 0 is the NEWEST entry — the plan's `pumpId` would have corrupted IOB
 
-`YpsoSyncHistoryToAaps` defaults to **off**. The reads and the mapping run regardless; only the
-`PumpSync` writes are gated.
+Two hardware findings, from one 50-entry read of each log:
 
-Plan §4 says to use `event.position` (the pump-memory slot index) as the `pumpId`, and that is
-what the code does. But **a slot index is only a stable identifier if the pump's log never
-wraps.** The read path is "read count, then read slots `count-maxEntries` … `count-1`", which is
-exactly what a growing log *and* a ring buffer both look like from outside. If it is a ring, slot
-numbers get reused, and `pumpId` collisions make PumpSync either silently merge two different
-boluses or reject a new one as a duplicate. Either way IOB is wrong, and the records are
-persistent — this is not a mistake you can back out cleanly.
+**As the slot index falls, the pump's sequence number rises and so do the timestamps.** So
+**index 0 is the most recent entry**, not the oldest. Upstream read `count - maxEntries` ..
+`count - 1` on the opposite assumption and returned the *oldest* slots — on the test pump the
+newest entry it fetched was four months stale, and that day's activity was missing entirely.
+Fixed: read `0 .. maxEntries - 1`.
 
-The raw dump exists to settle this. It prints **both** `idx` (slot) and `seq` (the pump's own
-sequence number) for every entry. On hardware:
+**The slot index is therefore useless as a `pumpId`.** If index 0 is always the newest, every
+new event renumbers every older one: today's bolus inherits yesterday's index. Feeding that to
+`syncBolusWithPumpId` makes PumpSync either merge two unrelated boluses or reject a real one as
+a duplicate — silent, persistent IOB corruption that cannot be cleanly undone.
 
-1. Read history, note the `idx` and `seq` of a few known events.
-2. Deliver nothing; let the pump record more events over a day or two.
-3. Read again. If `count` keeps growing and a given event keeps its `idx`, the slot index is
-   stable and the plan's mapping is safe — turn the switch on.
-4. If `count` plateaus, or an `idx` now names a different event, switch `pumpId` to `seq`
-   (or to the event timestamp) **before** enabling the sync.
+**Plan §4 specified the slot index. Do not use it.** `PumpHistoryEvent.position` now carries the
+pump's own **sequence number**, which was verified strictly monotonic and unique across both
+logs and does not move when new events arrive. This is a deliberate departure from the plan,
+and it is the reason the sync switch was gated off rather than shipped on.
+
+| log | count | index range read | seq range | timestamps |
+|---|---|---|---|---|
+| events | 3000 | 2950–2999 (old code) | 156828–156880 | 2026-03-14 → 03-15 |
+| alerts | 142 | 92–141 (old code) | 392–67766 | 2024-06-11 → 2025-02-28 |
+
+**[verified] The 2000-01-01 epoch is right.** Converted timestamps land on plausible real dates
+across a two-year span, so `HistoryEntry.parse`'s offset is correct.
+
+**[verified] Event type IDs decode sensibly**: `2` Bolus Immediate with `v1` in centi-units
+(39 = 0.39 U), `10` Basal Profile Temp with `v1` percent and `v2` minutes, and the 100-series
+alerts (occlusion, cartridge empty, no cartridge, battery empty). Still worth checking a handful
+against the pump's own history screen before enabling the sync.
+
+### Writing history into AAPS is still disabled by default
+
+`YpsoSyncHistoryToAaps` defaults to **off**. Reads and mapping run regardless; only the
+`PumpSync` writes are gated. The `pumpId` blocker above is now resolved — what remains before
+switching it on is confirming the event-type mapping and bolus amounts against the pump display,
+and deciding how `sincePosition` should filter already-seen events.
 
 ---
 
@@ -396,29 +414,29 @@ Firmware confirmed **V05.02.03**.
 
 Blocking work, roughly in order:
 
-1. **Prove the history read** (§5). The wire format is fixed but `HistoryEntry.parse`, the
-   2000-01-01 epoch and the event-type IDs are all unverified.
-2. **Settle the `pumpId` question** (§5). Retrofitting stable IDs after boluses have been
-   recorded means duplicate IOB. Do this before enabling any sync.
-3. **Confirm the unmapped status bytes** (§4): bytes 6–9 as active basal rate, byte 10 as TBR
+1. **Finish verifying the history mapping** (§5). Reads, ordering, epoch and `pumpId` are
+   settled; what is left is checking event types and bolus amounts against the pump's own
+   history screen, then deciding how `sincePosition` filters already-seen events. Only then
+   turn `YpsoSyncHistoryToAaps` on.
+2. **Confirm the unmapped status bytes** (§4): bytes 6–9 as active basal rate, byte 10 as TBR
    percent. Byte 10 is the only TBR candidate found, and no TBR support is possible without it.
-4. **Extend the delivery-mode map** (§4) by observation — start, stop, prime and bolus the pump
+3. **Extend the delivery-mode map** (§4) by observation — start, stop, prime and bolus the pump
    and record byte 0 each time. Until then anything but `3` and `10` reads as unverified and
    `isDelivering` stays false, which under-reports a delivering pump.
-5. **`syncDateTime` first** — plan §7 step 5, the first non-delivering write, with nothing at
+4. **`syncDateTime` first** — plan §7 step 5, the first non-delivering write, with nothing at
    stake. `YpsoPumpManagerImpl.syncDateTime` currently refuses; `bleManager.syncTime` underneath
    is vendored and intact — **but it still writes through `writeFramesSequentially`**, and §4b
    showed this firmware rejects framed writes of short payloads with
    `GATT_INVALID_ATTRIBUTE_LENGTH`. Expect to strip the framing there too. That is precisely why
    syncDateTime is the right first write: it fails harmlessly.
-6. **Then delivery**, on saline, off-body, in plan §7 step 6 order: 0.05 U bolus (with progress
+5. **Then delivery**, on saline, off-body, in plan §7 step 6 order: 0.05 U bolus (with progress
    and abort) → TBR → basal write. The SDK methods exist and are wired to the pump; what has to
    be written is the `YpsoService` entry point and the `YpsoPlugin` override. Note the bolus and
    TBR payloads also go out framed — check each against §4b before trusting a "sent" result.
-7. **Bolus progress** should come from collecting `pumpEvents` / the bolus-notification
+6. **Bolus progress** should come from collecting `pumpEvents` / the bolus-notification
    characteristic into `EventOverviewBolusProgress` — a Flow collection, not Medtrum's sleep-poll.
    Scale the completion timeout to the configured bolus speed (`YpsoBolusSpeed`, 12 U/min).
-8. **Re-check the refusals.** Every `REFUSED` log line and every `notImplemented()` in
+7. **Re-check the refusals.** Every `REFUSED` log line and every `notImplemented()` in
    `YpsoPlugin` is a deliberate stop. Remove them one at a time, with a saline test each, not in
    a batch.
 
