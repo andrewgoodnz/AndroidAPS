@@ -1015,7 +1015,7 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
      * @param program Identificador del programa: 'A' o 'B'.
      * @param callback Llamado con una lista de 24 tasas en U/h, o `null` si alguna lectura falló.
      */
-    fun readBasalProfile(program: Char, callback: (List<Float>?) -> Unit) {
+    fun readBasalProfile(program: Char, callback: (List<Double>?) -> Unit) {
         val startIndex = when (program) {
             'A' -> SettingsIndex.PROGRAM_A_START
             'B' -> SettingsIndex.PROGRAM_B_START
@@ -1025,15 +1025,15 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
             }
         }
 
-        val rates = mutableListOf<Float>()
+        val rates = mutableListOf<Double>()
         readBasalRateSequential(startIndex, startIndex + 23, rates, callback)
     }
 
     private fun readBasalRateSequential(
         currentIndex: Int,
         endIndex: Int,
-        rates: MutableList<Float>,
-        callback: (List<Float>?) -> Unit
+        rates: MutableList<Double>,
+        callback: (List<Double>?) -> Unit
     ) {
         if (currentIndex > endIndex) {
             log("Basal profile read complete: ${rates.size} rates, values=${rates.map { "%.2f".format(it) }}")
@@ -1044,9 +1044,9 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
         readSetting(currentIndex) { value ->
             if (value != null) {
                 if (value == -1) {  // 0xFFFFFFFF = unprogrammed slot
-                    rates.add(0f)
+                    rates.add(0.0)
                 } else {
-                    rates.add(value / 100f)
+                    rates.add(value / 100.0)
                 }
                 readBasalRateSequential(currentIndex + 1, endIndex, rates, callback)
             } else {

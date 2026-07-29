@@ -329,14 +329,14 @@ class YpsoPumpManagerImpl private constructor(
 
     override suspend fun readBasalProfile(profileId: Int): BasalProfile? = withConnection {
         val program = if (profileId == 0) 'A' else 'B'
-        val rates = suspendCancellableCoroutine<List<Float>?> { cont ->
+        val rates = suspendCancellableCoroutine<List<Double>?> { cont ->
             bleManager.readBasalProfile(program) { cont.resume(it) }
         } ?: return@withConnection null
 
         BasalProfile(
             profileId = profileId,
             name = "Profile $program",
-            blocks = rates.map { rate -> BasalBlock(durationMinutes = 60, basalRate = rate.toDouble()) }
+            blocks = rates.map { rate -> BasalBlock(durationMinutes = 60, basalRate = rate) }
         )
     }
 
