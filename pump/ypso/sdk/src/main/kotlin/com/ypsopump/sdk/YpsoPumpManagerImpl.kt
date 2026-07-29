@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.pump.common.ActiveTbr
 import com.pump.common.BasalBlock
 import com.pump.common.BasalProfile
 import com.pump.common.BolusDeliveryResult
@@ -110,10 +111,9 @@ class YpsoPumpManagerImpl private constructor(
     /**
      * Whether the pump reports a temporary basal running.
      *
-     * This is all the system-status characteristic tells us — it carries the delivery mode, the
-     * reservoir and the battery, and nothing about the TBR's percentage or remaining time. The
-     * [PumpStatus.activeTbr] field therefore stays null; filling it with zeroes would look like
-     * a real reading. Finding where the pump exposes the TBR detail is session 3's problem.
+     * The system status does carry the TBR detail after all — percentage in bytes 10–13 and
+     * remaining minutes in 14–17 — so [PumpStatus.activeTbr] is populated from the same read.
+     * This flag is just the convenient boolean form of `tbrPercent != 100`.
      */
     private val _isTbrActive = MutableStateFlow(false)
     val isTbrActive: StateFlow<Boolean> = _isTbrActive
@@ -544,9 +544,7 @@ class YpsoPumpManagerImpl private constructor(
     // ==================== INTERNAL ====================
 
     private fun updateStatusFromSystem(status: SystemStatusData) {
-        // Upstream's TBR mode value is from a different firmware and cannot be trusted here.
-        // Claiming "no TBR" is the safe direction: it does not invent a temporary basal.
-        _isTbrActive.value = false
+        _isTbrActive.value = status.isTbrRunning
 
         // Only assert delivery where it has been confirmed against the pump's own display.
         // An unverified mode reads as "not delivering" rather than "delivering", because
@@ -555,7 +553,14 @@ class YpsoPumpManagerImpl private constructor(
             batteryPercent = status.batteryPercent,
             reservoirUnits = status.insulinRemaining.toDouble(),
             deliveryModeName = status.deliveryModeName,
-            isDelivering = DeliveryMode.isDeliveringOrNull(status.deliveryMode) == true
+            isDelivering = DeliveryMode.isDeliveringOrNull(status.deliveryMode) == true,
+            activeBasalRate = status.currentBasalRate,
+            activeTbr = if (status.isTbrRunning) {
+                ActiveTbr(
+                    percentage = status.tbrPercent,
+                    remainingMinutes = status.tbrRemainingMinutes
+                )
+            } else null
         )
     }
 

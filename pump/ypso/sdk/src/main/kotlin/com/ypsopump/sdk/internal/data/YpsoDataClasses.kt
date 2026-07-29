@@ -15,13 +15,39 @@ import java.nio.ByteOrder
  * @property insulinRemaining Insulina restante en el reservorio, en unidades (U).
  * @property batteryPercent Nivel de batería actual, en porcentaje (0–100).
  */
+/**
+ * The full 18-byte system status payload, mapped against the pump's own display:
+ *
+ * ```
+ * 0A  2B 16 00 00  02  9C 00 00 00  82 00 00 00  F0 00 00 00
+ * │   └reservoir┘  │   └── rate ─┘  └─ TBR % ─┘  └─ TBR min ┘
+ * └mode           battery bars
+ * ```
+ *
+ * @property currentBasalRate the rate the pump is *actually* running, i.e. the programmed rate
+ *   already scaled by [tbrPercent] — 1.20 U/h under a 130% TBR reads as 1.56 U/h.
+ * @property tbrPercent 100 when no temporary basal is running.
+ * @property tbrRemainingMinutes counts down once a minute; 0 when no TBR is running.
+ */
 internal data class SystemStatusData(
     val deliveryMode: Int,
     val deliveryModeName: String,
     val insulinRemaining: Float,
     val batteryPercent: Int,
-    val batteryBars: Int
-)
+    val batteryBars: Int,
+    val currentBasalRate: Double,
+    val tbrPercent: Int,
+    val tbrRemainingMinutes: Int
+) {
+
+    val isTbrRunning: Boolean get() = tbrPercent != TBR_PERCENT_NONE
+
+    companion object {
+
+        /** The pump reports 100% when no temporary basal is active. */
+        const val TBR_PERCENT_NONE = 100
+    }
+}
 
 /**
  * Estado detallado del bolo en curso, leído de la característica

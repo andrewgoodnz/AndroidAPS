@@ -51,6 +51,9 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
         /** The pump's battery gauge has four bars; the status byte carries a bar count. */
         const val BATTERY_BARS_MAX = 4
 
+        /** Bytes of system status the driver decodes, before the 2-byte CRC. */
+        private const val STATUS_PAYLOAD_BYTES = 18
+
         /** Salt used by vicktor's SDK, verified against firmware V05.02.03. */
         val AUTH_SALT_SDK = byteArrayOf(
             0x4F, 0xC2.toByte(), 0x45, 0x4D, 0x9B.toByte(),
@@ -632,10 +635,11 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
 
             if (YpsoCrc.isValid(data)) {
                 val payload = data.copyOfRange(0, data.size - 2)
-                if (payload.size >= 6) {
+                if (payload.size >= STATUS_PAYLOAD_BYTES) {
+                    fun le32(at: Int) = ByteBuffer.wrap(payload, at, 4).order(ByteOrder.LITTLE_ENDIAN).int
+
                     val mode = payload[0].toInt() and 0xFF
-                    val insulinRaw = ByteBuffer.wrap(payload, 1, 4)
-                        .order(ByteOrder.LITTLE_ENDIAN).int
+                    val insulinRaw = le32(1)
                     // The pump reports battery as bars, not percent — verified against the
                     // pump's own display, which showed "2 of 4 bars" for a raw value of 2.
                     // Upstream passed this straight through as a percentage, which turned a
@@ -647,11 +651,18 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
                         deliveryModeName = DeliveryMode.nameFor(mode),
                         insulinRemaining = insulinRaw / 100f,
                         batteryPercent = (bars.coerceIn(0, BATTERY_BARS_MAX) * 100) / BATTERY_BARS_MAX,
-                        batteryBars = bars
+                        batteryBars = bars,
+                        currentBasalRate = le32(6) / 100.0,
+                        tbrPercent = le32(10),
+                        tbrRemainingMinutes = le32(14)
                     )
                     log(
                         "Status: ${status.deliveryModeName}, Insulin: ${status.insulinRemaining}U, " +
-                            "Battery: $bars/$BATTERY_BARS_MAX bars (${status.batteryPercent}%)"
+                            "Battery: $bars/$BATTERY_BARS_MAX bars (${status.batteryPercent}%), " +
+                            "Rate: ${status.currentBasalRate}U/h" +
+                            if (status.isTbrRunning) {
+                                ", TBR ${status.tbrPercent}% ${status.tbrRemainingMinutes}min left"
+                            } else ""
                     )
                     emitData(DataEvent.StatusNotification(data))
                     callback(status)
