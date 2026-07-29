@@ -258,6 +258,33 @@ Two judgement calls worth knowing about:
 
 ## 7. First hardware session — what to check, in order
 
+### Before anything: the test device
+
+**Use a phone that is not running another pump controller.** If a licensed closed-loop app
+(CamAPS FX, mylife Loop, …) is paired to the same pump, do not put this driver on that phone or
+point it at that pump. This driver *holds* its GATT connection rather than reconnecting per
+command (§1), so it can keep the other app from reaching the pump to deliver insulin. Read-only
+does not mean harmless when two controllers compete for one BLE peripheral.
+
+Device requirements: Android 12+ (`minSdk 31`). Developer options → USB debugging on. At runtime
+the pairing screen needs Bluetooth scan/connect permission granted, or it finishes immediately
+with a permission toast.
+
+Installing the debug APK can fail with `INSTALL_FAILED_VERIFICATION_FAILURE: Install not
+allowed`, which is **not** a signature problem and no amount of `-r` will fix it. It is
+on-device install verification: Play Protect's "Verify apps over USB" (Developer options) and,
+on Samsung, Auto Blocker (Settings → Security and privacy). Turn the relevant one off on the
+test device. `adb shell settings put global verifier_verify_adb_installs 0` does the same thing
+from the host — appropriate on a dedicated test phone, not on a personal one.
+
+A genuine signature mismatch looks different: `INSTALL_FAILED_UPDATE_INCOMPATIBLE`. That one
+does need an uninstall, which **deletes the AAPS database** — export settings *and* database
+from within AAPS first, and verify both landed in `/storage/emulated/0/AAPS/preferences/` and
+`/AAPS/exports/` before uninstalling. The database export is a separate action from the settings
+export and is easy to believe you did.
+
+### On the pump
+
 1. **Bond.** Settings → YpsoPump → "Pair YpsoPump". The pump should appear as
    `YpsoPump_<serial>`. Confirm the code on the pump. If nothing shows up, lower
    `YpsoRssiThreshold` before assuming a scan problem.
