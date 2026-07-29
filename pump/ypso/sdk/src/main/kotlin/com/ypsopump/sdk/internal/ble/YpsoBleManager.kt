@@ -48,6 +48,9 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
         private const val TAG = "YpsoBleManager"
         const val YPSOPUMP_NAME_PREFIX = "YpsoPump_"
 
+        /** The pump's battery gauge has four bars; the status byte carries a bar count. */
+        const val BATTERY_BARS_MAX = 4
+
         /** Salt used by vicktor's SDK, verified against firmware V05.02.03. */
         val AUTH_SALT_SDK = byteArrayOf(
             0x4F, 0xC2.toByte(), 0x45, 0x4D, 0x9B.toByte(),
@@ -633,14 +636,23 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
                     val mode = payload[0].toInt() and 0xFF
                     val insulinRaw = ByteBuffer.wrap(payload, 1, 4)
                         .order(ByteOrder.LITTLE_ENDIAN).int
-                    val battery = payload[5].toInt() and 0xFF
+                    // The pump reports battery as bars, not percent — verified against the
+                    // pump's own display, which showed "2 of 4 bars" for a raw value of 2.
+                    // Upstream passed this straight through as a percentage, which turned a
+                    // half-charged battery into a 2% reading and would have looked like an
+                    // imminent shutdown to anything acting on it.
+                    val bars = payload[5].toInt() and 0xFF
                     val status = SystemStatusData(
                         deliveryMode = mode,
                         deliveryModeName = DeliveryMode.name(mode),
                         insulinRemaining = insulinRaw / 100f,
-                        batteryPercent = battery
+                        batteryPercent = (bars.coerceIn(0, BATTERY_BARS_MAX) * 100) / BATTERY_BARS_MAX,
+                        batteryBars = bars
                     )
-                    log("Status: ${status.deliveryModeName}, Insulin: ${status.insulinRemaining}U, Battery: ${status.batteryPercent}%")
+                    log(
+                        "Status: ${status.deliveryModeName}, Insulin: ${status.insulinRemaining}U, " +
+                            "Battery: $bars/$BATTERY_BARS_MAX bars (${status.batteryPercent}%)"
+                    )
                     emitData(DataEvent.StatusNotification(data))
                     callback(status)
                 } else {
@@ -906,12 +918,10 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
             return
         }
 
-        val frames = YpsoFraming.chunkPayload(YpsoGlb.encode(index))
-
-        writeFramesSequentially(idChar, frames, 0) { success ->
+        writeGlb(idChar, index) { success ->
             if (!success) {
                 callback(null)
-                return@writeFramesSequentially
+                return@writeGlb
             }
 
             readExtended(YpsoPumpUuids.CHAR_SETTING_VALUE) { data ->
@@ -947,17 +957,31 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
             return
         }
 
-        val indexFrames = YpsoFraming.chunkPayload(YpsoGlb.encode(index))
-
-        writeFramesSequentially(idChar, indexFrames, 0) { idSuccess ->
+        writeGlb(idChar, index) { idSuccess ->
             if (!idSuccess) {
                 callback(false)
-                return@writeFramesSequentially
+                return@writeGlb
             }
-
-            val valueFrames = YpsoFraming.chunkPayload(YpsoGlb.encode(value))
-            writeFramesSequentially(valChar, valueFrames, 0, callback)
+            writeGlb(valChar, value, callback)
         }
+    }
+
+    /**
+     * Writes a GLB safe variable to [char] as the bare 8 bytes, with no framing header.
+     *
+     * The pump rejects a framed 9-byte write of an 8-byte GLB with
+     * GATT_INVALID_ATTRIBUTE_LENGTH (13) — which is what broke every basal profile read. That
+     * matches what the read path showed: firmware V05.02.03 does not use the 1-byte framing
+     * header for these short messages, in either direction.
+     */
+    private fun writeGlb(char: BluetoothGattCharacteristic, value: Int, callback: (Boolean) -> Unit) {
+        writeCharacteristic(char, YpsoGlb.encode(value), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+            .with { _, _ -> callback(true) }
+            .fail { _, status ->
+                log("GLB write to ${char.uuid} failed (GATT status=$status)")
+                callback(false)
+            }
+            .enqueue()
     }
 
     // ==================== BASAL PROFILES ====================
@@ -1042,12 +1066,10 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
         entryIndex: Int,
         callback: (HistoryEntry?) -> Unit
     ) {
-        val frames = YpsoFraming.chunkPayload(YpsoGlb.encode(entryIndex))
-
-        writeFramesSequentially(indexChar, frames, 0) { success ->
+        writeGlb(indexChar, entryIndex) { success ->
             if (!success) {
                 callback(null)
-                return@writeFramesSequentially
+                return@writeGlb
             }
 
             readExtended(valueUuid) { data ->

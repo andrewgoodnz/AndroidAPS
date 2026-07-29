@@ -19,7 +19,8 @@ internal data class SystemStatusData(
     val deliveryMode: Int,
     val deliveryModeName: String,
     val insulinRemaining: Float,
-    val batteryPercent: Int
+    val batteryPercent: Int,
+    val batteryBars: Int
 )
 
 /**
