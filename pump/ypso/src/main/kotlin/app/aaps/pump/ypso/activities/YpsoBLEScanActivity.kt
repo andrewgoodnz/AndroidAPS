@@ -28,7 +28,7 @@ import app.aaps.core.ui.toast.ToastUtils
 import app.aaps.core.utils.extensions.safeEnable
 import app.aaps.pump.ypso.R
 import app.aaps.pump.ypso.databinding.YpsoBlescannerActivityBinding
-import app.aaps.pump.ypso.events.EventYpsoPumpDataChanged
+import app.aaps.pump.ypso.events.EventYpsoPumpDeviceChanged
 import app.aaps.pump.ypso.keys.YpsoIntKey
 import app.aaps.pump.ypso.keys.YpsoStringNonKey
 import javax.inject.Inject
@@ -187,7 +187,7 @@ class YpsoBLEScanActivity : TranslatedDaggerAppCompatActivity() {
                         ToastUtils.errorToast(context, rh.gs(R.string.ypso_bonding_failed))
                     }
                 }
-                rxBus.send(EventYpsoPumpDataChanged())
+                rxBus.send(EventYpsoPumpDeviceChanged())
                 finish()
             }
 

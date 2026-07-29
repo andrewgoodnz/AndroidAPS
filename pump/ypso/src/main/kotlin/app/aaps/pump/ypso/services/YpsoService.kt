@@ -13,6 +13,7 @@ import app.aaps.core.interfaces.resources.ResourceHelper
 import app.aaps.core.interfaces.rx.AapsSchedulers
 import app.aaps.core.interfaces.rx.bus.RxBus
 import app.aaps.core.interfaces.rx.events.EventAppExit
+import app.aaps.core.interfaces.rx.events.EventPreferenceChange
 import app.aaps.core.interfaces.rx.events.EventPumpStatusChanged
 import app.aaps.core.interfaces.utils.DateUtil
 import app.aaps.core.interfaces.utils.fabric.FabricPrivacy
@@ -20,10 +21,12 @@ import app.aaps.core.keys.interfaces.Preferences
 import app.aaps.pump.ypso.R
 import app.aaps.pump.ypso.YpsoPump
 import app.aaps.pump.ypso.events.EventYpsoPumpDataChanged
+import app.aaps.pump.ypso.events.EventYpsoPumpDeviceChanged
 import app.aaps.pump.ypso.keys.YpsoBooleanKey
 import app.aaps.pump.ypso.keys.YpsoIntKey
 import com.pump.common.PumpConnectionState
 import com.pump.common.PumpHistoryEvent
+import com.ypsopump.sdk.YpsoEventTypes
 import com.ypsopump.sdk.YpsoPumpManagerImpl
 import dagger.android.DaggerService
 import io.reactivex.rxjava3.disposables.CompositeDisposable
@@ -88,6 +91,27 @@ class YpsoService : DaggerService() {
             .observeOn(aapsSchedulers.io)
             .subscribe({ stopSelf() }, fabricPrivacy::logException)
 
+        // A pump chosen in the pairing screen must take effect now, not at the next app start.
+        // Dropping the current session first means we never keep talking to the old pump.
+        disposable += rxBus
+            .toObservable(EventYpsoPumpDeviceChanged::class.java)
+            .observeOn(aapsSchedulers.io)
+            .subscribe({
+                           scope.launch {
+                               pumpManager.disconnect()
+                               ypsoPump.reset()
+                               applyPairedDevice()
+                               rxBus.send(EventYpsoPumpDataChanged())
+                           }
+                       }, fabricPrivacy::logException)
+
+        disposable += rxBus
+            .toObservable(EventPreferenceChange::class.java)
+            .observeOn(aapsSchedulers.io)
+            .subscribe({ event ->
+                           if (event.isChanged(YpsoBooleanKey.YpsoLegacyAuthSalt.key)) applyAuthSaltPreference()
+                       }, fabricPrivacy::logException)
+
         // Forward the SDK's own log lines into the AAPS log, so BLE traffic shows up in the
         // same place as everything else during bring-up.
         scope.launch {
@@ -111,6 +135,13 @@ class YpsoService : DaggerService() {
                 ypsoPump.deliveryModeName = status.deliveryModeName
                 ypsoPump.isDelivering = status.isDelivering
                 ypsoPump.activeTbr = status.activeTbr
+                rxBus.send(EventYpsoPumpDataChanged())
+            }
+        }
+
+        scope.launch {
+            pumpManager.isTbrActive.collect { active ->
+                ypsoPump.isTbrRunning = active
                 rxBus.send(EventYpsoPumpDataChanged())
             }
         }
@@ -235,16 +266,15 @@ class YpsoService : DaggerService() {
     fun loadHistory(): Boolean = awaitResult("loadHistory", false) {
         val count = preferences.get(YpsoIntKey.YpsoHistoryReadCount)
 
-        ypsoPump.lastHistoryDump = pumpManager.dumpHistoryEntries(count)
-        ypsoPump.lastHistoryDump.forEach { aapsLogger.debug(LTag.PUMP, "[history] $it") }
-
-        val events = pumpManager.readHistory(maxEvents = count)
-        aapsLogger.debug(LTag.PUMP, "Mapped ${events.size} history event(s)")
+        val result = pumpManager.readHistoryWithDump(count)
+        ypsoPump.lastHistoryDump = result.rawDump
+        result.rawDump.forEach { aapsLogger.debug(LTag.PUMP, "[history] $it") }
+        aapsLogger.debug(LTag.PUMP, "Mapped ${result.events.size} of ${result.rawDump.size} entries")
 
         if (preferences.get(YpsoBooleanKey.YpsoSyncHistoryToAaps)) {
-            events.forEach { syncToAaps(it) }
+            result.events.forEach { syncToAaps(it) }
         } else {
-            aapsLogger.info(LTag.PUMP, "History sync to AAPS is disabled; ${events.size} event(s) logged only")
+            aapsLogger.info(LTag.PUMP, "History sync to AAPS is disabled; ${result.events.size} event(s) logged only")
         }
 
         ypsoPump.onConnectionSucceeded()
@@ -298,8 +328,36 @@ class YpsoService : DaggerService() {
                 pumpSerial = serial
             )
 
+            is PumpHistoryEvent.Unknown        -> syncConsumableChange(event, serial)
+
             else                               ->
                 aapsLogger.debug(LTag.PUMP, "No PumpSync mapping for ${event::class.simpleName}, skipped")
+        }
+    }
+
+    /**
+     * Turns the pump's mechanical events into AAPS therapy events, per the mapping confirmed
+     * against mylife Lotus: cannula priming is a site change, battery removal is a battery
+     * change, and a prime counts as a tubing change only when it was large enough to have
+     * actually filled a line — a small prime is a top-up, not a set change.
+     */
+    private fun syncConsumableChange(event: PumpHistoryEvent.Unknown, serial: String) {
+        when (event.eventType) {
+            YpsoEventTypes.CANNULA_PRIMING_FINISHED -> insertTherapyEvent(TE.Type.CANNULA_CHANGE, event, serial)
+
+            YpsoEventTypes.BATTERY_REMOVED          -> insertTherapyEvent(TE.Type.PUMP_BATTERY_CHANGE, event, serial)
+
+            YpsoEventTypes.PRIMING_FINISHED         -> {
+                val primed = YpsoEventTypes.primedUnits(event.rawData)
+                if (primed > YpsoEventTypes.TUBE_CHANGE_PRIME_THRESHOLD_UNITS) {
+                    insertTherapyEvent(TE.Type.TUBE_CHANGE, event, serial)
+                } else {
+                    aapsLogger.debug(LTag.PUMP, "Prime of ${primed}U below tube-change threshold, not recorded")
+                }
+            }
+
+            else                                    ->
+                aapsLogger.debug(LTag.PUMP, "Unmapped pump event type ${event.eventType}, skipped")
         }
     }
 

@@ -34,6 +34,7 @@
     <string name="ypso_reservoir_value">%1$.1f U</string>
     <string name="ypso_basal_rate_value">%1$.2f U/h</string>
     <string name="ypso_tbr_value">%1$d%% (%2$d min left)</string>
+    <string name="ypso_tbr_running_no_detail">Running (rate and duration not readable yet)</string>
 
     <string name="ypso_refresh">Refresh</string>
     <string name="ypso_read_history">Read history</string>

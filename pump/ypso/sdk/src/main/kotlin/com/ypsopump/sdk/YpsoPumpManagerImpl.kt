@@ -107,6 +107,17 @@ class YpsoPumpManagerImpl private constructor(
     private val _activeProfileId = MutableStateFlow<Int?>(null)
     val activeProfileId: StateFlow<Int?> = _activeProfileId
 
+    /**
+     * Whether the pump reports a temporary basal running.
+     *
+     * This is all the system-status characteristic tells us — it carries the delivery mode, the
+     * reservoir and the battery, and nothing about the TBR's percentage or remaining time. The
+     * [PumpStatus.activeTbr] field therefore stays null; filling it with zeroes would look like
+     * a real reading. Finding where the pump exposes the TBR detail is session 3's problem.
+     */
+    private val _isTbrActive = MutableStateFlow(false)
+    val isTbrActive: StateFlow<Boolean> = _isTbrActive
+
     override val isPaired: Boolean get() = pairedMac != null
     override val pairedAddress: String? get() = pairedMac
 
@@ -327,22 +338,52 @@ class YpsoPumpManagerImpl private constructor(
     // ==================== HISTORY ====================
 
     /**
-     * Reads the pump's event and alert logs and maps them onto [PumpHistoryEvent].
+     * Result of one history read: the mapped events, plus the raw entries as text.
      *
-     * @param sincePosition ignored for now — the pump is addressed by slot, so the caller
-     *   filters what it has already seen. Kept for interface compatibility.
-     * @param maxEvents how many of the most recent entries to fetch from each log.
+     * Both come from a single pass over the pump's logs. Reading history is expensive — every
+     * entry costs a write of its index followed by a read of its value — so the parity dump and
+     * the mapped events must not be two separate reads.
      */
-    override suspend fun readHistory(sincePosition: Long, maxEvents: Int): List<PumpHistoryEvent> = withConnection {
+    data class HistoryReadResult(
+        val events: List<PumpHistoryEvent>,
+        val rawDump: List<String>
+    )
+
+    /**
+     * Reads the pump's event and alert logs, returning both the mapped events and a raw dump.
+     *
+     * The dump includes each entry's slot index *and* its sequence number, which is what settles
+     * whether the slot index is a stable identifier or a reused ring-buffer position — the
+     * question that decides whether [PumpHistoryEvent.position] is safe to use as a PumpSync
+     * `pumpId`.
+     *
+     * @param maxEntries how many of the most recent entries to fetch from each log.
+     */
+    suspend fun readHistoryWithDump(maxEntries: Int): HistoryReadResult = withConnection {
         val events = suspendCancellableCoroutine<List<HistoryEntry>> { cont ->
-            bleManager.readHistoryEvents(maxEvents) { cont.resume(it) }
+            bleManager.readHistoryEvents(maxEntries) { cont.resume(it) }
         }
         val alerts = suspendCancellableCoroutine<List<HistoryEntry>> { cont ->
-            bleManager.readHistoryAlerts(maxEvents) { cont.resume(it) }
+            bleManager.readHistoryAlerts(maxEntries) { cont.resume(it) }
         }
         log("History: ${events.size} event(s), ${alerts.size} alert(s)")
-        (events + alerts).mapNotNull { toHistoryEvent(it) }.sortedBy { it.timestamp }
+
+        val all = events + alerts
+        HistoryReadResult(
+            events = all.mapNotNull { toHistoryEvent(it) }.sortedBy { it.timestamp },
+            rawDump = all.map { e ->
+                "idx=${e.index} seq=${e.sequence} ts=${e.timestamp} type=${e.entryType}(${e.entryTypeName}) " +
+                    "v1=${e.value1} v2=${e.value2} v3=${e.value3}"
+            }
+        )
     }
+
+    /**
+     * @param sincePosition ignored — the pump is addressed by slot, so the caller filters what it
+     *   has already seen. Kept because it is part of the [PumpManager] contract.
+     */
+    override suspend fun readHistory(sincePosition: Long, maxEvents: Int): List<PumpHistoryEvent> =
+        readHistoryWithDump(maxEvents).events
 
     private fun toHistoryEvent(entry: HistoryEntry): PumpHistoryEvent? {
         val ts = entry.timestamp * 1000L
@@ -372,11 +413,17 @@ class YpsoPumpManagerImpl private constructor(
             EventType.BASAL_PROFILE_B_CHANGED    ->
                 PumpHistoryEvent.BasalRateChanged(entry.value1 / 100.0, ts, pos)
 
-            EventType.REWIND_FINISHED,
+            // Consumable changes. The pump does not have a single "cartridge changed" event;
+            // it records the mechanical steps, and the caller turns those into therapy events.
+            // value1 carries the primed amount in centi-units, which is what distinguishes a
+            // real tubing change from a small top-up prime.
+            EventType.REWIND_FINISHED            ->
+                PumpHistoryEvent.CartridgeChanged(ts, pos)
+
             EventType.PRIMING_FINISHED,
             EventType.CANNULA_PRIMING_FINISHED,
             EventType.BATTERY_REMOVED            ->
-                PumpHistoryEvent.Unknown(entry.entryType, byteArrayOf(), ts, pos)
+                PumpHistoryEvent.Unknown(entry.entryType, encodeValues(entry), ts, pos)
 
             in EventType.A_BATTERY_REMOVED..EventType.A_BATTERY_REJECTED ->
                 PumpHistoryEvent.Alert(entry.entryType, entry.entryTypeName, ts, pos)
@@ -386,19 +433,15 @@ class YpsoPumpManagerImpl private constructor(
     }
 
     /**
-     * Human-readable dump of the raw history entries, for the parity cross-check against the
-     * pump's own history screen. Includes both slot index and sequence number, which is what
-     * settles whether the slot index is a stable id or a reused ring-buffer position.
+     * Packs an entry's three value fields into [PumpHistoryEvent.Unknown.rawData] so the caller
+     * can still reach them — the prime amount decides whether a prime was a tubing change.
+     * Little-endian 16-bit each, matching how the pump laid them out.
      */
-    suspend fun dumpHistoryEntries(maxEntries: Int): List<String> = withConnection {
-        val entries = suspendCancellableCoroutine<List<HistoryEntry>> { cont ->
-            bleManager.readHistoryEvents(maxEntries) { cont.resume(it) }
-        }
-        entries.map { e ->
-            "idx=${e.index} seq=${e.sequence} ts=${e.timestamp} type=${e.entryType}(${e.entryTypeName}) " +
-                "v1=${e.value1} v2=${e.value2} v3=${e.value3}"
-        }
-    }
+    private fun encodeValues(entry: HistoryEntry): ByteArray = byteArrayOf(
+        (entry.value1 and 0xFF).toByte(), ((entry.value1 shr 8) and 0xFF).toByte(),
+        (entry.value2 and 0xFF).toByte(), ((entry.value2 shr 8) and 0xFF).toByte(),
+        (entry.value3 and 0xFF).toByte(), ((entry.value3 shr 8) and 0xFF).toByte()
+    )
 
     // ==================== DELIVERY — NOT IMPLEMENTED ====================
     //
@@ -475,6 +518,7 @@ class YpsoPumpManagerImpl private constructor(
     // ==================== INTERNAL ====================
 
     private fun updateStatusFromSystem(status: SystemStatusData) {
+        _isTbrActive.value = status.deliveryMode == DeliveryMode.TBR
         _pumpStatus.value = (_pumpStatus.value ?: PumpStatus()).copy(
             batteryPercent = status.batteryPercent,
             reservoirUnits = status.insulinRemaining.toDouble(),

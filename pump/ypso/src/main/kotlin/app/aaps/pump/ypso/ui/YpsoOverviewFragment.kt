@@ -138,7 +138,7 @@ class YpsoOverviewFragment : DaggerFragment() {
 
         binding.tempBasal.text = ypsoPump.activeTbr
             ?.let { rh.gs(R.string.ypso_tbr_value, it.percentage, it.remainingMinutes) }
-            ?: PLACEHOLDER
+            ?: if (ypsoPump.isTbrRunning) rh.gs(R.string.ypso_tbr_running_no_detail) else PLACEHOLDER
 
         binding.connectionStatus.text = when {
             ypsoPlugin.isConnected()  -> rh.gs(R.string.ypso_connected)

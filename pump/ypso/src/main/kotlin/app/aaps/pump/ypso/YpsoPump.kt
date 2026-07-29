@@ -74,7 +74,16 @@ class YpsoPump @Inject constructor(
 
     var isDelivering: Boolean = false
 
-    /** Temporary basal reported by the pump, or null when none is running. */
+    /**
+     * Whether the pump says a temporary basal is running.
+     *
+     * Separate from [activeTbr] on purpose: the system-status characteristic reports only the
+     * delivery mode, so this can be true while the percentage and remaining time are still
+     * unknown. Session 3 needs to find where the pump exposes that detail.
+     */
+    var isTbrRunning: Boolean = false
+
+    /** Full temporary basal detail, or null when none is running *or* it has not been read. */
     var activeTbr: ActiveTbr? = null
 
     /** 24 hourly rates in U/h for the active program, empty until read. */
@@ -113,6 +122,7 @@ class YpsoPump @Inject constructor(
         firmwareVersion = ""
         deliveryModeName = ""
         isDelivering = false
+        isTbrRunning = false
         activeTbr = null
         basalProfileRates = emptyList()
         lastHistoryDump = emptyList()
