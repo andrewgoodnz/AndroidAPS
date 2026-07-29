@@ -8,6 +8,7 @@ plugins {
     alias(libs.plugins.android.library)
     id("kotlin-android")
     id("android-module-dependencies")
+    id("test-module-dependencies")
 }
 
 android {

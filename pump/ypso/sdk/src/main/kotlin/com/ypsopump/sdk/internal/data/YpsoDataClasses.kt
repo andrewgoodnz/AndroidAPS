@@ -1,6 +1,7 @@
 package com.ypsopump.sdk.internal.data
 
 import com.ypsopump.sdk.internal.protocol.BolusNotificationStatus
+import com.ypsopump.sdk.internal.protocol.DeliveryMode
 import com.ypsopump.sdk.internal.protocol.EventType
 import com.ypsopump.sdk.internal.protocol.YpsoCrc
 import java.nio.ByteBuffer
@@ -47,6 +48,44 @@ internal data class SystemStatusData(
 
         /** The pump reports 100% when no temporary basal is active. */
         const val TBR_PERCENT_NONE = 100
+
+        /** The pump's battery gauge has four bars; byte 5 carries a bar count, not a percent. */
+        const val BATTERY_BARS_MAX = 4
+
+        /** Bytes the driver decodes, i.e. the reply with its trailing CRC already removed. */
+        const val PAYLOAD_BYTES = 18
+
+        /**
+         * Decodes an 18-byte system-status payload, or returns null if it is short.
+         *
+         * A pure function on purpose: this is the most safety-critical decode in the driver —
+         * reservoir, delivery mode and temporary basal all come from here — and leaving it
+         * inline in a BLE callback put it out of reach of any test. [HistoryEntry.parse] and
+         * [BolusNotification.parse] were already shaped this way.
+         *
+         * @param payload the reply **without** its CRC.
+         */
+        fun parse(payload: ByteArray): SystemStatusData? {
+            if (payload.size < PAYLOAD_BYTES) return null
+
+            fun le32(at: Int) = ByteBuffer.wrap(payload, at, 4).order(ByteOrder.LITTLE_ENDIAN).int
+
+            val mode = payload[0].toInt() and 0xFF
+            // Byte 5 is a bar count, verified against a pump displaying "2 of 4 bars" for a raw
+            // value of 2. Upstream passed it through as a percentage, turning a half-charged
+            // battery into a 2% reading — and AAPS acts on pump battery level.
+            val bars = payload[5].toInt() and 0xFF
+            return SystemStatusData(
+                deliveryMode = mode,
+                deliveryModeName = DeliveryMode.nameFor(mode),
+                insulinRemaining = le32(1) / 100f,
+                batteryPercent = (bars.coerceIn(0, BATTERY_BARS_MAX) * 100) / BATTERY_BARS_MAX,
+                batteryBars = bars,
+                currentBasalRate = le32(6) / 100.0,
+                tbrPercent = le32(10),
+                tbrRemainingMinutes = le32(14)
+            )
+        }
     }
 }
 

@@ -11,7 +11,6 @@ import com.ypsopump.sdk.internal.data.HistoryEntry
 import com.ypsopump.sdk.internal.data.PumpClockData
 import com.ypsopump.sdk.internal.data.SystemStatusData
 import com.ypsopump.sdk.internal.protocol.BolusNotificationStatus
-import com.ypsopump.sdk.internal.protocol.DeliveryMode
 import com.ypsopump.sdk.internal.protocol.SettingsIndex
 import com.ypsopump.sdk.internal.protocol.YpsoCrc
 import com.ypsopump.sdk.internal.protocol.YpsoFraming
@@ -49,12 +48,6 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
     companion object {
         private const val TAG = "YpsoBleManager"
         const val YPSOPUMP_NAME_PREFIX = "YpsoPump_"
-
-        /** The pump's battery gauge has four bars; the status byte carries a bar count. */
-        const val BATTERY_BARS_MAX = 4
-
-        /** Bytes of system status the driver decodes, before the 2-byte CRC. */
-        private const val STATUS_PAYLOAD_BYTES = 18
 
         /** `CHAR_SYSTEM_DATE` payload: year u16 LE, month u8, day u8. */
         private const val DATE_PAYLOAD_BYTES = 4
@@ -641,45 +634,28 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
                 return@readExtended
             }
 
-            if (YpsoCrc.isValid(data)) {
-                val payload = data.copyOfRange(0, data.size - 2)
-                if (payload.size >= STATUS_PAYLOAD_BYTES) {
-                    fun le32(at: Int) = ByteBuffer.wrap(payload, at, 4).order(ByteOrder.LITTLE_ENDIAN).int
-
-                    val mode = payload[0].toInt() and 0xFF
-                    val insulinRaw = le32(1)
-                    // The pump reports battery as bars, not percent — verified against the
-                    // pump's own display, which showed "2 of 4 bars" for a raw value of 2.
-                    // Upstream passed this straight through as a percentage, which turned a
-                    // half-charged battery into a 2% reading and would have looked like an
-                    // imminent shutdown to anything acting on it.
-                    val bars = payload[5].toInt() and 0xFF
-                    val status = SystemStatusData(
-                        deliveryMode = mode,
-                        deliveryModeName = DeliveryMode.nameFor(mode),
-                        insulinRemaining = insulinRaw / 100f,
-                        batteryPercent = (bars.coerceIn(0, BATTERY_BARS_MAX) * 100) / BATTERY_BARS_MAX,
-                        batteryBars = bars,
-                        currentBasalRate = le32(6) / 100.0,
-                        tbrPercent = le32(10),
-                        tbrRemainingMinutes = le32(14)
-                    )
-                    log(
-                        "Status: ${status.deliveryModeName}, Insulin: ${status.insulinRemaining}U, " +
-                            "Battery: $bars/$BATTERY_BARS_MAX bars (${status.batteryPercent}%), " +
-                            "Rate: ${status.currentBasalRate}U/h" +
-                            if (status.isTbrRunning) {
-                                ", TBR ${status.tbrPercent}% ${status.tbrRemainingMinutes}min left"
-                            } else ""
-                    )
-                    emitData(DataEvent.StatusNotification(data))
-                    callback(status)
-                } else {
-                    callback(null)
-                }
-            } else {
+            if (!YpsoCrc.isValid(data)) {
                 callback(null)
+                return@readExtended
             }
+
+            val status = SystemStatusData.parse(data.copyOfRange(0, data.size - 2))
+            if (status == null) {
+                log("getSystemStatus: payload too short (${data.size - 2}B)")
+                callback(null)
+                return@readExtended
+            }
+
+            log(
+                "Status: ${status.deliveryModeName}, Insulin: ${status.insulinRemaining}U, " +
+                    "Battery: ${status.batteryBars}/${SystemStatusData.BATTERY_BARS_MAX} bars " +
+                    "(${status.batteryPercent}%), Rate: ${status.currentBasalRate}U/h" +
+                    if (status.isTbrRunning) {
+                        ", TBR ${status.tbrPercent}% ${status.tbrRemainingMinutes}min left"
+                    } else ""
+            )
+            emitData(DataEvent.StatusNotification(data))
+            callback(status)
         }
     }
 
