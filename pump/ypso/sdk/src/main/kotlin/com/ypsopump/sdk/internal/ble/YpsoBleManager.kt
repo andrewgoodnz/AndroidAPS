@@ -412,11 +412,25 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
                 return@with
             }
 
+            log("readExtended($firstUuid): read ${firstFrame.size}B = ${firstFrame.toHexString()}")
+
+            // Firmware V05.02.03 answers reads with a bare CRC-terminated message and no
+            // framing header — the whole reply arrives in one read. Upstream assumed reads are
+            // framed like writes are, took the low nibble of the first *data* byte as a frame
+            // count, and then read continuation frames that do not exist. A status reply
+            // starting 0x03 was read as "frame 1 of 3", and the follow-up read of the extended
+            // characteristic failed with GATT_INVALID_OFFSET, killing every session right
+            // after authentication.
+            //
+            // The CRC is the reliable discriminator: if it validates over the bytes we already
+            // have, this is a complete message and there is nothing to continue.
+            if (YpsoCrc.isValid(firstFrame)) {
+                callback(firstFrame)
+                return@with
+            }
+
             val totalFrames = YpsoFraming.getTotalFrames(firstFrame[0])
-            // The raw bytes matter during bring-up: the frame count tells you how long the
-            // pump's answer is, which is how you tell a short plaintext payload from a
-            // ciphertext blob carrying a 16-byte tag and a 24-byte nonce.
-            log("readExtended($firstUuid): frame 1/$totalFrames = ${firstFrame.toHexString()}")
+            log("readExtended($firstUuid): no valid CRC yet, treating as frame 1/$totalFrames")
             if (totalFrames <= 1) {
                 callback(if (firstFrame.size > 1) firstFrame.copyOfRange(1, firstFrame.size) else byteArrayOf())
                 return@with
