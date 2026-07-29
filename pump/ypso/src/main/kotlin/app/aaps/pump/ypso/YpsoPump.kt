@@ -1,0 +1,120 @@
+package app.aaps.pump.ypso
+
+import app.aaps.core.interfaces.logging.AAPSLogger
+import app.aaps.core.interfaces.logging.LTag
+import app.aaps.core.interfaces.utils.DateUtil
+import app.aaps.core.keys.interfaces.Preferences
+import app.aaps.pump.ypso.keys.YpsoDoubleNonKey
+import app.aaps.pump.ypso.keys.YpsoIntNonKey
+import app.aaps.pump.ypso.keys.YpsoLongNonKey
+import app.aaps.pump.ypso.keys.YpsoStringNonKey
+import com.pump.common.ActiveTbr
+import java.util.Calendar
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Everything the driver knows about the pump between connections.
+ *
+ * Shaped on `MedtrumPump`: the plugin and the fragment read from here rather than from the
+ * service, so a value survives the service being unbound and rebound. Values that must outlive
+ * a process restart are mirrored into preferences.
+ */
+@Singleton
+class YpsoPump @Inject constructor(
+    private val aapsLogger: AAPSLogger,
+    private val preferences: Preferences,
+    private val dateUtil: DateUtil
+) {
+
+    var pumpMac: String
+        get() = preferences.get(YpsoStringNonKey.MacAddress)
+        set(value) = preferences.put(YpsoStringNonKey.MacAddress, value)
+
+    var pumpName: String
+        get() = preferences.get(YpsoStringNonKey.DeviceName)
+        set(value) = preferences.put(YpsoStringNonKey.DeviceName, value)
+
+    /** Serial as printed on the pump, taken from the advertised name `YpsoPump_<serial>`. */
+    var serialNumber: String
+        get() = preferences.get(YpsoStringNonKey.SerialNumber)
+        set(value) = preferences.put(YpsoStringNonKey.SerialNumber, value)
+
+    var firmwareVersion: String
+        get() = preferences.get(YpsoStringNonKey.FirmwareVersion)
+        set(value) = preferences.put(YpsoStringNonKey.FirmwareVersion, value)
+
+    var lastConnection: Long
+        get() = preferences.get(YpsoLongNonKey.LastConnection)
+        set(value) = preferences.put(YpsoLongNonKey.LastConnection, value)
+
+    var reservoir: Double
+        get() = preferences.get(YpsoDoubleNonKey.Reservoir)
+        set(value) = preferences.put(YpsoDoubleNonKey.Reservoir, value)
+
+    var batteryPercent: Int
+        get() = preferences.get(YpsoIntNonKey.BatteryLevel)
+        set(value) = preferences.put(YpsoIntNonKey.BatteryLevel, value)
+
+    /** 0 = program A, 1 = program B, -1 = not read yet. */
+    var activeProfileId: Int
+        get() = preferences.get(YpsoIntNonKey.ActiveProfileId)
+        set(value) = preferences.put(YpsoIntNonKey.ActiveProfileId, value)
+
+    var lastBolusTime: Long
+        get() = preferences.get(YpsoLongNonKey.LastBolusTime)
+        set(value) = preferences.put(YpsoLongNonKey.LastBolusTime, value)
+
+    var lastBolusAmount: Double
+        get() = preferences.get(YpsoDoubleNonKey.LastBolusAmount)
+        set(value) = preferences.put(YpsoDoubleNonKey.LastBolusAmount, value)
+
+    /** The pump's delivery mode as a display string, e.g. "Basal" or "TBR Active". */
+    var deliveryModeName: String = ""
+
+    var isDelivering: Boolean = false
+
+    /** Temporary basal reported by the pump, or null when none is running. */
+    var activeTbr: ActiveTbr? = null
+
+    /** 24 hourly rates in U/h for the active program, empty until read. */
+    var basalProfileRates: List<Double> = emptyList()
+
+    /** Last raw history dump, kept in memory only, for the firmware parity check. */
+    var lastHistoryDump: List<String> = emptyList()
+
+    val isPaired: Boolean get() = pumpMac.isNotBlank()
+
+    /**
+     * Base basal rate right now: the active program's rate for the current hour.
+     *
+     * Returns 0.0 until the profile has been read, which is honest — the driver genuinely does
+     * not know the rate yet, and reporting a made-up value would corrupt every calculation
+     * downstream.
+     */
+    val baseBasalRate: Double
+        get() {
+            val rates = basalProfileRates
+            if (rates.size != 24) return 0.0
+            return rates[Calendar.getInstance().get(Calendar.HOUR_OF_DAY)]
+        }
+
+    fun onConnectionSucceeded() {
+        lastConnection = dateUtil.now()
+    }
+
+    fun reset() {
+        aapsLogger.debug(LTag.PUMP, "YpsoPump: resetting cached pump state")
+        reservoir = 0.0
+        batteryPercent = 0
+        activeProfileId = -1
+        lastConnection = 0L
+        serialNumber = ""
+        firmwareVersion = ""
+        deliveryModeName = ""
+        isDelivering = false
+        activeTbr = null
+        basalProfileRates = emptyList()
+        lastHistoryDump = emptyList()
+    }
+}

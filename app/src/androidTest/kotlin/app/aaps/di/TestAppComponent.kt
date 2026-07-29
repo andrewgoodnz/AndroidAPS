@@ -29,7 +29,7 @@ import app.aaps.pump.medtrum.di.MedtrumModule
 import app.aaps.pump.omnipod.dash.di.OmnipodDashModule
 import app.aaps.pump.omnipod.eros.di.OmnipodErosModule
 import app.aaps.pump.virtual.di.VirtualPumpModule
-import app.aaps.pump.ypsopump.di.YpsoPumpModule
+import app.aaps.pump.ypso.di.YpsoModule
 import app.aaps.shared.impl.di.LoggerModule
 import app.aaps.shared.impl.di.SharedImplModule
 import app.aaps.ui.di.UiModule
@@ -95,7 +95,7 @@ import javax.inject.Singleton
         RileyLinkModule::class,
         MedtrumModule::class,
         VirtualPumpModule::class,
-        YpsoPumpModule::class
+        YpsoModule::class
     ]
 )
 interface TestAppComponent : AndroidInjector<TestApplication> {

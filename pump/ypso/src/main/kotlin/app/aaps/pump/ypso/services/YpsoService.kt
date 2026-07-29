@@ -1,0 +1,346 @@
+package app.aaps.pump.ypso.services
+
+import android.content.Context
+import android.content.Intent
+import android.os.Binder
+import android.os.IBinder
+import app.aaps.core.data.model.TE
+import app.aaps.core.data.pump.defs.PumpType
+import app.aaps.core.interfaces.logging.AAPSLogger
+import app.aaps.core.interfaces.logging.LTag
+import app.aaps.core.interfaces.pump.PumpSync
+import app.aaps.core.interfaces.resources.ResourceHelper
+import app.aaps.core.interfaces.rx.AapsSchedulers
+import app.aaps.core.interfaces.rx.bus.RxBus
+import app.aaps.core.interfaces.rx.events.EventAppExit
+import app.aaps.core.interfaces.rx.events.EventPumpStatusChanged
+import app.aaps.core.interfaces.utils.DateUtil
+import app.aaps.core.interfaces.utils.fabric.FabricPrivacy
+import app.aaps.core.keys.interfaces.Preferences
+import app.aaps.pump.ypso.R
+import app.aaps.pump.ypso.YpsoPump
+import app.aaps.pump.ypso.events.EventYpsoPumpDataChanged
+import app.aaps.pump.ypso.keys.YpsoBooleanKey
+import app.aaps.pump.ypso.keys.YpsoIntKey
+import com.pump.common.PumpConnectionState
+import com.pump.common.PumpHistoryEvent
+import com.ypsopump.sdk.YpsoPumpManagerImpl
+import dagger.android.DaggerService
+import io.reactivex.rxjava3.disposables.CompositeDisposable
+import io.reactivex.rxjava3.kotlin.plusAssign
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import javax.inject.Inject
+
+/**
+ * Owns the connection to the pump.
+ *
+ * Structurally this is Medtrum's bound `DaggerService`: the plugin binds it, talks to it through
+ * [LocalBinder], and the service holds the pump session for the whole app lifetime. Internally it
+ * is nothing like Medtrum's, though — there is no packet state machine and no `SystemClock.sleep`
+ * polling. The service owns a [CoroutineScope] and calls the vendored SDK's suspend functions
+ * directly.
+ *
+ * `runBlocking` appears exactly once, in [awaitResult], and only because the AAPS command queue
+ * calls into pump drivers from its own thread and expects a synchronous answer. Everything below
+ * that line stays suspending.
+ *
+ * **This build reads and never writes.** The service exposes no bolus, TBR, basal-write or
+ * clock-set entry point at all, so there is no code path from AAPS to a delivery command —
+ * not a flag to check, an absence of method. Session 3 adds them, on saline.
+ */
+class YpsoService : DaggerService() {
+
+    @Inject lateinit var aapsLogger: AAPSLogger
+    @Inject lateinit var aapsSchedulers: AapsSchedulers
+    @Inject lateinit var rxBus: RxBus
+    @Inject lateinit var preferences: Preferences
+    @Inject lateinit var rh: ResourceHelper
+    @Inject lateinit var context: Context
+    @Inject lateinit var ypsoPump: YpsoPump
+    @Inject lateinit var pumpSync: PumpSync
+    @Inject lateinit var dateUtil: DateUtil
+    @Inject lateinit var fabricPrivacy: FabricPrivacy
+
+    private val binder: IBinder = LocalBinder()
+    private val disposable = CompositeDisposable()
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    private lateinit var pumpManager: YpsoPumpManagerImpl
+
+    /** Serialises the blocking bridge so two command-queue calls cannot overlap. */
+    private val commandLock = Any()
+
+    override fun onCreate() {
+        super.onCreate()
+        aapsLogger.debug(LTag.PUMP, "YpsoService onCreate")
+
+        pumpManager = YpsoPumpManagerImpl.create(context)
+        applyPairedDevice()
+        applyAuthSaltPreference()
+
+        disposable += rxBus
+            .toObservable(EventAppExit::class.java)
+            .observeOn(aapsSchedulers.io)
+            .subscribe({ stopSelf() }, fabricPrivacy::logException)
+
+        // Forward the SDK's own log lines into the AAPS log, so BLE traffic shows up in the
+        // same place as everything else during bring-up.
+        scope.launch {
+            pumpManager.logs.collect { line -> aapsLogger.debug(LTag.PUMPBTCOMM, "[ypso-sdk] $line") }
+        }
+
+        scope.launch {
+            pumpManager.connectionState.collect { state -> onConnectionStateChanged(state) }
+        }
+
+        scope.launch {
+            pumpManager.pumpStatus.collect { status ->
+                status ?: return@collect
+                status.serialNumber.takeIf { it.isNotBlank() }?.let {
+                    ypsoPump.serialNumber = it.removePrefix(YPSOPUMP_NAME_PREFIX)
+                }
+                status.firmwareVersion.takeIf { it.isNotBlank() }?.let { ypsoPump.firmwareVersion = it }
+                status.batteryPercent?.let { ypsoPump.batteryPercent = it }
+                status.reservoirUnits?.let { ypsoPump.reservoir = it }
+                status.activeProfileId?.let { ypsoPump.activeProfileId = it }
+                ypsoPump.deliveryModeName = status.deliveryModeName
+                ypsoPump.isDelivering = status.isDelivering
+                ypsoPump.activeTbr = status.activeTbr
+                rxBus.send(EventYpsoPumpDataChanged())
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        aapsLogger.debug(LTag.PUMP, "YpsoService onDestroy")
+        disposable.clear()
+        pumpManager.close()
+        scope.cancel()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent): IBinder = binder
+
+    inner class LocalBinder : Binder() {
+
+        val serviceInstance: YpsoService get() = this@YpsoService
+    }
+
+    // ==================== STATE ====================
+
+    val isConnected: Boolean get() = pumpManager.isConnected
+
+    val isConnecting: Boolean
+        get() = pumpManager.connectionState.value.let {
+            it is PumpConnectionState.Connecting || it is PumpConnectionState.Initializing
+        }
+
+    /** Picks up a MAC newly chosen in the pairing screen. */
+    fun applyPairedDevice() {
+        val mac = ypsoPump.pumpMac
+        pumpManager.setPairedDevice(mac.takeIf { it.isNotBlank() }, ypsoPump.pumpName)
+    }
+
+    fun applyAuthSaltPreference() {
+        pumpManager.useLegacyAuthSalt = preferences.get(YpsoBooleanKey.YpsoLegacyAuthSalt)
+    }
+
+    // ==================== CONNECTION ====================
+
+    /**
+     * Starts connecting and returns immediately.
+     *
+     * The AAPS command queue calls this and then waits on [isConnected], so blocking here would
+     * only stall its thread for the length of a BLE handshake.
+     */
+    fun connect(from: String): Boolean {
+        if (!ypsoPump.isPaired) {
+            aapsLogger.error(LTag.PUMP, "connect($from) refused: no pump paired")
+            return false
+        }
+        aapsLogger.debug(LTag.PUMP, "connect from: $from")
+        scope.launch { pumpManager.connect() }
+        return true
+    }
+
+    fun disconnect(from: String) {
+        aapsLogger.debug(LTag.PUMP, "disconnect from: $from")
+        scope.launch { pumpManager.disconnect() }
+    }
+
+    fun stopConnecting() = disconnect("stopConnecting")
+
+    private fun onConnectionStateChanged(state: PumpConnectionState) {
+        aapsLogger.debug(LTag.PUMP, "Connection state: $state")
+        when (state) {
+            is PumpConnectionState.Connecting  ->
+                rxBus.send(EventPumpStatusChanged(EventPumpStatusChanged.Status.CONNECTING))
+
+            is PumpConnectionState.Initializing ->
+                rxBus.send(EventPumpStatusChanged(EventPumpStatusChanged.Status.HANDSHAKING))
+
+            is PumpConnectionState.Ready       -> {
+                ypsoPump.onConnectionSucceeded()
+                rxBus.send(EventPumpStatusChanged(EventPumpStatusChanged.Status.CONNECTED))
+            }
+
+            is PumpConnectionState.Disconnected,
+            is PumpConnectionState.NotPaired   ->
+                rxBus.send(EventPumpStatusChanged(EventPumpStatusChanged.Status.DISCONNECTED))
+
+            is PumpConnectionState.Error       ->
+                rxBus.send(EventPumpStatusChanged(state.message))
+
+            else                               -> Unit
+        }
+        rxBus.send(EventYpsoPumpDataChanged())
+    }
+
+    // ==================== READS ====================
+
+    /**
+     * Reads reservoir, battery, delivery mode, active program and the active basal profile.
+     *
+     * @return true if the pump answered.
+     */
+    fun readPumpStatus(): Boolean = awaitResult("readPumpStatus", false) {
+        rxBus.send(EventPumpStatusChanged(rh.gs(R.string.ypso_getting_pump_status)))
+        pumpManager.getFullStatus()
+        ypsoPump.onConnectionSucceeded()
+
+        // Read the program that the pump says is active, so the rate we report is the rate the
+        // pump is actually running rather than whichever program we looked at last.
+        val profileId = ypsoPump.activeProfileId.takeIf { it >= 0 } ?: 0
+        pumpManager.readBasalProfile(profileId)?.let { profile ->
+            ypsoPump.basalProfileRates = profile.blocks.map { it.basalRate }
+            aapsLogger.debug(LTag.PUMP, "Basal profile ${profile.name}: ${ypsoPump.basalProfileRates}")
+        } ?: aapsLogger.warn(LTag.PUMP, "Basal profile read returned nothing")
+
+        rxBus.send(EventYpsoPumpDataChanged())
+        true
+    }
+
+    /**
+     * Reads the pump's event and alert logs.
+     *
+     * Always produces a human-readable dump for the firmware parity check. Writing the events
+     * into AAPS treatment records is gated behind [YpsoBooleanKey.YpsoSyncHistoryToAaps] — see
+     * that key's comment for why it defaults to off.
+     */
+    fun loadHistory(): Boolean = awaitResult("loadHistory", false) {
+        val count = preferences.get(YpsoIntKey.YpsoHistoryReadCount)
+
+        ypsoPump.lastHistoryDump = pumpManager.dumpHistoryEntries(count)
+        ypsoPump.lastHistoryDump.forEach { aapsLogger.debug(LTag.PUMP, "[history] $it") }
+
+        val events = pumpManager.readHistory(maxEvents = count)
+        aapsLogger.debug(LTag.PUMP, "Mapped ${events.size} history event(s)")
+
+        if (preferences.get(YpsoBooleanKey.YpsoSyncHistoryToAaps)) {
+            events.forEach { syncToAaps(it) }
+        } else {
+            aapsLogger.info(LTag.PUMP, "History sync to AAPS is disabled; ${events.size} event(s) logged only")
+        }
+
+        ypsoPump.onConnectionSucceeded()
+        rxBus.send(EventYpsoPumpDataChanged())
+        true
+    }
+
+    /** Reads one of the pump's two basal programs without making it active. */
+    fun readBasalProfile(profileId: Int): List<Double>? = awaitResult("readBasalProfile", null) {
+        pumpManager.readBasalProfile(profileId)?.blocks?.map { it.basalRate }
+    }
+
+    // ==================== PUMPSYNC ====================
+
+    private fun syncToAaps(event: PumpHistoryEvent) {
+        val serial = ypsoPump.serialNumber.ifBlank { ypsoPump.pumpMac }
+        when (event) {
+            is PumpHistoryEvent.BolusDelivered -> pumpSync.syncBolusWithPumpId(
+                timestamp = event.timestamp,
+                amount = event.amount,
+                type = null,
+                pumpId = event.position,
+                pumpType = PumpType.YPSOPUMP,
+                pumpSerial = serial
+            )
+
+            is PumpHistoryEvent.TbrStarted     -> pumpSync.syncTemporaryBasalWithPumpId(
+                timestamp = event.timestamp,
+                rate = event.percentage.toDouble(),
+                duration = event.durationMinutes * 60L * 1000L,
+                isAbsolute = false,
+                type = null,
+                pumpId = event.position,
+                pumpType = PumpType.YPSOPUMP,
+                pumpSerial = serial
+            )
+
+            is PumpHistoryEvent.TbrEnded       -> pumpSync.syncStopTemporaryBasalWithPumpId(
+                timestamp = event.timestamp,
+                endPumpId = event.position,
+                pumpType = PumpType.YPSOPUMP,
+                pumpSerial = serial
+            )
+
+            is PumpHistoryEvent.CartridgeChanged -> insertTherapyEvent(TE.Type.INSULIN_CHANGE, event, serial)
+
+            is PumpHistoryEvent.Alert          -> pumpSync.insertAnnouncement(
+                error = event.message,
+                pumpId = event.position,
+                pumpType = PumpType.YPSOPUMP,
+                pumpSerial = serial
+            )
+
+            else                               ->
+                aapsLogger.debug(LTag.PUMP, "No PumpSync mapping for ${event::class.simpleName}, skipped")
+        }
+    }
+
+    private fun insertTherapyEvent(type: TE.Type, event: PumpHistoryEvent, serial: String) {
+        val enabled = when (type) {
+            TE.Type.INSULIN_CHANGE  -> preferences.get(YpsoBooleanKey.YpsoLogInsulinChange)
+            TE.Type.CANNULA_CHANGE  -> preferences.get(YpsoBooleanKey.YpsoLogSiteChange)
+            TE.Type.TUBE_CHANGE     -> preferences.get(YpsoBooleanKey.YpsoLogTubeChange)
+            TE.Type.PUMP_BATTERY_CHANGE -> preferences.get(YpsoBooleanKey.YpsoLogBatteryChange)
+            else                    -> true
+        }
+        if (!enabled) return
+        pumpSync.insertTherapyEventIfNewWithTimestamp(
+            timestamp = event.timestamp,
+            type = type,
+            pumpId = event.position,
+            pumpType = PumpType.YPSOPUMP,
+            pumpSerial = serial
+        )
+    }
+
+    // ==================== BLOCKING BRIDGE ====================
+
+    /**
+     * The one place suspending code is made synchronous, for the AAPS command queue.
+     *
+     * A failure is reported as [fallback] and logged; it never throws into the queue thread,
+     * because an exception escaping here aborts the whole command chain.
+     */
+    private fun <T> awaitResult(what: String, fallback: T, block: suspend () -> T): T =
+        synchronized(commandLock) {
+            try {
+                runBlocking { block() }
+            } catch (e: Exception) {
+                aapsLogger.error(LTag.PUMP, "$what failed: ${e.message}", e)
+                fallback
+            }
+        }
+
+    companion object {
+
+        private const val YPSOPUMP_NAME_PREFIX = "YpsoPump_"
+    }
+}
