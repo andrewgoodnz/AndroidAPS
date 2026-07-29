@@ -407,11 +407,16 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
         readCharacteristic(firstChar).with { _, data ->
             val firstFrame = data.value
             if (firstFrame == null || firstFrame.isEmpty()) {
+                log("readExtended($firstUuid): empty first frame")
                 callback(null)
                 return@with
             }
 
             val totalFrames = YpsoFraming.getTotalFrames(firstFrame[0])
+            // The raw bytes matter during bring-up: the frame count tells you how long the
+            // pump's answer is, which is how you tell a short plaintext payload from a
+            // ciphertext blob carrying a 16-byte tag and a 24-byte nonce.
+            log("readExtended($firstUuid): frame 1/$totalFrames = ${firstFrame.toHexString()}")
             if (totalFrames <= 1) {
                 callback(if (firstFrame.size > 1) firstFrame.copyOfRange(1, firstFrame.size) else byteArrayOf())
                 return@with
@@ -448,11 +453,17 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
 
         readCharacteristic(char).with { _, data ->
             val frame = data.value
-            if (frame != null) frames.add(frame)
+            if (frame != null) {
+                frames.add(frame)
+                log("  continuation frame ${frames.size} = ${frame.toHexString()}")
+            }
             readRemainingFrames(char, remaining - 1, frames, callback)
         }.fail { _, status ->
-            log("Frame read failed (status=$status), got ${frames.size} of ${frames.size + remaining} frames")
-            callback(null) // Don't return partial data — it corrupts decrypt
+            log(
+                "Frame read failed on ${char.uuid} (GATT status=$status), " +
+                    "got ${frames.size} of ${frames.size + remaining} frames"
+            )
+            callback(null) // Never return partial data — a truncated payload parses as garbage.
         }.enqueue()
     }
 
