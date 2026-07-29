@@ -2,13 +2,17 @@
 
 Driver for an **unlocked plaintext research YpsoPump** on current AndroidAPS (3.4.2.4).
 
-**Status after session 2: the project builds green and installs. The driver connects, bonds,
-authenticates and reads. It cannot deliver insulin — there is no code path from AAPS to a
-delivery command.**
+**Status after session 2: verified on hardware.** The driver bonds, connects, authenticates in
+plaintext with no key exchange, and reads reservoir, battery, delivery state, active program and
+the 24-slot basal profile — each cross-checked against the pump's own display. It cannot deliver
+insulin: there is no code path from AAPS to a delivery command.
 
-The first hardware milestone (bond → auto-auth → stay connected with no key exchange) has
-**not yet been run against the pump.** Everything below describing pump behaviour is derived
-from the sources, not observed. §7 is the list of what to check when you first power it on.
+Test pump: **YpsoPump_10074292**, MAC `EC:2A:F0:01:22:34`, firmware V05.02.03 — the unit whose
+settings are in the decrypted Lotus export. (Serial 10178681 is a *different*, standard pump
+running mylife CamAPS FX; see §7.)
+
+Findings marked **[verified]** below were confirmed against the pump display. Everything else is
+still inference from the sources.
 
 ---
 
@@ -136,8 +140,11 @@ pump.
 | Andy `YpsoPumpUtil.computeUserLevelPassword` | `5B D7 10 66 01 F2 4F 3C 8F 6B` |
 
 So the plan's "cross-check the exact MAC string format" was checking the wrong thing — the MAC
-handling is identical; the salt is not. Only hardware can say which one this firmware wants.
-`YpsoLegacyAuthSalt` (Advanced settings, default off = vicktor's) switches between them.
+handling is identical; the salt is not. `YpsoLegacyAuthSalt` (Advanced settings, default off)
+switches between them.
+
+**[verified] vicktor's salt is the right one for V05.02.03.** Authentication succeeds with the
+default and the legacy toggle has not been needed. It is retained for older firmware.
 
 **Detecting a wrong salt:** the auth write itself will *succeed* either way — it is an ordinary
 GATT write and the pump does not NAK a bad password. The failure shows up on the next read. So
@@ -152,30 +159,93 @@ of the AAPS dependency graph — upstream needed both only for Proregia.
 
 ---
 
-## 4. Read path
+## 4. Read path — and four wire-format corrections to the vendored SDK
 
-`getPumpStatus` (queued as a normal status read) does:
+**Upstream's framing does not match firmware V05.02.03.** Four separate bugs, each found by
+looking at raw bytes rather than at the code's own assumptions. Together they broke every read.
 
-| Value | Source | Notes |
+### 4a. Reads carry no framing header
+
+The system-status reply is a bare CRC-terminated message:
+
+```
+03 8B 16 00 00 02 78 00 00 00 64 00 00 00 00 00 00 00  F1 52
+└─ payload (18 bytes) ─────────────────────────────┘  └CRC┘
+```
+
+CRC-16 over the first 18 bytes is `F1 52` — it matches, so the 20-byte read is complete.
+Recomputing with the leading byte treated as a framing header does *not* match. Upstream assumed
+reads are framed like writes, took the low nibble of the first *data* byte as a frame count, read
+`0x03` as "frame 1 of 3", and chased continuation frames on `CHAR_EXTENDED_READ` that do not
+exist — `GATT_INVALID_OFFSET` (status 7), killing every session about a second after auth.
+
+`readExtended` now validates the CRC first and returns the message when it is already complete.
+**The CRC is the discriminator, never the nibble** — the nibble may be data.
+
+### 4b. GLB writes must not be framed
+
+Writing an 8-byte GLB safe variable through `chunkPayload` makes it 9 bytes, and the pump answers
+`GATT_INVALID_ATTRIBUTE_LENGTH` (status 13). That broke every basal profile read. `writeGlb`
+sends the bare 8 bytes.
+
+### 4c. GLB reads must not go through `readExtended`
+
+Setting values come back as a bare GLB pair — value then its bitwise complement — with **no CRC
+and no framing**:
+
+```
+readSetting(1)  -> 03 00 00 00 FC FF FF FF   value=3   (program A)
+readSetting(14) -> 78 00 00 00 87 FF FF FF   value=120 (1.20 U/h)
+```
+
+With no CRC to validate, `readExtended` fell through to its frame-count fallback and read a value
+of 120 (`0x78`) as "frame 1 of 8". `readGlb` reads these directly; the GLB's own complement is
+the integrity check. History counts are the same shape.
+
+### 4d. Rates are Double, not widened Float
+
+`120 / 100f` widened to Double is `1.2000000476837158`. `isThisProfileSet()` compares pump
+against AAPS profile, so that would report a mismatch on a correct profile forever once writes
+exist. Divide in Double.
+
+### What is read, and what was verified
+
+| Value | Source | Status |
 |---|---|---|
-| Reservoir U | `getFullStatus()` → `CHAR_SYSTEM_STATUS` | centi-units ÷ 100 |
-| Battery % | same read | |
-| Delivery mode | same read | "Basal", "TBR Active", "Priming", … |
-| Active program | `readActiveProgram()` → setting index 1 | 3 = A, 10 = B |
-| Basal profile | `readBasalProfile(active)` → setting indices 14–37 (A) / 38–61 (B) | 24 hourly rates; `-1` slot = 0.0 U/h |
-| Serial / firmware / manufacturer | standard BLE device-info characteristics | read once per session |
+| Reservoir U | `CHAR_SYSTEM_STATUS` bytes 1–4, centi-units LE | **[verified]** 5771 → 57.71 U vs 57.7 U on pump; falls steadily while running |
+| Battery | byte 5 | **[verified]** it is **bars, not percent** — see below |
+| Delivery state | byte 0 | **[verified]** `3` = Stopped, `10` = Running |
+| Active program | setting index 1 | **[verified]** value 3 = program A |
+| Basal profile | setting indices 14–37 (A) / 38–61 (B) | **[verified]** all 24 slots read, 1.20 U/h |
+| Serial / firmware | standard BLE device-info characteristics | read once per session |
 
-`baseBasalRate` is the active program's rate for the current hour, and is **0.0 until the
-profile has actually been read** — the driver reports what it knows rather than a plausible
-guess.
+**Battery is a bar count.** The pump displayed "2 of 4 bars" for a raw value of 2. Upstream
+passed that through as `2%`, turning a half-charged battery into one apparently about to die —
+and pump battery level is something AAPS can act on. Now scaled by `BATTERY_BARS_MAX = 4`.
 
-**Known gap — temporary basal detail.** Plan §3 expected `getFullStatus().activeTbr` to carry
-`ActiveTbr(percentage, remainingMinutes, initialDurationMinutes)`. It does not: the system-status
-characteristic carries only delivery mode, reservoir and battery. So the driver exposes
-`isTbrActive` (true when the mode is TBR) and leaves `PumpStatus.activeTbr` **null**, and the
-fragment says "Running (rate and duration not readable yet)". Filling those fields with zeroes
-would have looked like a real measurement. Finding where the pump exposes TBR detail is session
-3 work and is a prerequisite for TBR support.
+**Delivery mode: upstream's table is wrong and is not used.** With the pump displaying *Stopped*,
+byte 0 reads `3`, which upstream calls `BOLUS_FAST`. That also made `isDelivering` true, so AAPS
+believed a stopped pump was running basal — the dangerous direction, since anything reasoning
+about IOB would assume background delivery that was not happening. `DeliveryMode` now reports
+only what has been confirmed: `3` = Stopped, `10` = Running, everything else "Unverified mode N"
+with `isDelivering` **not** asserted. Extend it only from observation.
+
+**Unmapped bytes**, both plausible and both unverified:
+
+- **bytes 6–9** went `0` → `120` when the pump was started, matching the 1.20 U/h basal read
+  independently from setting 14. Very likely the active rate in centi-units/hour. If confirmed
+  it gives `baseBasalRate` without reading the whole profile.
+- **byte 10** is `100` in every sample so far, stopped or running. Plausibly TBR percent with 100
+  meaning "none" — which would supply the TBR detail §3 of the plan expected and which is
+  otherwise missing. Testing needs a TBR set, so it is session 3 work.
+
+`baseBasalRate` is the active program's rate for the current hour and is **0.0 until the profile
+has actually been read** — the driver reports what it knows rather than a plausible guess.
+
+**Known gap — temporary basal detail.** `PumpStatus.activeTbr` stays **null**: no field carrying
+TBR percentage and remaining time has been identified yet (byte 10 is the candidate). The driver
+reports `isTbrActive = false` rather than inventing one. Resolving this is a prerequisite for TBR
+support.
 
 ---
 
@@ -206,6 +276,13 @@ top-up, not a set change). Each is gated by its own preference.
 `pump-common`'s `PumpHistoryEvent` has no variants for consumable changes, so those arrive as
 `Unknown` with the raw values packed into `rawData`; `YpsoEventTypes` re-exports the IDs and
 decodes the primed amount.
+
+**Not yet exercised on hardware.** History counts read through the same `readGlb` path that the
+basal profile now uses, and entries through the same index-write-then-value-read mechanism, so
+the wire format should be sorted (§4). What is unproven is `HistoryEntry.parse` — the 17-byte
+entry layout, the timestamp epoch (the pump counts from 2000-01-01, converted in `parse`) and
+the event-type IDs. Read history, then check the dump's timestamps and types against the pump's
+own history screen before trusting any of it.
 
 ### ⚠ Writing history into AAPS is disabled by default — settle this before enabling
 
@@ -283,28 +360,35 @@ from within AAPS first, and verify both landed in `/storage/emulated/0/AAPS/pref
 `/AAPS/exports/` before uninstalling. The database export is a separate action from the settings
 export and is easy to believe you did.
 
-### On the pump
+### Pump identity — settled
 
-1. **Bond.** Settings → YpsoPump → "Pair YpsoPump". The pump should appear as
-   `YpsoPump_<serial>`. Confirm the code on the pump. If nothing shows up, lower
-   `YpsoRssiThreshold` before assuming a scan problem.
-   - Confirm which unit you hold: the decrypted prefs are pump **10074292**
-     (MAC `EC:2A:F0:01:22:34`), the photos show **10178681**. Auth is MAC-derived so either
-     works, but the stored MAC belongs to the older pump.
-2. **Connect + auth.** Watch for `Authenticated (plaintext, no key exchange)` followed by
-   `Session ready` in the log. **This is the session's headline result: it proves the plaintext
-   assumption.**
-3. **If it connects but the status read fails:** flip `YpsoLegacyAuthSalt` (§3) and retry. That
-   is far more likely than a MAC-format problem.
-4. **Parity check.** Compare against the pump's own display, in this order — reservoir U,
-   battery %, active program (A/B), the 24 basal rates, firmware version. A mismatch in the basal
-   rates specifically would mean the setting indices (14–37 / 38–61) differ on this firmware.
-5. **History.** "Read history" on the overview screen. Compare the dump against the pump's
-   history screen: types, timestamps, bolus amounts. Then start the `idx`/`seq` observation
-   in §5.
-6. Leave the sync switch off until §5 step 3 or 4 is answered.
+The research unit is **10074292**, MAC `EC:2A:F0:01:22:34` — the pump in the decrypted Lotus
+export. **10178681** (seen in the photos) is a different, standard pump running mylife CamAPS FX
+for actual therapy. Both advertise as `YpsoPump_*` and both appear in the scan list, so the
+pairing screen makes the user confirm the serial before bonding. **Never select 10178681.**
 
-Confirm firmware version while you are there — the UUIDs were verified against **V05.02.03**.
+### Bring-up, in order
+
+1. **Make the plugin's tab visible.** Config Builder → Pump → YpsoPump → tick the visibility
+   checkbox. Pump fragments default to `visibleByDefault = false`, so without this the status
+   screen with Refresh and Read history simply is not there.
+2. **Bond.** Preferences → YpsoPump → "Pair YpsoPump", pick the pump, confirm the serial, then
+   confirm the code on the pump. If nothing appears in the list, lower `YpsoRssiThreshold` before
+   assuming a scan problem — and note a *connected* pump may stop advertising, so if you are
+   re-pairing you may need to forget it in Android Bluetooth settings first.
+3. **Connect + auth.** Watch for `Authenticated (plaintext, no key exchange)` then
+   `Session ready`. **[verified]**
+4. **If it connects but the status read fails:** flip `YpsoLegacyAuthSalt` (§3) and retry — but
+   the default salt is now confirmed correct for V05.02.03, so suspect framing (§4) first.
+5. **Parity check** against the pump's display: reservoir, battery, delivery state, active
+   program, the 24 basal rates. **[verified]** — and this is what found the battery and
+   delivery-mode bugs, neither of which was visible from the driver's own output. Do it again
+   after any decode change.
+6. **History.** "Read history" on the YPSO tab. Compare types and timestamps against the pump's
+   history screen, then start the `idx`/`seq` observation in §5.
+7. Leave the sync switch off until §5 step 3 or 4 is answered.
+
+Firmware confirmed **V05.02.03**.
 
 ---
 
@@ -312,20 +396,29 @@ Confirm firmware version while you are there — the UUIDs were verified against
 
 Blocking work, roughly in order:
 
-1. **Settle the `pumpId` question** (§5). Retrofitting stable IDs after boluses have been
-   recorded means duplicate IOB. Do this first.
-2. **Find the TBR detail read** (§4). No TBR support without percentage and remaining time.
-3. **`syncDateTime` first** — plan §7 step 5, the first non-delivering write. It exercises the
-   write path (`writeFramesSequentially` → `CHAR_SYSTEM_DATE` / `CHAR_SYSTEM_TIME`) with nothing
-   at stake. `YpsoPumpManagerImpl.syncDateTime` currently refuses; the BLE call underneath
-   (`bleManager.syncTime`) is already vendored and intact.
-4. **Then delivery**, on saline, off-body, in plan §7 step 6 order: 0.05 U bolus (with progress
-   and abort) → TBR → basal write. For each, the SDK method already exists and is wired to the
-   pump; what has to be written is the `YpsoService` entry point and the `YpsoPlugin` override.
-5. **Bolus progress** should come from collecting `pumpEvents` / the bolus-notification
+1. **Prove the history read** (§5). The wire format is fixed but `HistoryEntry.parse`, the
+   2000-01-01 epoch and the event-type IDs are all unverified.
+2. **Settle the `pumpId` question** (§5). Retrofitting stable IDs after boluses have been
+   recorded means duplicate IOB. Do this before enabling any sync.
+3. **Confirm the unmapped status bytes** (§4): bytes 6–9 as active basal rate, byte 10 as TBR
+   percent. Byte 10 is the only TBR candidate found, and no TBR support is possible without it.
+4. **Extend the delivery-mode map** (§4) by observation — start, stop, prime and bolus the pump
+   and record byte 0 each time. Until then anything but `3` and `10` reads as unverified and
+   `isDelivering` stays false, which under-reports a delivering pump.
+5. **`syncDateTime` first** — plan §7 step 5, the first non-delivering write, with nothing at
+   stake. `YpsoPumpManagerImpl.syncDateTime` currently refuses; `bleManager.syncTime` underneath
+   is vendored and intact — **but it still writes through `writeFramesSequentially`**, and §4b
+   showed this firmware rejects framed writes of short payloads with
+   `GATT_INVALID_ATTRIBUTE_LENGTH`. Expect to strip the framing there too. That is precisely why
+   syncDateTime is the right first write: it fails harmlessly.
+6. **Then delivery**, on saline, off-body, in plan §7 step 6 order: 0.05 U bolus (with progress
+   and abort) → TBR → basal write. The SDK methods exist and are wired to the pump; what has to
+   be written is the `YpsoService` entry point and the `YpsoPlugin` override. Note the bolus and
+   TBR payloads also go out framed — check each against §4b before trusting a "sent" result.
+7. **Bolus progress** should come from collecting `pumpEvents` / the bolus-notification
    characteristic into `EventOverviewBolusProgress` — a Flow collection, not Medtrum's sleep-poll.
    Scale the completion timeout to the configured bolus speed (`YpsoBolusSpeed`, 12 U/min).
-6. **Re-check the refusals.** Every `REFUSED` log line and every `notImplemented()` in
+8. **Re-check the refusals.** Every `REFUSED` log line and every `notImplemented()` in
    `YpsoPlugin` is a deliberate stop. Remove them one at a time, with a saline test each, not in
    a batch.
 
