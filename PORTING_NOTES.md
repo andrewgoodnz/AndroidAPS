@@ -313,10 +313,32 @@ and it is the reason the sync switch was gated off rather than shipped on.
 **[verified] The 2000-01-01 epoch is right.** Converted timestamps land on plausible real dates
 across a two-year span, so `HistoryEntry.parse`'s offset is correct.
 
-**[verified] Event type IDs decode sensibly**: `2` Bolus Immediate with `v1` in centi-units
-(39 = 0.39 U), `10` Basal Profile Temp with `v1` percent and `v2` minutes, and the 100-series
-alerts (occlusion, cartridge empty, no cartridge, battery empty). Still worth checking a handful
-against the pump's own history screen before enabling the sync.
+**[verified] The corrected read returns today's activity, matched against known actions.**
+After fitting a cartridge and starting the pump, the read returned:
+
+| idx | time | type | |
+|---|---|---|---|
+| 0 | 21:07 | 14 Pump Mode Changed | `v1=10` — the pump being set to Running |
+| 1–4 | 20:37–20:40 | 4 Priming Finished | primed 0.03 / 0.15 / 0.14 / 2.00 U |
+| 5 | 20:37 | 16 Rewind Finished | the cartridge change itself |
+
+That is exactly what was done to the pump, in order, with correct timestamps — the strongest
+confirmation available that ordering, epoch and type IDs are all right.
+
+**[verified] Third independent confirmation of the delivery-mode values.** History type 14
+"Pump Mode Changed" carries the new mode in `v1`: `3` when stopped, `10` when running. That
+agrees with byte 0 of the system status and with the pump's own display — three separate
+sources.
+
+**[verified] Event fields**: `2` Bolus Immediate carries centi-units in `v1` (39 = 0.39 U);
+`10` Basal Profile Temp carries percent in `v1` and minutes in `v2`; `4` Priming Finished
+carries the primed amount in `v1`. The 9 U tube-change threshold behaved correctly — the
+largest prime was 2.00 U, so none was recorded as a tube change.
+
+**⚠ Unresolved: three `24 Battery Removed` events** appeared within a minute of each other
+around the cartridge change. Each maps to a *Battery Change* therapy event, so if that reflects
+power cycling rather than an actual battery swap, enabling the sync would write spurious battery
+changes. Confirm what the pump logs on a cartridge change before switching it on.
 
 ### Writing history into AAPS is still disabled by default
 
