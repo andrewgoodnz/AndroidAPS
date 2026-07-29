@@ -13,6 +13,8 @@
     <string name="ypso_pairing_summary">Scan for your pump and bond to it. Confirm the code shown on the pump.</string>
     <string name="ypso_no_device_available">No YpsoPump found. Wake the pump and keep it close.</string>
     <string name="ypso_bonding_failed">Bonding failed. Wake the pump and try again.</string>
+    <string name="ypso_confirm_pair_title">Pair with this pump?</string>
+    <string name="ypso_confirm_pair_message">%1$s\n%2$s\n\nCheck the serial matches the pump you intend AAPS to use. Do not select a pump that another app is using to deliver insulin.</string>
     <string name="ypso_bonding_title">Bonding</string>
     <string name="ypso_bonding_message">Confirm the pairing request, and check the code matches the one shown on the pump.</string>
     <string name="ypso_not_paired">Not paired</string>

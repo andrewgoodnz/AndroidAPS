@@ -30,6 +30,7 @@ import app.aaps.core.interfaces.resources.ResourceHelper
 import app.aaps.core.interfaces.rx.bus.RxBus
 import app.aaps.core.keys.interfaces.Preferences
 import app.aaps.core.ui.activities.TranslatedDaggerAppCompatActivity
+import app.aaps.core.ui.dialogs.OKDialog
 import app.aaps.core.ui.toast.ToastUtils
 import app.aaps.core.utils.extensions.safeEnable
 import app.aaps.pump.ypso.R
@@ -188,6 +189,19 @@ class YpsoBLEScanActivity : TranslatedDaggerAppCompatActivity() {
                     return
                 }
 
+                // More than one YpsoPump can be in range, and one of them may be delivering
+                // insulin under another app. Bonding to the wrong one is not a mistake the user
+                // can see afterwards, so make them name the pump before we touch it.
+                OKDialog.showConfirmation(
+                    this@YpsoBLEScanActivity,
+                    rh.gs(R.string.ypso_confirm_pair_title),
+                    rh.gs(R.string.ypso_confirm_pair_message, item.name, item.device.address),
+                    { bondTo(item) }
+                )
+            }
+
+            @SuppressLint("MissingPermission")
+            private fun bondTo(item: BluetoothDeviceItem) {
                 val device = item.device
                 preferences.put(YpsoStringNonKey.MacAddress, device.address)
                 preferences.put(YpsoStringNonKey.DeviceName, item.name)
