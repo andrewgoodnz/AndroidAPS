@@ -335,10 +335,16 @@ sources.
 carries the primed amount in `v1`. The 9 U tube-change threshold behaved correctly — the
 largest prime was 2.00 U, so none was recorded as a tube change.
 
-**⚠ Unresolved: three `24 Battery Removed` events** appeared within a minute of each other
-around the cartridge change. Each maps to a *Battery Change* therapy event, so if that reflects
-power cycling rather than an actual battery swap, enabling the sync would write spurious battery
-changes. Confirm what the pump logs on a cartridge change before switching it on.
+**`24 Battery Removed` is unverified, but nothing observed argues against it.** Three of these
+appear in the log, all dated **2026-03-29** — 122 days before the cartridge change, and not
+corresponding to anything done in the bring-up session. Today's cartridge change logged a
+rewind, four primes and a mode change and *no* battery event, which is correct. Whether type 24
+means a genuine battery swap is still unconfirmed.
+
+(An earlier revision of this file claimed these events fired *during* the cartridge change and
+warned they would write spurious treatments. That was a misreading: their clock time, 20:41, is
+close to the cartridge change's 20:37, and the dates were not checked. Compare full timestamps,
+not times of day — history spanning two years makes that mistake easy.)
 
 ### Writing history into AAPS is still disabled by default
 
