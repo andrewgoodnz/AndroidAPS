@@ -923,19 +923,37 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
                 callback(null)
                 return@writeGlb
             }
-
-            readExtended(YpsoPumpUuids.CHAR_SETTING_VALUE) { data ->
-                if (data == null) {
-                    log("readSetting($index): BLE read returned null")
-                    callback(null)
-                    return@readExtended
-                }
-
-                val glbValue = YpsoGlb.findInPayload(data)
-                log("readSetting($index): value=$glbValue (${data.size}B)")
-                callback(glbValue)
+            readGlb(valChar) { value ->
+                log("readSetting($index): value=$value")
+                callback(value)
             }
         }
+    }
+
+    /**
+     * Reads a bare 8-byte GLB safe variable from [char].
+     *
+     * Settings values come back as the GLB pair on its own — no CRC and no framing header.
+     * Routing them through [readExtended] destroyed them: with no CRC to validate, that method
+     * falls back to treating the low nibble of the first *data* byte as a frame count, so a
+     * value of 120 (`0x78`) was read as "frame 1 of 8" and the follow-up reads killed it. Read
+     * these directly; the GLB's own complement check is the integrity guard here.
+     */
+    private fun readGlb(char: BluetoothGattCharacteristic, callback: (Int?) -> Unit) {
+        readCharacteristic(char).with { _, data ->
+            val raw = data.value
+            if (raw == null || raw.size < 8) {
+                log("readGlb(${char.uuid}): short read (${raw?.size ?: 0}B)")
+                callback(null)
+                return@with
+            }
+            val value = YpsoGlb.findInPayload(raw)
+            if (value == null) log("readGlb(${char.uuid}): no valid GLB in ${raw.toHexString()}")
+            callback(value)
+        }.fail { _, status ->
+            log("readGlb(${char.uuid}) failed (GATT status=$status)")
+            callback(null)
+        }.enqueue()
     }
 
     /**
@@ -1050,13 +1068,16 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
 
     // ==================== HISTORY ====================
 
+    /** History counts are GLB safe variables too — same bare 8 bytes as a setting value. */
     fun readHistoryCount(countUuid: UUID, callback: (Int?) -> Unit) {
-        readExtended(countUuid) { data ->
-            if (data == null) {
-                callback(null)
-                return@readExtended
-            }
-            callback(YpsoGlb.findInPayload(data))
+        val char = findCharacteristic(countUuid)
+        if (char == null) {
+            callback(null)
+            return
+        }
+        readGlb(char) { count ->
+            log("readHistoryCount($countUuid): $count")
+            callback(count)
         }
     }
 

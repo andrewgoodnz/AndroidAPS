@@ -33,25 +33,35 @@ internal object DeliveryMode {
     const val PRIMING = 6
     const val PAUSED = 7
 
-    /** Raw byte-0 value seen while the pump displayed "Stopped". The one verified data point. */
+    // Byte-0 values observed on V05.02.03, each confirmed by watching the pump's own display
+    // while it was switched between states.
+
+    /** Pump display read "Stopped". */
     const val V05_STOPPED = 3
 
-    /** Raw values confirmed against the pump screen to mean "not delivering". */
+    /** Pump display read "Running"; the reservoir fell and byte 6 began reporting a rate. */
+    const val V05_RUNNING = 10
+
     private val CONFIRMED_NOT_DELIVERING = setOf(V05_STOPPED)
+    private val CONFIRMED_DELIVERING = setOf(V05_RUNNING)
 
     /**
-     * Whether the pump is delivering, or `null` when the raw value has never been checked
+     * Whether the pump is delivering, or `null` when this raw value has never been checked
      * against the pump's display.
      *
-     * No value has yet been confirmed to *mean* delivery — building that mapping needs the pump
-     * started, which this read-only build will not do. Callers should treat `null` as "don't
-     * know" and must not turn it into "delivering".
+     * Callers must treat `null` as "don't know" and must not turn it into "delivering" —
+     * telling AAPS that basal is running when it isn't is the error that causes harm.
      */
-    fun isDeliveringOrNull(mode: Int): Boolean? = if (mode in CONFIRMED_NOT_DELIVERING) false else null
+    fun isDeliveringOrNull(mode: Int): Boolean? = when (mode) {
+        in CONFIRMED_DELIVERING     -> true
+        in CONFIRMED_NOT_DELIVERING -> false
+        else                        -> null
+    }
 
     /** Names only what has been verified; anything else says plainly that it is a guess. */
     fun nameFor(mode: Int): String = when (mode) {
         V05_STOPPED -> "Stopped"
+        V05_RUNNING -> "Running"
         else        -> "Unverified mode $mode"
     }
 }
