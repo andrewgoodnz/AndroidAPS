@@ -112,13 +112,19 @@ class YpsoPump @Inject constructor(
         lastConnection = dateUtil.now()
     }
 
+    /**
+     * Clears everything read *from* a pump, keeping the identity of the pump we are paired to.
+     *
+     * MAC, name and serial are set by the pairing screen and must survive this — the service
+     * calls it right after the user picks a pump, and wiping the serial here would discard the
+     * choice that was just made.
+     */
     fun reset() {
         aapsLogger.debug(LTag.PUMP, "YpsoPump: resetting cached pump state")
         reservoir = 0.0
         batteryPercent = 0
         activeProfileId = -1
         lastConnection = 0L
-        serialNumber = ""
         firmwareVersion = ""
         deliveryModeName = ""
         isDelivering = false

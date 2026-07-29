@@ -12,7 +12,9 @@
     <string name="ypso_pairing_title">Pair YpsoPump</string>
     <string name="ypso_pairing_summary">Scan for your pump and bond to it. Confirm the code shown on the pump.</string>
     <string name="ypso_no_device_available">No YpsoPump found. Wake the pump and keep it close.</string>
-    <string name="ypso_bonding_failed">Could not start bonding</string>
+    <string name="ypso_bonding_failed">Bonding failed. Wake the pump and try again.</string>
+    <string name="ypso_bonding_title">Bonding</string>
+    <string name="ypso_bonding_message">Confirm the pairing request, and check the code matches the one shown on the pump.</string>
     <string name="ypso_not_paired">Not paired</string>
 
     <string name="ypso_connection_label">Connection</string>

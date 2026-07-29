@@ -227,9 +227,20 @@ class YpsoPumpManagerImpl private constructor(
         _connectionState.value = PumpConnectionState.NotPaired
     }
 
+    @SuppressLint("MissingPermission")
     private suspend fun establishSession(mac: String) {
         _connectionState.value = PumpConnectionState.Connecting
         log("Connecting to $mac")
+
+        // Connecting to an unbonded pump fails with an opaque GATT status. Say what is actually
+        // wrong instead. Bonding needs the user to confirm a code on the pump, so it belongs in
+        // the pairing screen, not here on the command queue's thread.
+        val bondState = bluetoothAdapter?.getRemoteDevice(mac)?.bondState
+        if (bondState != BluetoothDevice.BOND_BONDED) {
+            throw IllegalStateException(
+                "Pump $mac is not bonded (bond state $bondState) — pair it in the YpsoPump settings first"
+            )
+        }
 
         if (!connectDirect(mac)) throw IllegalStateException("BLE connect failed")
 
