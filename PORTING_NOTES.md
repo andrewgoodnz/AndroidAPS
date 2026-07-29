@@ -2,12 +2,21 @@
 
 Driver for an **unlocked plaintext research YpsoPump** on current AndroidAPS (3.4.2.4).
 
-**Status after session 2: verified on hardware.** The driver bonds, connects, authenticates in
-plaintext with no key exchange, and reads reservoir, battery, delivery state, active program,
-the 24-slot basal profile, the active temporary basal and the event and alert history — every
-value cross-checked against the pump's own display or against actions performed on the pump
-minutes earlier. It cannot deliver insulin: there is no code path from AAPS to a delivery
-command.
+**Status after session 2: the read path is verified on hardware.** The driver bonds, connects,
+authenticates in plaintext with no key exchange, and reads reservoir, battery, delivery state,
+active program, the 24-slot basal profile, the active temporary basal and the event and alert
+history — every value cross-checked against the pump's own display or against actions performed
+on the pump minutes earlier.
+
+**Session 3 added exactly one write, and it is not tested yet.** Setting the pump's clock
+(§4e) is now implemented and reachable from the YPSO tab. Everything that could move insulin is
+still refused: there is no code path from AAPS to a delivery command.
+
+**No write that changes pump state has ever succeeded** — that is what the clock write is the
+canary for, and `SALINE_TEST_PROCEDURE.md` phase 1 is what has to pass before the sentence can
+change. Note this is narrower than "no write has succeeded": the auth password and the
+setting/history index writes demonstrably land, which is what makes the unframed hypothesis in
+§4e more than a guess.
 
 Test pump: **YpsoPump_10074292**, MAC `EC:2A:F0:01:22:34`, firmware V05.02.03 — the unit whose
 settings are in the decrypted Lotus export. (Serial 10178681 is a *different*, standard pump
@@ -20,25 +29,38 @@ still inference from the sources.
 
 ## 0. Read this first — safety posture
 
-This build reads and never writes. That is enforced in three independent places, deliberately,
-so no single edit can undo it:
+This build delivers no insulin. That is enforced in three independent places, deliberately, so
+no single edit can undo it:
 
 1. **The SDK has no encryption or key-exchange code at all.** vicktor's `crypto/` and
    `keyexchange/` packages were not vendored. There is no `PumpCryptor` to leave null and no
    relay client to accidentally call. Plaintext is a property of what exists, not a setting.
-2. **`YpsoService` exposes no delivery method.** No bolus, TBR, basal-write or clock-set entry
-   point is declared on it. This is an absence of method, not a flag that could be flipped.
+2. **`YpsoService` exposes no delivery method.** No bolus, TBR or basal-write entry point is
+   declared on it. This is an absence of method, not a flag that could be flipped. The one
+   write it does expose is `syncPumpTime`, which sets the clock (§4e).
 3. **`YpsoPumpManagerImpl` refuses delivery without touching BLE.** The `PumpManager` interface
-   requires `deliverStandardBolus`, `setTbr`, `writeBasalProfile`, `syncDateTime` and friends, so
-   they exist — and each logs `REFUSED` and returns failure before reaching the pump.
+   requires `deliverStandardBolus`, `setTbr`, `writeBasalProfile` and friends, so they exist —
+   and each logs `REFUSED` and returns failure before reaching the pump.
 
 `YpsoPlugin` overrides every delivering `Pump` method individually rather than relying on a
 shared default, so "this does nothing" is visible at each call site and re-enabling one has to
 be a deliberate act.
 
-**Never make a refusing method report success.** Session 1's notes recorded the same rule after
-Andy Rozman's dummy connector returned `success=true` for boluses; anything above a driver that
-trusts a delivery result will act on it.
+**A successful GATT write proves nothing on this pump.** It does not NAK a bad write — the
+wrong auth password produced a perfectly successful write and only failed on the *next read*
+(§3). So every write must be confirmed by a subsequent read-back or history entry, never by the
+write callback, and a method may only report success once the pump has confirmed the effect.
+`syncDateTime` is built that way and is the pattern for everything that follows: it reads the
+clock first, refuses to write at all if it cannot (no read-back means no confirmation), and
+reports success only when the clock reads back agreeing with the phone's.
+
+**Never make a refusing or failed method report success.** Session 1's notes recorded the same
+rule after Andy Rozman's dummy connector returned `success=true` for boluses; anything above a
+driver that trusts a delivery result will act on it.
+
+**Remove refusals one at a time, each with its own saline test.** Never in a batch. The
+procedures are in `SALINE_TEST_PROCEDURE.md`, one phase per refusal, each naming the read-back
+or history entry that confirms it.
 
 ---
 
@@ -161,10 +183,11 @@ of the AAPS dependency graph — upstream needed both only for Proregia.
 
 ---
 
-## 4. Read path — and four wire-format corrections to the vendored SDK
+## 4. Wire format — five corrections to the vendored SDK
 
 **Upstream's framing does not match firmware V05.02.03.** Four separate bugs, each found by
-looking at raw bytes rather than at the code's own assumptions. Together they broke every read.
+looking at raw bytes rather than at the code's own assumptions; together they broke every read.
+The fifth (§4e) is the same lesson applied to the write path, and is the one still unproven.
 
 ### 4a. Reads carry no framing header
 
@@ -210,6 +233,101 @@ the integrity check. History counts are the same shape.
 against AAPS profile, so that would report a mismatch on a correct profile forever once writes
 exist. Divide in Double.
 
+### 4e. Short writes: observe the envelope, do not assume it
+
+#### ⚠ Correction: writes to this pump already work — just not *command* writes
+
+The plan for this session opened with "no command write has ever succeeded, the write path is
+unproven". The first half is true; the second is not, and the distinction matters because it
+changes what phase 1 is actually testing.
+
+**Two write paths are already proven on hardware:**
+
+| Write | Shape | How we know it lands |
+|---|---|---|
+| `CHAR_AUTH_PASSWORD` | 16 bytes bare, no CRC | authentication succeeds, and reads afterwards return data (§3) |
+| `CHAR_SETTING_ID` / history `INDEX` via `writeGlb` | 8 bytes bare (GLB pair) | **every setting read is a write-then-read.** `readSetting(14)` writes index 14 and reads back 1.20 U/h; a history read writes each entry index and gets that entry back. Distinct indices return distinct, correct values — impossible unless the index write lands |
+
+So the fixed-length, unframed reading in §4b is not an inference from one failure. It is
+supported by two independent writes that work, in two different shapes, both bare.
+
+What has *never* been done is a write that **changes pump state** rather than selecting what to
+read next. That is the real gap, and it is what phase 1 tests. It also means the interesting
+unknown is narrower than "does writing work": it is whether the command characteristics
+(`CHAR_SYSTEM_DATE`/`TIME`, `CHAR_BOLUS_START_STOP`, `CHAR_TBR_START_STOP`) use the same
+fixed-length convention as the ones that already work.
+
+#### The remaining question
+
+4b established that an 8-byte GLB write must go out bare, because framing it to 9 bytes gets
+`GATT_INVALID_ATTRIBUTE_LENGTH` (13). 4a established that reads carry no framing header either.
+Together with the two proven writes above, this firmware appears to use **fixed-length
+attributes** throughout, in both directions, and the framing header belongs to some other
+firmware revision than V05.02.03.
+
+But "unframed" leaves a second question open — whether a CRC still terminates the message — and
+the three short messages already observed answer it three different ways:
+
+| Message | Length | Integrity check |
+|---|---|---|
+| GLB setting value (§4c) | 8 bytes bare | the GLB's own bitwise complement |
+| system status reply (§4a) | 18 bytes + 2 | CRC-16 |
+| auth password (§3) | 16 bytes bare | none |
+
+So a short write is either bare or CRC-terminated, and nothing in the sources says which applies
+to the clock characteristics. Upstream sent them **both** CRC-terminated *and* framed, which 4b
+says cannot be right.
+
+**Rather than swap one assumption for another, `syncTime` reads each characteristic before it
+writes it and matches the shape that came back.** A reply of exactly the payload length is
+written bare; a reply two bytes longer ending in a valid CRC is written with a CRC. Anything
+else — a third length, or fields that do not decode to a plausible date — aborts *without
+writing*. There is no third envelope this code knows how to produce, and guessing at one is how
+a pump ends up with a garbage clock.
+
+The read is also what proves the field layout, which was previously only inferred from
+upstream's write: `CHAR_SYSTEM_DATE` as year u16 LE + month u8 + day u8, `CHAR_SYSTEM_TIME` as
+hour + minute + second. If the pump's clock decodes to a date that matches its own display, the
+layout is right.
+
+**The clock write itself has not run against hardware yet.** Phase 1 of
+`SALINE_TEST_PROCEDURE.md` records the raw bytes of both characteristics, which is the finding
+this section is waiting for. Fill in the table below from the log and this stops being an
+inference:
+
+| Characteristic | Bytes observed | Envelope |
+|---|---|---|
+| `CHAR_SYSTEM_DATE` (`…fcbedc3b7bc5`) | *not yet read* | *unknown* |
+| `CHAR_SYSTEM_TIME` (`…fcbedd3b7bc5`) | *not yet read* | *unknown* |
+
+**The bolus and TBR payloads still go out framed** — `sendBolusCommand`, `startTbr` and
+`cancelTbr` all still call `chunkPayload`, as do the generic `sendCommand` and `writeMultiFrame`.
+That is deliberate: they are refused anyway, and the envelope rule should be settled by the
+harmless write before it is applied to anything that moves insulin.
+
+Two predictions worth writing down before they are tested, so they can be scored honestly:
+
+- **The bolus payload is 13 bytes + CRC and framed to 16.** If §4e's fixed-length reading is
+  right, that is refused with status 13 and the framing has to come off, exactly as it did for
+  the GLB write.
+- **`startTbr`/`cancelTbr` send a 16-byte payload of two GLB pairs — percent with its complement,
+  minutes with its complement — with no CRC, framed to 17.** That is the same *shape* as the
+  8-byte GLB in §4b, just doubled, and §4b says that shape goes out bare. Expect the framing to
+  come off and no CRC to be needed.
+
+**The basal profile write is the exception: it is already unframed.** It goes through
+`writeSetting` → `writeGlb`, which §4b already fixed to send the bare 8 bytes. So phase 4's write
+path has, in a sense, already been exercised — every basal profile *read* writes a setting index
+through it, and those reads work.
+
+**If the clock characteristics turn out not to be readable**, the fallback is a length probe —
+try candidates in ascending length and treat status 13 as "wrong length, next". Each candidate
+is a complete correct encoding differing only in envelope, so a rejected one never reaches the
+pump's application layer, which makes the probe safe. It is deliberately not implemented,
+because an unreadable characteristic also means no read-back, and a write that cannot be
+confirmed is one this driver should not be making (§0). That trade-off wants the phase-1
+evidence before it is decided.
+
 ### What is read, and what was verified
 
 | Value | Source | Status |
@@ -232,22 +350,38 @@ about IOB would assume background delivery that was not happening. `DeliveryMode
 only what has been confirmed: `3` = Stopped, `10` = Running, everything else "Unverified mode N"
 with `isDelivering` **not** asserted. Extend it only from observation.
 
-**Unmapped bytes**, both plausible and both unverified:
+### ⚠ [verified] The status payload is fully mapped — including the temporary basal
 
-- **bytes 6–9** went `0` → `120` when the pump was started, matching the 1.20 U/h basal read
-  independently from setting 14. Very likely the active rate in centi-units/hour. If confirmed
-  it gives `baseBasalRate` without reading the whole profile.
-- **byte 10** is `100` in every sample so far, stopped or running. Plausibly TBR percent with 100
-  meaning "none" — which would supply the TBR detail §3 of the plan expected and which is
-  otherwise missing. Testing needs a TBR set, so it is session 3 work.
+An earlier revision of this section listed bytes 6–17 as unmapped and recorded
+`PumpStatus.activeTbr` as a known gap that "no field carrying TBR percentage and remaining time
+has been identified" for. **That is out of date.** Setting a temporary basal on the pump moved
+three fields at once and made the rest of the 18 bytes readable:
+
+```
+0A  2B 16 00 00  02  9C 00 00 00  82 00 00 00  F0 00 00 00
+│   └reservoir┘  │   └── rate ─┘  └─ TBR % ─┘  └─ TBR min ┘
+└mode           battery bars
+```
+
+| Bytes | Field | How it was confirmed |
+|---|---|---|
+| 6–9 | the rate the pump is *actually* running, centi-units/hour | 1.20 U/h under a 130% TBR read back as exactly **1.56 U/h** |
+| 10–13 | TBR percentage, **100 when none is running** | read `130` while a 130% TBR was set on the pump |
+| 14–17 | TBR minutes remaining | counted down once a minute across successive reads |
+
+The 1.56 U/h is what makes this more than three plausible offsets: it is the programmed rate
+scaled by the percentage in the neighbouring field, so the three belong together rather than
+happening to sit next to each other. The pump's own history agreed independently, logging type
+`9` with `v1=130` for the same TBR.
+
+So `activeTbr` is populated for real and `activeBasalRate` carries the effective rate.
+**Byte 10 needs no further confirmation** — the phase-3 prerequisite the plan described as
+blocking is already satisfied, and what is left for temporary basals is only the write.
 
 `baseBasalRate` is the active program's rate for the current hour and is **0.0 until the profile
-has actually been read** — the driver reports what it knows rather than a plausible guess.
-
-**Known gap — temporary basal detail.** `PumpStatus.activeTbr` stays **null**: no field carrying
-TBR percentage and remaining time has been identified yet (byte 10 is the candidate). The driver
-reports `isTbrActive = false` rather than inventing one. Resolving this is a prerequisite for TBR
-support.
+has actually been read** — the driver reports what it knows rather than a plausible guess. It is
+deliberately *not* taken from bytes 6–9, which carry the TBR-scaled rate rather than the
+programmed one.
 
 ---
 
@@ -279,12 +413,12 @@ top-up, not a set change). Each is gated by its own preference.
 `Unknown` with the raw values packed into `rawData`; `YpsoEventTypes` re-exports the IDs and
 decodes the primed amount.
 
-**Not yet exercised on hardware.** History counts read through the same `readGlb` path that the
-basal profile now uses, and entries through the same index-write-then-value-read mechanism, so
-the wire format should be sorted (§4). What is unproven is `HistoryEntry.parse` — the 17-byte
-entry layout, the timestamp epoch (the pump counts from 2000-01-01, converted in `parse`) and
-the event-type IDs. Read history, then check the dump's timestamps and types against the pump's
-own history screen before trusting any of it.
+**[verified] on hardware, and the findings below are why this section is long.** History counts
+read through the same `readGlb` path as the basal profile, and entries through the same
+index-write-then-value-read mechanism. `HistoryEntry.parse` — the 17-byte entry layout, the
+2000-01-01 epoch and the event-type IDs — is confirmed against actions performed on the pump
+minutes before the read. Two things about it were *wrong* in the sources, and both would have
+been silent; they are recorded next.
 
 ### ⚠ [verified] Index 0 is the NEWEST entry — the plan's `pumpId` would have corrupted IOB
 
@@ -366,9 +500,10 @@ not times of day — history spanning two years makes that mistake easy.)
 ### Writing history into AAPS is still disabled by default
 
 `YpsoSyncHistoryToAaps` defaults to **off**. Reads and mapping run regardless; only the
-`PumpSync` writes are gated. The `pumpId` blocker above is now resolved — what remains before
-switching it on is confirming the event-type mapping and bolus amounts against the pump display,
-and deciding how `sincePosition` should filter already-seen events.
+`PumpSync` writes are gated. Two of the three blockers are now resolved: `pumpId` carries the
+pump's sequence number, and the event types and bolus amounts are verified against actions
+performed on the pump. **The one remaining question is how `sincePosition` should filter entries
+already seen** — and note the type-12 trap above, which rules out sorting by timestamp.
 
 ---
 
@@ -390,9 +525,9 @@ Two judgement calls worth knowing about:
   safety setting the user chose. The 10 U figure is the *pump's* cap and will be used to clamp
   driver-side once delivery exists.
 - **Bolus speed and nano-bolus are recorded but not yet load-bearing.** They only matter for
-  bolus progress timing and bolus step, both of which are session 3. Applying nano-bolus would
-  mean editing `PumpType.YPSOPUMP`, which the old `:pump:ypsopump` module also reads — not worth
-  touching for a read-only build.
+  bolus progress timing and bolus step, both of which arrive with phase 2. Applying nano-bolus
+  would mean editing `PumpType.YPSOPUMP`, which the old `:pump:ypsopump` module also reads — not
+  worth touching until a bolus can actually be delivered.
 
 ---
 
@@ -434,7 +569,7 @@ pairing screen makes the user confirm the serial before bonding. **Never select 
 
 1. **Make the plugin's tab visible.** Config Builder → Pump → YpsoPump → tick the visibility
    checkbox. Pump fragments default to `visibleByDefault = false`, so without this the status
-   screen with Refresh and Read history simply is not there.
+   screen with Refresh, Read history and Set pump clock simply is not there.
 2. **Bond.** Preferences → YpsoPump → "Pair YpsoPump", pick the pump, confirm the serial, then
    confirm the code on the pump. If nothing appears in the list, lower `YpsoRssiThreshold` before
    assuming a scan problem — and note a *connected* pump may stop advertising, so if you are
@@ -448,42 +583,53 @@ pairing screen makes the user confirm the serial before bonding. **Never select 
    delivery-mode bugs, neither of which was visible from the driver's own output. Do it again
    after any decode change.
 6. **History.** "Read history" on the YPSO tab. Compare types and timestamps against the pump's
-   history screen, then start the `idx`/`seq` observation in §5.
-7. Leave the sync switch off until §5 step 3 or 4 is answered.
+   history screen. **[verified]** — the `idx`/`seq` question this step used to open is answered
+   in §5, and index 0 is the newest entry.
+7. Leave `YpsoSyncHistoryToAaps` off until `sincePosition` filtering is decided (§8 item 7).
+8. **Only then, the write path:** phase 1 of `SALINE_TEST_PROCEDURE.md`. Everything from here on
+   is a write, and every write is its own hardware gate.
 
 Firmware confirmed **V05.02.03**.
 
 ---
 
-## 8. What session 3 (saline delivery) needs
+## 8. What remains before insulin
 
-Blocking work, roughly in order:
+Two of the four items this section used to list are now settled and have been struck: the
+status bytes are fully mapped (§4, including byte 10 as TBR percent), and the history mapping is
+verified against actions performed on the pump (§5). What is left is the write path, and it is
+gated one step at a time by `SALINE_TEST_PROCEDURE.md`.
 
-1. **Finish verifying the history mapping** (§5). Reads, ordering, epoch and `pumpId` are
-   settled; what is left is checking event types and bolus amounts against the pump's own
-   history screen, then deciding how `sincePosition` filters already-seen events. Only then
-   turn `YpsoSyncHistoryToAaps` on.
-2. **Confirm the unmapped status bytes** (§4): bytes 6–9 as active basal rate, byte 10 as TBR
-   percent. Byte 10 is the only TBR candidate found, and no TBR support is possible without it.
-3. **Extend the delivery-mode map** (§4) by observation — start, stop, prime and bolus the pump
-   and record byte 0 each time. Until then anything but `3` and `10` reads as unverified and
-   `isDelivering` stays false, which under-reports a delivering pump.
-4. **`syncDateTime` first** — plan §7 step 5, the first non-delivering write, with nothing at
-   stake. `YpsoPumpManagerImpl.syncDateTime` currently refuses; `bleManager.syncTime` underneath
-   is vendored and intact — **but it still writes through `writeFramesSequentially`**, and §4b
-   showed this firmware rejects framed writes of short payloads with
-   `GATT_INVALID_ATTRIBUTE_LENGTH`. Expect to strip the framing there too. That is precisely why
-   syncDateTime is the right first write: it fails harmlessly.
-5. **Then delivery**, on saline, off-body, in plan §7 step 6 order: 0.05 U bolus (with progress
-   and abort) → TBR → basal write. The SDK methods exist and are wired to the pump; what has to
-   be written is the `YpsoService` entry point and the `YpsoPlugin` override. Note the bolus and
-   TBR payloads also go out framed — check each against §4b before trusting a "sent" result.
-6. **Bolus progress** should come from collecting `pumpEvents` / the bolus-notification
-   characteristic into `EventOverviewBolusProgress` — a Flow collection, not Medtrum's sleep-poll.
-   Scale the completion timeout to the configured bolus speed (`YpsoBolusSpeed`, 12 U/min).
-7. **Re-check the refusals.** Every `REFUSED` log line and every `notImplemented()` in
-   `YpsoPlugin` is a deliberate stop. Remove them one at a time, with a saline test each, not in
-   a batch.
+**The gate that blocks everything else:**
+
+1. **Run phase 1 — the clock write.** No write of any kind has ever succeeded against this pump.
+   §4e is an *inference* about the envelope until the phase-1 log says otherwise, and the two
+   raw-byte lines it asks for are the finding the rest of the write path is waiting on. Nothing
+   below should be built on a guess about what phase 1 will show.
+
+**Then, in order, one refusal per hardware test:**
+
+2. **Standard bolus** (phase 2). Add the `YpsoService` entry point and the `YpsoPlugin` override
+   → `deliverStandardBolus`. Check the 13-byte payload against §4e first — it currently goes out
+   framed. **Abort is part of this phase, not a follow-up:** wire AAPS's bolus-stop to
+   `cancelBolus()` and confirm a partial delivery in history before the phase counts as done.
+   Confirm every bolus by the history entry (type 2, `v1` in centi-units), never by the write.
+3. **Bolus progress** — collect `pumpEvents` / the bolus-notification characteristic into
+   `EventOverviewBolusProgress`. A Flow collection, not Medtrum's sleep-poll. Scale the
+   completion timeout to the configured bolus speed (`YpsoBolusSpeed`, 12 U/min); a progress bar
+   that finishes early is worse than one that finishes late.
+4. **Temporary basal** (phase 3). Only the write is left — the read side is confirmed (§4).
+   `setTempBasalAbsolute` converts U/h→% in the plugin, clamped to `tbrPercentRange`, and must be
+   checked at a profile-block boundary. Confirm via history (type 9, `v1` = %) *and* the byte-10
+   read-back.
+5. **Basal profile write** (phase 4). AAPS `Profile` → 24 `BasalBlock`s; read back and diff all
+   24 in `Double` (§4d). Record the pump's existing 24 rates first — this one is destructive.
+6. **Delivery-mode map.** Extend `DeliveryMode` by observation as the phases above run: record
+   byte 0 while priming, bolusing and running a TBR. Anything but `3` and `10` still reads as
+   unverified, and `isDelivering` stays false, which under-reports a delivering pump.
+7. **`YpsoSyncHistoryToAaps`.** Still off. Ordering, epoch, `pumpId` and the event mapping are
+   all settled (§5); what remains is deciding how `sincePosition` filters entries already seen.
+   Its own gate, because getting it wrong corrupts IOB silently rather than visibly.
 
 Also worth doing eventually, none of it blocking: a history screen (Medtronic's
 `MedtronicHistoryActivity` is the pattern), unit tests for the history mapping (nothing in the
