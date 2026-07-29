@@ -4,9 +4,10 @@ Driver for an **unlocked plaintext research YpsoPump** on current AndroidAPS (3.
 
 **Status after session 2: verified on hardware.** The driver bonds, connects, authenticates in
 plaintext with no key exchange, and reads reservoir, battery, delivery state, active program,
-the 24-slot basal profile and the event and alert history — the live values each cross-checked
-against the pump's own display. It cannot deliver
-insulin: there is no code path from AAPS to a delivery command.
+the 24-slot basal profile, the active temporary basal and the event and alert history — every
+value cross-checked against the pump's own display or against actions performed on the pump
+minutes earlier. It cannot deliver insulin: there is no code path from AAPS to a delivery
+command.
 
 Test pump: **YpsoPump_10074292**, MAC `EC:2A:F0:01:22:34`, firmware V05.02.03 — the unit whose
 settings are in the decrypted Lotus export. (Serial 10178681 is a *different*, standard pump
@@ -330,10 +331,26 @@ confirmation available that ordering, epoch and type IDs are all right.
 agrees with byte 0 of the system status and with the pump's own display — three separate
 sources.
 
-**[verified] Event fields**: `2` Bolus Immediate carries centi-units in `v1` (39 = 0.39 U);
-`10` Basal Profile Temp carries percent in `v1` and minutes in `v2`; `4` Priming Finished
-carries the primed amount in `v1`. The 9 U tube-change threshold behaved correctly — the
+**[verified] Event fields**, checked against actions performed on the pump minutes earlier:
+
+| idx | time | type | v1 | actual action |
+|---|---|---|---|---|
+| 0 | 21:58 | 2 Bolus Immediate | 150 | a **1.5 U** bolus → decodes to 1.50 U |
+| 1 | 21:54 | 9 Basal Profile Temp Running | 130 | a **130%** TBR |
+| 2 | 21:07 | 14 Pump Mode Changed | 10 | set to **Running** |
+| 3–6 | 20:37–20:40 | 4 Priming Finished | 3/15/14/200 | four primes, 0.03–2.00 U |
+| 7 | 20:37 | 16 Rewind Finished | — | the cartridge change |
+
+So `2` carries bolus centi-units in `v1`, `9` carries TBR percent, `14` carries the new delivery
+mode, and `4` carries the primed amount. The 9 U tube-change threshold behaved correctly: the
 largest prime was 2.00 U, so none was recorded as a tube change.
+
+**⚠ `12 Date Changed` carries a pre-change timestamp.** One such entry has `ts` = 2022-01-01
+while `v1/v2/v3` = 29/7/26, i.e. the *new* date being set (2026-07-29). The entry's own
+timestamp is whatever the clock said before the change, so events around a clock change are not
+chronologically trustworthy. `toHistoryEvent` does not map type 12, so nothing reaches PumpSync
+from it — keep it that way, and be careful if `sincePosition` filtering ever sorts by timestamp
+rather than sequence.
 
 **`24 Battery Removed` is unverified, but nothing observed argues against it.** Three of these
 appear in the log, all dated **2026-03-29** — 122 days before the cartridge change, and not
