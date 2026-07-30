@@ -547,18 +547,32 @@ class YpsoService : DaggerService() {
             )
 
             if (result.confirmed) {
+                // Byte 10 has already confirmed the pump is not running a temporary basal, so the
+                // AAPS record must be closed whatever the log says. Leaving it open is the one
+                // outcome that actually harms: AAPS would keep assuming elevated basal delivery
+                // that has stopped, and over-count IOB for the rest of the original duration.
+                //
+                // The pump's sequence number is preferred as the id, so this stop and a later
+                // history sync of the same event agree. When the log gives us nothing, the
+                // timestamp stands in — a possible future dedupe collision on a sync switch that
+                // is off (and that needs rework anyway now the entry is known to mutate) is a far
+                // smaller problem than a temporary basal AAPS thinks is still running.
                 val sequence = result.pumpSequence
+                val endPumpId = sequence ?: dateUtil.now()
                 if (sequence == null) {
-                    aapsLogger.warn(LTag.PUMP, "TBR is stopped but the pump logged no end entry, so the stop cannot be recorded")
-                } else {
-                    val synced = pumpSync.syncStopTemporaryBasalWithPumpId(
-                        timestamp = dateUtil.now(),
-                        endPumpId = sequence,
-                        pumpType = PumpType.YPSOPUMP,
-                        pumpSerial = pumpSerial()
+                    aapsLogger.warn(
+                        LTag.PUMP,
+                        "TBR is stopped but the pump logged no identifiable entry; closing the AAPS record " +
+                            "under a timestamp id instead of leaving it open"
                     )
-                    aapsLogger.info(LTag.PUMP, "Recorded TBR stop under endPumpId=$sequence, new=$synced")
                 }
+                val synced = pumpSync.syncStopTemporaryBasalWithPumpId(
+                    timestamp = dateUtil.now(),
+                    endPumpId = endPumpId,
+                    pumpType = PumpType.YPSOPUMP,
+                    pumpSerial = pumpSerial()
+                )
+                aapsLogger.info(LTag.PUMP, "Recorded TBR stop under endPumpId=$endPumpId, new=$synced")
             }
             rxBus.send(EventYpsoPumpDataChanged())
             result

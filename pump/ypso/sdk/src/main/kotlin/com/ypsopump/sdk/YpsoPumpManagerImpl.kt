@@ -139,6 +139,21 @@ class YpsoPumpManagerImpl private constructor(
         /** Breathing room between writing a temporary basal and reading byte 10 back. */
         private const val TBR_SETTLE_MS = 700L
 
+        /** Re-reads while waiting for the pump to rewrite the TBR entry from type 9 to type 10. */
+        private const val TBR_END_LOOKUP_ATTEMPTS = 3
+
+        private const val TBR_END_LOOKUP_RETRY_MS = 1_500L
+
+        /**
+         * Every type a single temporary basal's entry can be in. It is **one** entry that changes
+         * type as the TBR runs and stops — see [findTbrEndRecord].
+         */
+        private val TBR_ENTRY_TYPES = setOf(
+            EventType.BASAL_PROFILE_TEMP_RUNNING,
+            EventType.BASAL_PROFILE_TEMP,
+            EventType.BASAL_PROFILE_TEMP_ABORT
+        )
+
         /**
          * Event types a standard bolus can produce. `2` settles the outcome and carries the amount
          * — including for a bolus stopped from AAPS, which this pump logs as type 2 with the
@@ -1037,8 +1052,9 @@ class YpsoPumpManagerImpl private constructor(
      * basal — is satisfied, and failing would make AAPS retry something already true.
      */
     suspend fun cancelTbrConfirmed(): ConfirmedTbr = withConnection {
-        // Baselined for the same reason as everything else: the end record needs the pump's own
-        // sequence number as its id, or a later history sync would store the same TBR-end twice.
+        // The running TBR's entry is *already* the newest one, and the pump will rewrite it in place
+        // rather than appending an end record (see findTbrEndRecord). So the search has to include
+        // the current newest, not start above it.
         val baselineSequence = newestEventSequence()
 
         if (!suspendCancelTbr()) {
@@ -1098,12 +1114,37 @@ class YpsoPumpManagerImpl private constructor(
         findNewestEntry(afterSequence, setOf(EventType.BASAL_PROFILE_TEMP_RUNNING))
 
     /**
-     * Finds the entry that ends a temporary basal: `10` when it ran to term, `32` when it was
-     * aborted. Which of the two this pump writes for a cancel over BLE is unknown — the bolus
-     * turned out to log an abort as a *completion* (§4f), so both are accepted rather than assuming.
+     * Finds the entry identifying the temporary basal that has just ended.
+     *
+     * ⚠ **This pump rewrites the entry in place — it does not append an end record.** The type-9
+     * "Temp Running" entry *becomes* a type-10 "Temp" entry when the temporary basal stops, with
+     * `v2` rewritten from the requested duration to the duration it actually ran. Verified on
+     * hardware: `seq=160371` read as `type=9 v1=150 v2=30` while running and as
+     * `type=10 v1=150 v2=2` after a cancel two minutes later.
+     *
+     * So a temporary basal has **one** sequence number covering both its start and its end, and
+     * searching for an entry *newer* than the start finds nothing — which left the AAPS record open
+     * and AAPS believing a temporary basal was running after the pump had stopped it. Hence `>=`
+     * rather than `>`, and hence retries: the rewrite can lag the cancel.
+     *
+     * Returns whatever TBR entry it finds, even one still reading type 9. Whether the pump stopped
+     * is decided by **byte 10**, not by this; the log is only being asked for the identity.
      */
-    private suspend fun findTbrEndRecord(afterSequence: Long): HistoryEntry? =
-        findNewestEntry(afterSequence, setOf(EventType.BASAL_PROFILE_TEMP, EventType.BASAL_PROFILE_TEMP_ABORT))
+    private suspend fun findTbrEndRecord(atOrAfterSequence: Long): HistoryEntry? {
+        var latest: HistoryEntry? = null
+        repeat(TBR_END_LOOKUP_ATTEMPTS) { attempt ->
+            latest = suspendReadHistoryEvents(HISTORY_SEARCH_ENTRIES)
+                .filter { it.sequence >= atOrAfterSequence && it.entryType in TBR_ENTRY_TYPES }
+                .maxByOrNull { it.sequence }
+                ?: latest
+
+            if (latest?.entryType != null && latest?.entryType != EventType.BASAL_PROFILE_TEMP_RUNNING) {
+                return latest
+            }
+            if (attempt < TBR_END_LOOKUP_ATTEMPTS - 1) delay(TBR_END_LOOKUP_RETRY_MS)
+        }
+        return latest
+    }
 
     private suspend fun findNewestEntry(afterSequence: Long, types: Set<Int>): HistoryEntry? =
         suspendReadHistoryEvents(HISTORY_SEARCH_ENTRIES)

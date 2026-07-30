@@ -195,6 +195,36 @@ write and does nothing. Only a length error comes back (`GATT_INVALID_ATTRIBUTE_
 Assume nothing carries over from one attribute to the next, and confirm every write by an effect
 you can go and read.
 
+### The envelope table — **[verified]**, and no two of these were predictable
+
+| Characteristic | On the wire | Integrity |
+|---|---|---|
+| `CHAR_AUTH_PASSWORD` | 16 B bare | none |
+| `CHAR_SYSTEM_DATE` | 4 B bare | none |
+| `CHAR_SYSTEM_TIME` | 3 B bare | none |
+| GLB settings / history index | 8 B bare | the value's own complement |
+| `CHAR_BOLUS_START_STOP` | 13 B **+ CRC-16** = 15 B | CRC |
+| `CHAR_TBR_START_STOP` | 16 B bare | two GLB complements |
+| `CHAR_SYSTEM_STATUS` (read) | 18 B + CRC = 20 B | CRC |
+| `CHAR_BOLUS_STATUS` (read) | **3 frames**, 42 B + CRC | CRC + framing |
+
+Nothing is framed except `CHAR_BOLUS_STATUS`, which is framed *and* CRC'd. The bolus command is
+the only write carrying a CRC. Upstream, incidentally, sent the bolus with a CRC and the TBR without
+one — so it had this difference encoded all along, and losing that detail while stripping the
+framing is what cost two hardware attempts.
+
+**This is why `writeCommandPayload` discovers rather than assumes.** Each of the three
+state-changing writes needed a different answer, and going from the clock to the bolus by
+assumption failed. Candidates are complete, correct encodings differing only in wrapper, a wrong
+length is refused by the ATT layer without reaching the pump, and the accepted one is remembered
+per characteristic. On the TBR it cost two harmless rejections and 300 ms:
+
+```
+18B payload+CRC        → refused (13)
+19B frame(payload+CRC) → refused (13)
+16B bare               → ACCEPTED
+```
+
 ### 4a. Reads carry no framing header
 
 The system-status reply is a bare CRC-terminated message. Logged verbatim off the pump:
@@ -487,6 +517,82 @@ start, which is precisely the moment AAPS could have said the pump had stopped.
 it as part of the value, so the serial was stored as `10074292` plus `U+0000`. Invisible on screen,
 but it becomes `pumpSerial` on every `PumpSync` call, and a serial differing by one unprintable byte
 would split records across two apparent pumps.
+
+### 4h. Temporary basal — **[verified]**
+
+Confirmed on hardware 2026-07-30. Envelope: **16 bytes bare** (see the table above), two GLB pairs
+— percent with its complement, minutes with its complement.
+
+```
+Starting TBR: 150% for 30min
+writing 16B to …fcbee38b7bc5 as payload: 96 00 00 00 69 FF FF FF 1E 00 00 00 E1 FF FF FF
+Status: Rate: 1.8U/h, TBR 150% 30min left
+TBR confirmed by read-back: 150% with 30min left, logged as seq=160371 v1=150 v2=30
+Recorded TBR 150% under pumpId=160371, new=true
+```
+
+**The load-bearing number is 1.8 U/h.** The programmed rate is 1.20 U/h and 1.20 × 150% = 1.80
+exactly, so the pump is *running* the requested rate rather than merely echoing the percentage. The
+same arithmetic confirmed 1.56 U/h at 130% in session 2. An echoed percentage on its own would not
+distinguish "accepted the command" from "changed the delivery".
+
+**Confirmation is byte 10 of the system status, not the history log** — the opposite choice from the
+bolus, for a concrete reason: byte 10 is *not* cleared while the temporary basal runs, so it can be
+read at any time and means what it says. The bolus status is cleared on completion (§4f), which is
+what made it useless as evidence there.
+
+**Cancel** is confirmed by byte 10 returning to 100, also verified. Cancelling when nothing was
+running reports success with "no end entry to record" — correct on both counts: the caller's intent
+(no temporary basal) is satisfied, and there is genuinely nothing for `PumpSync`.
+
+**A 100% request is treated as a cancellation**, because 100 is how this pump expresses "none".
+Setting it would otherwise leave AAPS believing a temporary basal was running while byte 10 says
+none is.
+
+**⚠ Still unsettled: the maximum percentage.** This driver allows 0–200% while
+`PumpType.YPSOPUMP.tbrSettings` declares **500%**, so AAPS will offer rates the driver refuses.
+Refusing is deliberate — clamping would leave AAPS believing it had set a rate the pump is not
+running, and a silent difference in delivered insulin is worse than a visible failure. **One
+hardware request settles it:** ask for 250% on saline and see whether byte 10 comes back as 250 or
+the command is rejected. Until then the narrower bound holds, because over-stating what the pump
+accepts is the dangerous direction.
+
+### ⚠⚠ [verified] The pump rewrites the TBR history entry in place
+
+**A temporary basal has one history entry, not two.** The type-9 "Temp Running" entry *becomes* a
+type-10 "Temp" entry when the TBR stops, and `v2` is rewritten from the requested duration to the
+duration it actually ran:
+
+| `seq=160371` | type | `v1` | `v2` |
+|---|---|---|---|
+| while running (19:46:57) | **9** Temp Running | 150 | 30 — requested |
+| after a cancel (19:48:48) | **10** Temp | 150 | **2** — actual |
+
+**What this broke.** The cancel looked for an entry *newer* than the TBR's own, found nothing, and
+so never called `syncStopTemporaryBasalWithPumpId`. AAPS was left with an open temporary basal — the
+ACT tab still offered "CANCEL 150%" while byte 10 read 100 — meaning it kept assuming elevated basal
+delivery for the remaining 28 minutes. Basal **over**-counting, which is the direction that hurts.
+
+Two fixes: the search is now `>=` the entry that existed before the cancel rather than `>`, and it
+retries because the rewrite can lag. And, decisively, **the AAPS record is closed on the strength of
+byte 10 regardless of what the log yields** — falling back to a timestamp id if the entry cannot be
+identified. A possible dedupe collision on a sync switch that is off is a far smaller problem than a
+temporary basal AAPS believes is still running.
+
+**⚠ This also breaks history sync's TBR handling, which is not yet reworked.**
+`YpsoHistoryMapper` maps type 9 → `TbrStarted` and type 10 → `TbrEnded`, both keyed on the same
+sequence number — and since the entry mutates, a history read only ever sees *one* of them. Read
+after the TBR has ended and the start is simply gone, so a TBR that has finished can never be
+reconstructed from history alone. Resolve this before `YpsoSyncHistoryToAaps` is switched on; it is
+now the second reason that switch needs work, alongside `sincePosition`.
+
+**⚠ Inherent, not a bug: a percentage is only correct for the basal block it was computed in.** When
+the pump crosses into an hour with a different programmed rate, the same percentage becomes a
+different absolute rate. Unavoidable on a percent-only pump; AAPS re-evaluating each loop iteration
+is what bounds the exposure. `setTempBasalAbsolute` therefore divides by the rate **the pump** is
+programmed to run — read from the pump, not taken from the AAPS profile, which is a different number
+until a profile write exists — and refuses outright when that rate has not been read yet rather than
+inventing a divisor.
 
 ### What is read, and what was verified
 
@@ -823,21 +929,23 @@ Firmware confirmed **V05.02.03**.
 ## 8. What remains before insulin
 
 **Done and verified on hardware, 2026-07-30:** the clock write (§4e), the standard bolus with abort
-(§4f), recording boluses into `PumpSync` and raising the pump's alarms (§4g). The status bytes were
-already fully mapped (§4) and the history mapping verified against actions on the pump (§5).
+(§4f), bolus recording into `PumpSync` and pump alarms (§4g), and the temporary basal with cancel
+(§4h). The status bytes were already fully mapped (§4) and the history mapping verified against
+actions on the pump (§5).
 
-What is left is the remaining two writes, gated one step at a time by
-`SALINE_TEST_PROCEDURE.md`.
+**Next:**
 
-**Next, in order, one refusal per hardware test:**
+1. **Basal profile write** (phase 4) — the last write. AAPS `Profile` → 24 `BasalBlock`s; read back
+   and diff all 24 in `Double` (§4d). Record the pump's existing 24 rates first, because this one is
+   destructive. Its envelope is likely already right: it goes through `writeSetting` → `writeGlb`,
+   which is the bare-8-byte path every profile *read* already exercises — but per the envelope table
+   that is a prediction, not a fact, until a setting *value* has been written.
 
-1. **Temporary basal** (phase 3). Only the write is left — the read side is confirmed (§4).
-   `setTempBasalAbsolute` converts U/h→% in the plugin, clamped to `tbrPercentRange`, and must be
-   checked at a profile-block boundary. Confirm via history (type 9, `v1` = %) *and* the byte-10
-   read-back. **Read `CHAR_TBR_START_STOP` before writing it** — it still goes out framed, and §4f
-   is three demonstrations that nothing carries over between attributes.
-2. **Basal profile write** (phase 4). AAPS `Profile` → 24 `BasalBlock`s; read back and diff all
-   24 in `Double` (§4d). Record the pump's existing 24 rates first — this one is destructive.
+**Two small open questions, each one hardware request:**
+
+2. **The TBR maximum** — 200% or 500%? Ask for 250% and read byte 10 (§4h).
+3. **The alarm notification** — the count path works but the notification branch has never fired.
+   See the outstanding test in `SALINE_TEST_PROCEDURE.md`.
 6. **Delivery-mode map.** Extend `DeliveryMode` by observation as the phases above run: record
    byte 0 while priming, bolusing and running a TBR. Anything but `3` and `10` still reads as
    unverified, and `isDelivering` stays false, which under-reports a delivering pump.

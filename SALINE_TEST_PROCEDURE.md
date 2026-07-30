@@ -291,7 +291,28 @@ exists to prevent, so it needs to be seen working before insulin.
 
 ---
 
-## Phase 3 — temporary basal (not yet implemented)
+## Phase 3 — temporary basal ✅ **PASSED 2026-07-30**
+
+> **Result.** Set and cancel both verified on pump 10074292, saline, off-body.
+>
+> - **Envelope: 16 bytes bare** — a *third* distinct convention (see the envelope table in
+>   `PORTING_NOTES` §4). `18B payload+CRC` and `19B frame(payload+CRC)` were both refused with
+>   status 13 first; the discovery cost 300 ms and two harmless rejections.
+> - **150% for 30 min:** `Status: Rate: 1.8U/h, TBR 150% 30min left`, confirmed from byte 10,
+>   logged `seq=160371 v1=150 v2=30`, recorded under `pumpId=160371`.
+> - **1.20 U/h × 150% = 1.80 U/h exactly** — the pump *running* the rate, not just echoing the
+>   percentage. This is the check that matters; an echoed percentage alone would not distinguish
+>   "command accepted" from "delivery changed".
+> - **Cancel:** byte 10 back to 100. Cancelling with nothing running reports success and "no end
+>   entry to record", which is correct on both counts.
+>
+> **Still open — one request each:** ask for **250%** to settle whether the pump's maximum is 200%
+> (this driver) or 500% (`PumpType.YPSOPUMP`); and see a temporary basal survive an **hour
+> boundary**, where the same percentage becomes a different absolute rate.
+
+---
+
+## Phase 3 — the original procedure
 
 **The read side is already confirmed**, which was not true when this phase was planned. Setting a
 130% TBR on the pump moved status bytes 6–9, 10–13 and 14–17 together: the effective rate read
