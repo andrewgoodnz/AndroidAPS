@@ -1352,6 +1352,125 @@ reference is mined out of it.
 
 ---
 
+## 8.6 What the other AAPS drivers do that this one did not
+
+A read of the whole `Pump` interface against Combo v2, Medtrum, DanaRS, Medtronic, Omnipod (Dash and
+Eros), Insight, EOPatch, Equil and Diaconn, done 2026-07-31. Two of these were real defects and are
+fixed; the rest are recorded with a recommendation.
+
+### ⚠⚠ [fixed] A stopped pump went on contributing basal IOB
+
+**The biggest thing missing, and it was invisible.** `isSuspended()` was implemented and correct, and
+it does stop the *loop* acting — but **AAPS's IOB accounting never consults it.** Basal insulin on
+board is computed from the profile and whatever temporary basals are on record. So a pump that has
+stopped, whether by the user's hand or because an occlusion halted it, kept contributing basal IOB
+that was not being delivered, indefinitely, with nothing in the UI to say so.
+
+Every driver that can detect a stopped pump answers this the same way: **hold a 0% temporary basal
+open for as long as the pump is stopped**, typed `PUMP_SUSPEND` — the type reserved for a pump
+stopping of its own accord rather than AAPS asking for zero. `MedtrumPump.setFakeTBRIfNotSet` is the
+clearest version; Combo maps its own `COMBO_STOPPED` to the same type.
+
+Now implemented in `YpsoService.syncSuspendedState`, with two things the pattern requires:
+
+- **The record is recognised as ours before it is closed.** A real temporary basal has a different
+  type and duration; closing one by mistake would tell AAPS basal had resumed when it had not.
+- **It is re-asserted on every poll** while the pump stays stopped, rather than relied on to outlive
+  the outage.
+
+**And one thing the pattern does not require, but this pump does.** `isDelivering` is false both for
+"confirmed stopped" and for "delivery mode never identified" — right for gating the loop, where the
+safe answer to *don't know* is *don't act*, but wrong for writing a record. Only two byte-0 values out
+of 256 are known (§8.3) and nobody has yet looked at what the pump reports **during a bolus**. If that
+is a third value, treating unknown as stopped would open a suspend record on every bolus — and an app
+killed mid-bolus would leave one open for 80 hours, telling AAPS basal was off for days.
+
+So `PumpStatus.operatingMode` is now populated as a genuine three-valued state and only `STOPPED`
+opens the record. `UNKNOWN` logs loudly and writes nothing. The loop stays held off either way.
+
+### ⚠ [fixed] Nothing corrected the pump's clock after a DST or timezone change
+
+`timezoneOrDSTChanged` was not implemented. Ten drivers implement it; Combo and Medtrum both use it to
+rewrite the pump's clock.
+
+This pump needs it more than most, because it **has no concept of a time zone** — `syncTime` writes
+local hour, minute and second and it counts local wall-clock seconds from there (§5). After a DST
+change its clock is simply an hour wrong until somebody notices and presses the button on the YPSO
+tab, with every bolus and temporary basal it logs in the meantime carrying the wrong instant. That is
+the same class of error that already produced treatments 12 hours in the future.
+
+It now queues a clock sync, which is safe to fire unattended for the reason §4e gives: the write
+refuses unless it can read the clock first, and reports success only from the read-back. A failure
+raises a notification saying the pump's clock is now wrong, rather than leaving it to be discovered.
+
+`canHandleDST()` stays **false** — it must, because the pump genuinely cannot — so AAPS's own DST
+safeguard is untouched.
+
+### ⚠ [fixed] Clock drift was measured on every poll and never mentioned
+
+The skew is read every status poll and shown on the YPSO tab, but nobody watches a tab. Omnipod,
+Insight and Medtronic each raise a notification when the pump's clock is out. Now so does this one,
+above 30 minutes — far beyond any crystal drift, so crossing it means something happened rather than
+something wore.
+
+Deliveries are recorded at the phone's time, so drift does not corrupt IOB. What it corrupts is the
+pump's own log, and therefore any history sync and any attempt to reconcile the two.
+
+### ⚠ Still open: `YpsomedCapabilities` promises three things the driver refuses
+
+```kotlin
+YpsomedCapabilities(arrayOf(
+    Capability.Bolus, Capability.ExtendedBolus, Capability.TempBasal,
+    Capability.BasalProfileSet, Capability.Refill, Capability.ReplaceBattery,
+    Capability.TDD, Capability.ManualTDDLoad
+))
+```
+
+`ExtendedBolus`, `TDD` and `ManualTDDLoad` are all declared, and all three return a failed
+`PumpEnactResult` without touching the pump. **A capability declaration is a promise to AAPS**, and
+AAPS acts on it: it offers an extended bolus in the UI and a TDD load in the actions, both of which
+cannot work.
+
+Medtrum shows the convention — its capability list carries the comment *"Technically the pump supports
+ExtendedBolus, but not implemented (yet)"* and simply **omits** it.
+
+**Not changed here, deliberately.** `PumpCapability` lives in shared `core/data` and `YpsomedCapabilities`
+is also used by the upstream `:pump:ypsopump` driver, so it is not this driver's to edit unilaterally.
+Two ways forward, and they point in opposite directions:
+
+- Drop `ExtendedBolus` until it is implemented and tested, matching Medtrum.
+- Implement `loadTDDs` instead of dropping the TDD capabilities — **the data already exists.** The
+  pump logs `23 Daily Total Insulin` with the total in `v1` as centi-units (`v1=1944` → 19.44 U), and
+  `PumpSync.createOrUpdateTotalDailyDose` takes exactly that shape; Combo passes `bolusAmount = 0.0,
+  basalAmount = 0.0` and only a total, which is all this pump offers. It needs a small SDK method to
+  expose the entries, since `YpsoHistoryMapper` deliberately maps type 23 to null.
+
+### ⚠ Still open: `bolusSize = 0.1` is a pump *setting*, not a constant
+
+`PumpType.YPSOPUMP` hard-codes a 0.1 U bolus step. But the pump has an event type for
+`5 Bolus Step Changed`, so the increment is configurable on the pump itself, and this driver cannot
+read it — no settings index for it is known.
+
+If a user's pump is set to 0.05 or 1.0 U, AAPS rounds bolus amounts to the wrong grid. The
+confirm-from-the-log discipline would catch the consequence (delivered ≠ asked ⇒ `success=false`)
+rather than silently mis-dosing, so this fails loudly rather than dangerously — but it fails.
+**Worth one hardware test:** change the pump's bolus increment, ask for something off the new grid,
+and see what it does.
+
+### Smaller gaps, none of them safety-critical
+
+| | What | Assessment |
+|---|---|---|
+| `isBusy()` | Always false. Medtrum and Combo report true while a command runs | The `pumpMutex` already serialises commands, so a second command blocks rather than corrupts. Changing it risks stalling the queue and wants care |
+| `updateExtendedJsonStatus` | Not implemented. Combo puts its warning and error codes here | Cheap, and it is what a caregiver watching Nightscout sees. Worth adding: delivery mode and the last alert |
+| `getCustomActions` | Not implemented | The YPSO tab already has the buttons. Only worth it to reach the Actions tab |
+| `waitForDisconnectionInSeconds` | Default 5 s | Fine. Omnipod Eros uses 0, Virtual 0; nothing suggests this pump wants either |
+| `setNeutralTempAtFullHour` | Default false | For pumps that beep at the hour on a TBR. Not observed here |
+| `isUnreachableAlertTimeoutExceeded` | Default false, and `hasCustomUnreachableAlertCheck` is false for this pump type | Correct — the standard 30-minute check applies |
+| `deliverTreatment` guards | `require(carbs == 0)` / `require(insulin > 0)` | Matches Medtrum exactly. Carbs-only never reaches the pump |
+
+---
+
 ## 9. Build environment gotchas
 
 Carried forward from session 1, all still true:

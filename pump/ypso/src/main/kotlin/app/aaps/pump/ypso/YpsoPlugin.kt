@@ -12,9 +12,11 @@ import app.aaps.core.data.plugin.PluginType
 import app.aaps.core.data.pump.defs.ManufacturerType
 import app.aaps.core.data.pump.defs.PumpDescription
 import app.aaps.core.data.pump.defs.PumpType
+import app.aaps.core.data.pump.defs.TimeChangeType
 import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.logging.LTag
 import app.aaps.core.interfaces.notifications.Notification
+import app.aaps.core.interfaces.queue.Callback
 import app.aaps.core.interfaces.plugin.PluginDescription
 import app.aaps.core.interfaces.profile.Profile
 import app.aaps.core.interfaces.pump.DetailedBolusInfo
@@ -179,7 +181,56 @@ class YpsoPlugin @Inject constructor(
     override fun serialNumber(): String = ypsoPump.serialNumber.ifBlank { ypsoPump.pumpMac }
     override val pumpDescription: PumpDescription get() = PumpDescription().fillFor(PumpType.YPSOPUMP)
     override val isFakingTempsByExtendedBoluses: Boolean = false
+
+    /**
+     * False, and it has to be: this pump cannot handle a DST change by itself.
+     *
+     * It has **no concept of a time zone**. `syncTime` writes local hour, minute and second, and the
+     * pump counts local wall-clock seconds from there (`PORTING_NOTES` §5). So when the phone's
+     * offset changes, the pump's clock is simply an hour wrong until something rewrites it, and every
+     * history timestamp read in the meantime is an hour out — which is the class of error that
+     * already produced treatments 12 hours in the future once.
+     *
+     * Returning false keeps AAPS's own DST safeguard in place; [timezoneOrDSTChanged] then does the
+     * repair.
+     */
     override fun canHandleDST(): Boolean = false
+
+    /**
+     * Rewrites the pump's clock after the phone's time, zone or DST changed.
+     *
+     * The gap this closes: nothing else ever corrects it. The clock is written on demand from the
+     * YPSO tab and at no other time, so before this a DST change left the pump an hour out until
+     * somebody noticed and pressed the button — with every bolus and temporary basal logged at the
+     * wrong instant in between.
+     *
+     * Queued rather than called directly, so it shares the normal connect/disconnect cycle instead of
+     * opening a second BLE session from a broadcast receiver. The write is safe to fire unattended:
+     * it refuses unless it can read the clock first, and reports success only from the read-back
+     * (§4e). If the pump is unreachable the command fails and the clock stays wrong, which is what a
+     * failure should look like.
+     */
+    override fun timezoneOrDSTChanged(timeChangeType: TimeChangeType) {
+        aapsLogger.info(LTag.PUMP, "Phone time changed ($timeChangeType); queueing a pump clock sync")
+        if (!isInitialized()) {
+            aapsLogger.warn(LTag.PUMP, "Not initialised, so the pump clock cannot be corrected yet")
+            return
+        }
+        commandQueue.customCommand(YpsoSyncTimeCommand(), object : Callback() {
+            override fun run() {
+                if (result.success) {
+                    aapsLogger.info(LTag.PUMP, "Pump clock corrected after $timeChangeType")
+                } else {
+                    aapsLogger.error(LTag.PUMP, "Pump clock NOT corrected after $timeChangeType — it is now wrong by the offset")
+                    uiInteraction.addNotification(
+                        Notification.TIME_OR_TIMEZONE_CHANGE,
+                        rh.gs(R.string.ypso_clock_dst_failed),
+                        Notification.URGENT
+                    )
+                }
+            }
+        })
+    }
 
     override fun pumpSpecificShortStatus(veryShort: Boolean): String = buildString {
         append("Firmware: ${ypsoPump.firmwareVersion.ifBlank { "?" }}")

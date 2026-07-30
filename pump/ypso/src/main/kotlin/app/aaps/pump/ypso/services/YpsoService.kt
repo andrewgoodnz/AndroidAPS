@@ -6,6 +6,7 @@ import android.os.Binder
 import android.os.IBinder
 import app.aaps.core.data.model.TE
 import app.aaps.core.data.pump.defs.PumpType
+import app.aaps.core.data.time.T
 import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.logging.LTag
 import app.aaps.core.interfaces.notifications.Notification
@@ -16,6 +17,7 @@ import app.aaps.core.interfaces.resources.ResourceHelper
 import app.aaps.core.interfaces.rx.AapsSchedulers
 import app.aaps.core.interfaces.rx.bus.RxBus
 import app.aaps.core.interfaces.rx.events.EventAppExit
+import app.aaps.core.interfaces.rx.events.EventDismissNotification
 import app.aaps.core.interfaces.rx.events.EventOverviewBolusProgress
 import app.aaps.core.interfaces.rx.events.EventPreferenceChange
 import app.aaps.core.interfaces.rx.events.EventPumpStatusChanged
@@ -33,6 +35,7 @@ import app.aaps.pump.ypso.keys.YpsoIntNonKey
 import app.aaps.pump.ypso.keys.YpsoStringKey
 import com.pump.common.BasalBlock
 import com.pump.common.BasalProfile
+import com.pump.common.OperatingMode
 import com.pump.common.PumpConnectionState
 import com.pump.common.PumpHistoryEvent
 import com.ypsopump.sdk.YpsoEventTypes
@@ -47,6 +50,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import javax.inject.Inject
+import kotlin.math.abs
 
 /**
  * Owns the connection to the pump.
@@ -149,6 +153,7 @@ class YpsoService : DaggerService() {
                 ypsoPump.deliveryModeName = status.deliveryModeName
                 ypsoPump.isDelivering = status.isDelivering
                 ypsoPump.activeTbr = status.activeTbr
+                syncSuspendedState(status.operatingMode, status.deliveryModeName)
                 rxBus.send(EventYpsoPumpDataChanged())
             }
         }
@@ -163,6 +168,7 @@ class YpsoService : DaggerService() {
         scope.launch {
             pumpManager.pumpClockSkewMs.collect { skew ->
                 ypsoPump.pumpClockSkewMs = skew
+                warnIfClockHasDrifted(skew)
                 rxBus.send(EventYpsoPumpDataChanged())
             }
         }
@@ -195,6 +201,120 @@ class YpsoService : DaggerService() {
                 if (count >= 0) preferences.put(YpsoIntNonKey.LastAlertCount, count)
             }
         }
+    }
+
+    /**
+     * Says so when the pump's clock has drifted away from the phone's.
+     *
+     * The skew is read on every status poll and shown on the YPSO tab, but nobody watches a tab. The
+     * other drivers that can see the pump's clock all raise a notification instead — Omnipod, Insight
+     * and Medtronic each have one — and this driver has more reason to than most: the pump keeps
+     * **local wall-clock seconds with no time zone** (`PORTING_NOTES` §5), so its clock is the sole
+     * authority on when anything in its log happened.
+     *
+     * Deliveries are recorded at the *phone's* time, so IOB is unaffected by drift. What drift does
+     * corrupt is the pump's own log — and therefore any history sync, and any attempt to reconcile
+     * what AAPS believes against what the pump did.
+     *
+     * [DateUtil] is not consulted for the threshold: half an hour is well beyond anything a crystal
+     * does in a day, so crossing it means something happened — a manual change on the pump, a battery
+     * swap that reset the clock, or a DST correction that failed.
+     */
+    private fun warnIfClockHasDrifted(skewMs: Long?) {
+        if (skewMs == null) return
+        val minutes = abs(skewMs) / 60_000L
+        if (minutes < CLOCK_DRIFT_WARN_MINUTES) {
+            rxBus.send(EventDismissNotification(Notification.INSIGHT_DATE_TIME_UPDATED))
+            return
+        }
+        aapsLogger.warn(LTag.PUMP, "Pump clock is $minutes min from the phone's; the pump's own log timestamps are wrong by that much")
+        uiInteraction.addNotification(
+            Notification.INSIGHT_DATE_TIME_UPDATED,
+            rh.gs(R.string.ypso_clock_drifted, minutes),
+            Notification.NORMAL
+        )
+    }
+
+    /**
+     * Tells AAPS that a stopped pump is delivering **no basal**, by holding a 0% temporary basal
+     * open for as long as it is stopped.
+     *
+     * ⚠ `isSuspended()` is not enough on its own, and that was the gap. It stops the *loop* from
+     * acting, but AAPS's IOB accounting does not consult it: basal insulin on board is computed from
+     * the profile and whatever temporary basals are on record. A pump that has stopped — by the
+     * user's hand, or because an occlusion halted it — therefore goes on contributing basal IOB that
+     * is not being delivered, indefinitely and invisibly. That is the same shape as the temporary
+     * basal cancel that left AAPS believing a TBR was still running (`PORTING_NOTES` §4h): the pump
+     * was right, the driver was right, and only AAPS's own record was wrong.
+     *
+     * The pattern is Medtrum's — every driver that can detect a stopped pump does this. The record
+     * is a `PUMP_SUSPEND` temporary basal, which is the type reserved for a pump stopping of its own
+     * accord rather than AAPS asking for zero.
+     *
+     * [SUSPEND_TBR_MINUTES] is long and distinctive on purpose: it is how the record is recognised as
+     * this driver's own on resume, so a real temporary basal is never mistaken for one of these and
+     * closed by accident. It is re-asserted on every poll while the pump stays stopped, so it cannot
+     * quietly expire underneath a pump that is still not delivering.
+     *
+     * ⚠ **An unrecognised delivery mode does not open this record**, and that distinction is the
+     * whole reason [PumpStatus.operatingMode] is a three-valued thing rather than `isDelivering`.
+     * Only two of 256 byte-0 values have ever been identified (§8.3), and nobody has looked at what
+     * the pump reports *during a bolus*. If that turns out to be a third value, treating unknown as
+     * stopped would open a suspend record on every single bolus — and if the app died mid-bolus, that
+     * record would sit open for [SUSPEND_TBR_MINUTES] telling AAPS basal was off for days.
+     *
+     * `isSuspended()` still reports true for an unknown mode, so the **loop** stays conservative and
+     * refuses to act. That costs nothing and reverses instantly. Writing a therapy record is a claim
+     * that persists, and this driver does not make claims from bytes it has not identified.
+     */
+    private fun syncSuspendedState(mode: OperatingMode, modeName: String) {
+        val open = pumpSync.expectedPumpState().temporaryBasal
+        val ourSuspendRecord = open?.takeIf {
+            it.type == PumpSync.TemporaryBasalType.PUMP_SUSPEND && it.duration == T.mins(SUSPEND_TBR_MINUTES).msecs()
+        }
+
+        if (mode == OperatingMode.UNKNOWN) {
+            aapsLogger.warn(
+                LTag.PUMP,
+                "Delivery mode '$modeName' has never been identified; the loop is held off but no suspend record is written. " +
+                    "Record what the pump's own display says against this mode — PORTING_NOTES §8.3"
+            )
+            return
+        }
+
+        if (mode != OperatingMode.STARTED) {
+            if (ourSuspendRecord != null) return
+            val synced = pumpSync.syncTemporaryBasalWithPumpId(
+                timestamp = dateUtil.now(),
+                rate = 0.0,
+                duration = T.mins(SUSPEND_TBR_MINUTES).msecs(),
+                isAbsolute = true,
+                type = PumpSync.TemporaryBasalType.PUMP_SUSPEND,
+                pumpId = dateUtil.now(),
+                pumpType = PumpType.YPSOPUMP,
+                pumpSerial = pumpSerial()
+            )
+            aapsLogger.warn(
+                LTag.PUMP,
+                "Pump is not delivering (mode '$modeName'); recorded a 0% basal so AAPS stops counting basal IOB, new=$synced"
+            )
+            uiInteraction.addNotification(
+                Notification.PUMP_SUSPENDED, rh.gs(R.string.ypso_pump_suspended, modeName), Notification.URGENT
+            )
+            return
+        }
+
+        // Delivering again. Close only a record this driver opened — a real temporary basal has a
+        // different type and duration, and closing one would tell AAPS basal resumed when it had not.
+        rxBus.send(EventDismissNotification(Notification.PUMP_SUSPENDED))
+        if (ourSuspendRecord == null) return
+        val stopped = pumpSync.syncStopTemporaryBasalWithPumpId(
+            timestamp = dateUtil.now(),
+            endPumpId = dateUtil.now(),
+            pumpType = PumpType.YPSOPUMP,
+            pumpSerial = pumpSerial()
+        )
+        aapsLogger.info(LTag.PUMP, "Pump is delivering again (mode '$modeName'); closed the 0% suspend record, new=$stopped")
     }
 
     /**
@@ -753,5 +873,23 @@ class YpsoService : DaggerService() {
             YpsoEventTypes.A_BATTERY_EMPTY,
             YpsoEventTypes.A_REUSABLE_ERROR
         )
+
+        /**
+         * Length of the 0% temporary basal that stands for a stopped pump — see [syncSuspendedState].
+         *
+         * Long enough that it cannot lapse between status polls, which are 20 minutes apart when the
+         * driver is idle (`PORTING_NOTES` §8.2), and distinctive enough to be recognised as this
+         * driver's own record when delivery resumes. It is re-asserted while the pump stays stopped
+         * rather than relied on to outlive the outage.
+         */
+        private const val SUSPEND_TBR_MINUTES = 4800L
+
+        /**
+         * How far the pump's clock may be from the phone's before the user is told, in minutes.
+         *
+         * Well beyond any plausible crystal drift, so crossing it means something happened rather
+         * than something wore. The clock write itself treats anything within 90 seconds as in sync.
+         */
+        private const val CLOCK_DRIFT_WARN_MINUTES = 30L
     }
 }

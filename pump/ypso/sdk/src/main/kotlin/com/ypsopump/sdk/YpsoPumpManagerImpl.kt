@@ -14,6 +14,7 @@ import com.pump.common.ActiveTbr
 import com.pump.common.BasalBlock
 import com.pump.common.BasalProfile
 import com.pump.common.BolusDeliveryResult
+import com.pump.common.OperatingMode
 import com.pump.common.PumpConnectionState
 import com.pump.common.PumpEvent
 import com.pump.common.PumpHistoryEvent
@@ -1387,6 +1388,17 @@ class YpsoPumpManagerImpl private constructor(
             reservoirUnits = if (status.reservoirKnown) status.insulinRemaining.toDouble() else null,
             deliveryModeName = status.deliveryModeName,
             isDelivering = DeliveryMode.isDeliveringOrNull(status.deliveryMode) == true,
+            // ⚠ Deliberately three states, not two. `isDelivering` collapses "confirmed stopped" and
+            // "never seen this mode" into the same `false`, which is right for gating the loop — the
+            // safe answer to "don't know" is "don't act" — but wrong for anything that *writes a
+            // record*. Recording a therapy event on the strength of a byte nobody has identified is
+            // the kind of claim this driver does not make, so callers that persist something must
+            // require STOPPED and treat UNKNOWN as "ask again later".
+            operatingMode = when (DeliveryMode.isDeliveringOrNull(status.deliveryMode)) {
+                true  -> OperatingMode.STARTED
+                false -> OperatingMode.STOPPED
+                null  -> OperatingMode.UNKNOWN
+            },
             activeBasalRate = status.currentBasalRate,
             activeTbr = if (status.isTbrRunning) {
                 ActiveTbr(

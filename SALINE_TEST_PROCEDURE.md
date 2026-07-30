@@ -10,7 +10,10 @@ As of 2026-07-31, **all four phases have passed on hardware.** What is left:
 | # | Test | Why it matters | Where |
 |---|---|---|---|
 | 1 | **Decide the alarm poll interval** | Not a test — a decision. An occlusion took **27 minutes** to reach AAPS, because the driver polls every 20 min when idle. See `PORTING_NOTES` §8.2 | — |
-| 2 | **The delivery-mode byte in every state** | Mapped for 2 values out of 256. An unmapped one makes AAPS call the pump suspended, and a *stopped* pump is how an alarm should really surface | `PORTING_NOTES` §8.3 |
+| 2 | **The delivery-mode byte in every state** | Mapped for 2 values out of 256. **Now load-bearing:** a confirmed `STOPPED` writes a 0% suspend record into AAPS, and an unidentified mode deliberately writes nothing. Read byte 0 during a bolus, during priming, and after an alarm stops the pump | `PORTING_NOTES` §8.3, §8.6 |
+| 2a | **Stop the pump from its own buttons** | New behaviour, untested: AAPS should raise an urgent "not delivering" notification and open a 0% `PUMP_SUSPEND` temporary basal so basal IOB stops accruing. Restart it and the record must close | `PORTING_NOTES` §8.6 |
+| 2b | **Change the phone's timezone** | New behaviour, untested: the driver should queue a clock sync and the pump's clock should follow. Previously nothing corrected it | `PORTING_NOTES` §8.6 |
+| 2c | **Change the pump's bolus increment** | AAPS hard-codes 0.1 U and cannot read the pump's setting. Ask for something off the new grid and see whether it is refused or silently rounded | `PORTING_NOTES` §8.6 |
 | 3 | **Reconnect mid-bolus** | Pull BLE range during delivery. The bolus is confirmed from history, so it *should* resolve on reconnect | — |
 | 4 | **A bolus while a TBR runs** | Never tried together; both are identified by sequence | — |
 | 5 | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
