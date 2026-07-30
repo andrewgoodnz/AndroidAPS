@@ -20,10 +20,9 @@ In rough order of value:
 | 8 | **Reconnect mid-bolus** | Pull BLE range during delivery. The bolus is confirmed from history, so it *should* resolve on reconnect | — |
 | 9 | **The extended bolus** | Still refused. Out of scope until the standard bolus has soaked | — |
 
-**Two known-broken things that are not tests but blockers**, both in `PORTING_NOTES` §8:
-history sync cannot reconstruct a finished temporary basal (the pump rewrites the entry in place),
-and boluses are recorded at delivery time while history sync would record them at the pump's
-timestamp. Both need settling before `YpsoSyncHistoryToAaps` goes on.
+**Before `YpsoSyncHistoryToAaps` goes on** (`PORTING_NOTES` §8): decide how `sincePosition` skips
+already-seen entries, and decide whether a bolus is recorded at the phone's time or the pump's — the
+two paths currently differ, though they reconcile to one record because the `pumpId` matches.
 
 ---
 

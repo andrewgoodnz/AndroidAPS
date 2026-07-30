@@ -101,6 +101,63 @@ class YpsoHistoryMapperTest {
         assertThat(mapped.durationMinutes).isEqualTo(15)
     }
 
+    /**
+     * ⚠ A *finished* temporary basal is a type-10 entry, and it must still map to a complete TBR.
+     *
+     * This pump keeps one entry per temporary basal and rewrites it in place: type 9 while running,
+     * type 10 once stopped, with `v2` rewritten from the requested duration to the actual one, and
+     * `timestamp` staying the start. Verified on hardware — `seq=160371` read `type=9 v1=150 v2=30`
+     * while running and `type=10 v1=150 v2=2` after a cancel.
+     *
+     * Mapping type 10 to `TbrEnded` discarded the percentage and duration and handed AAPS an end for
+     * a start it had never seen, because a read taken after the TBR finished never sees type 9 at
+     * all. The entry describes the whole temporary basal, so that is what it maps to.
+     */
+    @Test
+    fun `a finished temporary basal maps to a complete TBR with its actual duration`() {
+        val mapped = YpsoHistoryMapper.toHistoryEvent(
+            entry(EventType.BASAL_PROFILE_TEMP, value1 = 150, value2 = 2, sequence = 160_371L)
+        )
+
+        assertThat(mapped).isInstanceOf(PumpHistoryEvent.TbrStarted::class.java)
+        with(mapped as PumpHistoryEvent.TbrStarted) {
+            assertThat(percentage).isEqualTo(150)
+            // The 2 minutes it ran, not the 30 that were asked for.
+            assertThat(durationMinutes).isEqualTo(2)
+            assertThat(position).isEqualTo(160_371L)
+        }
+    }
+
+    @Test
+    fun `an aborted temporary basal also maps to a complete TBR`() {
+        val mapped = YpsoHistoryMapper.toHistoryEvent(
+            entry(EventType.BASAL_PROFILE_TEMP_ABORT, value1 = 80, value2 = 5)
+        )
+
+        assertThat(mapped).isInstanceOf(PumpHistoryEvent.TbrStarted::class.java)
+        with(mapped as PumpHistoryEvent.TbrStarted) {
+            assertThat(percentage).isEqualTo(80)
+            assertThat(durationMinutes).isEqualTo(5)
+        }
+    }
+
+    /**
+     * The start and end of one temporary basal share a sequence number, because they are one entry.
+     * Both states must therefore produce the same `position`, or PumpSync would store a finished TBR
+     * as a second, separate one.
+     */
+    @Test
+    fun `both states of one TBR entry share the same position`() {
+        val running = YpsoHistoryMapper.toHistoryEvent(
+            entry(EventType.BASAL_PROFILE_TEMP_RUNNING, value1 = 150, value2 = 30, sequence = 160_371L)
+        )!!
+        val finished = YpsoHistoryMapper.toHistoryEvent(
+            entry(EventType.BASAL_PROFILE_TEMP, value1 = 150, value2 = 2, sequence = 160_371L)
+        )!!
+
+        assertThat(finished.position).isEqualTo(running.position)
+    }
+
     @Test
     fun `timestamps are converted from seconds to milliseconds`() {
         val mapped = YpsoHistoryMapper.toHistoryEvent(

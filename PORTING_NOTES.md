@@ -605,12 +605,20 @@ byte 10 regardless of what the log yields** — falling back to a timestamp id i
 identified. A possible dedupe collision on a sync switch that is off is a far smaller problem than a
 temporary basal AAPS believes is still running.
 
-**⚠ This also breaks history sync's TBR handling, which is not yet reworked.**
-`YpsoHistoryMapper` maps type 9 → `TbrStarted` and type 10 → `TbrEnded`, both keyed on the same
-sequence number — and since the entry mutates, a history read only ever sees *one* of them. Read
-after the TBR has ended and the start is simply gone, so a TBR that has finished can never be
-reconstructed from history alone. Resolve this before `YpsoSyncHistoryToAaps` is switched on; it is
-now the second reason that switch needs work, alongside `sincePosition`.
+**[verified] The entry's `timestamp` is the TBR's *start*, and it survives the rewrite.** `seq=160371`
+was read at 19:52, after the cancel, and its timestamp decoded to 19:46:55 — the moment the TBR was
+set (19:46:57), not the moment it stopped.
+
+**That makes a finished TBR fully reconstructable after all**, which resolves what looked like a
+history-sync blocker: a type-10 entry carries the start (`timestamp`), the percentage (`v1`) and the
+duration it actually ran (`v2`). It is not an "end event with a missing start" — it is the whole
+temporary basal.
+
+`YpsoHistoryMapper` now maps types 9, 10 and 32 all to `TbrStarted`, because on this pump each of
+them describes a complete temporary basal. Mapping type 10 to `TbrEnded` threw away the percentage
+and the duration and handed AAPS an end for a start it had never seen — a read taken after the TBR
+finished never sees the type-9 state at all. Both states share the sequence number, so both produce
+the same `position` and PumpSync sees one temporary basal rather than two.
 
 **⚠ Inherent, not a bug: a percentage is only correct for the basal block it was computed in.** When
 the pump crosses into an hour with a different programmed rate, the same percentage becomes a
@@ -972,17 +980,17 @@ expect to fail:
 - **The alarm notification.** The alert-count path is proven, but the branch that raises the
   notification has never fired.
 
-**Two blockers on `YpsoSyncHistoryToAaps`, both from today:**
+**Remaining before `YpsoSyncHistoryToAaps` goes on:**
 
-1. **A finished temporary basal cannot be reconstructed from history**, because the pump rewrites the
-   one entry in place (§4h). The mapper keys `TbrStarted` and `TbrEnded` on the same sequence and a
-   read only ever sees whichever state the entry is currently in.
+1. **`sincePosition` filtering** — how already-seen entries are skipped. Sort by sequence, never by
+   timestamp (§5's type-12 trap).
 2. **Delivery and history disagree on timestamps.** Delivery records at the phone's time
-   (deliberately — §5); a history sync would record at the pump's. Same `pumpId`, so they reconcile,
-   but decide which timestamp wins before switching it on.
+   (deliberately — §5); a history sync would record at the pump's. The `pumpId` is the same either
+   way so they reconcile to one record, but decide which timestamp wins first.
 
-Also unresolved: `sincePosition` filtering, and whether `entry.timestamp` on a mutated TBR entry is
-the start or the end of the temporary basal — that one is measurable and matters for reconstruction.
+The TBR reconstruction problem that looked like a third blocker is **resolved** — the entry's
+timestamp is the start and survives the rewrite, so a type-10 entry describes a complete temporary
+basal (§4h).
 6. **Delivery-mode map.** Extend `DeliveryMode` by observation as the phases above run: record
    byte 0 while priming, bolusing and running a TBR. Anything but `3` and `10` still reads as
    unverified, and `isDelivering` stays false, which under-reports a delivering pump.

@@ -46,12 +46,23 @@ internal object YpsoHistoryMapper {
             EventType.BOLUS_BLIND           ->
                 PumpHistoryEvent.BolusDelivered(entry.value1 / 100.0, BolusType.STANDARD, ts, pos)
 
-            EventType.BASAL_PROFILE_TEMP_RUNNING ->
-                PumpHistoryEvent.TbrStarted(entry.value1, entry.value2, ts, pos)
-
+            // ⚠ All three temporary-basal types map to TbrStarted, and that is not a mistake.
+            //
+            // This pump keeps **one** entry per temporary basal and rewrites it in place: type 9
+            // while it runs, becoming type 10 when it stops, with value2 rewritten from the
+            // requested duration to the duration it actually ran. Verified on hardware —
+            // seq=160371 read as `type=9 v1=150 v2=30` while running and `type=10 v1=150 v2=2`
+            // after a cancel two minutes later — and `timestamp` stays the *start* throughout.
+            //
+            // So a type-10 entry is not an "end event" with no start; it is the whole temporary
+            // basal, described completely: started at `ts`, ran `value2` minutes at `value1`
+            // percent. Mapping it to TbrEnded threw away the percentage and the duration and left
+            // AAPS with an end for a start it had never seen — because a read taken after the TBR
+            // finished never sees the type-9 state at all.
+            EventType.BASAL_PROFILE_TEMP_RUNNING,
             EventType.BASAL_PROFILE_TEMP,
             EventType.BASAL_PROFILE_TEMP_ABORT   ->
-                PumpHistoryEvent.TbrEnded(ts, pos)
+                PumpHistoryEvent.TbrStarted(entry.value1, entry.value2, ts, pos)
 
             EventType.BASAL_PROFILE_CHANGED,
             EventType.BASAL_PROFILE_A_CHANGED,
