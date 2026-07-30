@@ -121,8 +121,8 @@ class YpsoPumpManagerImpl private constructor(
          */
         private const val BOLUS_LOG_SETTLE_MS = 3_000L
 
-        /** How many of the newest event-log entries to search for the bolus just delivered. */
-        private const val BOLUS_HISTORY_SEARCH_ENTRIES = 5
+        /** How many of the newest event-log entries to search for the command just issued. */
+        private const val HISTORY_SEARCH_ENTRIES = 5
 
         /** Re-reads of the log before giving up on finding the entry. */
         private const val BOLUS_HISTORY_ATTEMPTS = 3
@@ -135,6 +135,9 @@ class YpsoPumpManagerImpl private constructor(
          * would stall the status poll for minutes; the newest few are what matter.
          */
         private const val MAX_NEW_ALERTS_PER_CHECK = 5
+
+        /** Breathing room between writing a temporary basal and reading byte 10 back. */
+        private const val TBR_SETTLE_MS = 700L
 
         /**
          * Event types a standard bolus can produce. `2` settles the outcome and carries the amount
@@ -234,6 +237,18 @@ class YpsoPumpManagerImpl private constructor(
 
     override val maxBasalProfiles: Int = 2
     override val maxBolusAmount: Double = 25.0
+
+    /**
+     * ⚠ **Unsettled, and narrower than AAPS believes.** This 0–200% comes from upstream, while
+     * `PumpType.YPSOPUMP.tbrSettings` declares a maximum of **500%** — so AAPS will offer rates
+     * this driver then refuses.
+     *
+     * Refusing is the deliberate choice: clamping would leave AAPS believing it had set a rate the
+     * pump is not running, and a silent difference in delivered insulin is worse than a visible
+     * failure. Only hardware can settle which figure is right — ask for 250% on saline and see
+     * whether byte 10 comes back as 250 or the command is rejected. Until then the narrower bound
+     * holds, because over-stating what the pump accepts is the dangerous direction.
+     */
     override val tbrPercentRange: IntRange = 0..200
 
     /**
@@ -859,7 +874,7 @@ class YpsoPumpManagerImpl private constructor(
      */
     private suspend fun findBolusRecord(afterSequence: Long): HistoryEntry? {
         repeat(BOLUS_HISTORY_ATTEMPTS) { attempt ->
-            val newest = suspendReadHistoryEvents(BOLUS_HISTORY_SEARCH_ENTRIES)
+            val newest = suspendReadHistoryEvents(HISTORY_SEARCH_ENTRIES)
                 .filter { it.sequence > afterSequence && it.entryType in STANDARD_BOLUS_TYPES }
                 .maxByOrNull { it.sequence }
 
@@ -921,6 +936,180 @@ class YpsoPumpManagerImpl private constructor(
     private fun bolusTimeoutMs(amount: Double): Long =
         expectedDeliveryMs(amount) + (BOLUS_TIMEOUT_SLACK_SECONDS * 1000).toLong()
 
+    // ==================== TEMPORARY BASAL ====================
+
+    /**
+     * A temporary basal as the pump reports it after the fact.
+     *
+     * [pumpSequence] comes from the type-9 history entry and is the same identity history sync
+     * uses, for the reason set out on [ConfirmedBolus]. Null means the entry was not found, in
+     * which case the TBR may still be running — [confirmed] is what says whether it is.
+     */
+    data class ConfirmedTbr(
+        val percentage: Int,
+        val durationMinutes: Int,
+        val pumpSequence: Long?,
+        val timestampMillis: Long?,
+        val confirmed: Boolean,
+        val errorMessage: String?
+    )
+
+    override suspend fun setTbr(percentage: Int, durationMinutes: Int): Boolean =
+        setTbrConfirmed(percentage, durationMinutes).confirmed
+
+    /**
+     * Sets a temporary basal and confirms it from **byte 10 of the system status**.
+     *
+     * Unlike the bolus status (§4f), byte 10 is *not* cleared while the temporary basal runs — it
+     * reads the live percentage, and 100 when none is active. That makes a direct read-back the
+     * right confirmation here rather than the history log, and it is the field already verified on
+     * hardware: a 130% temporary basal read back as 130 with the effective rate scaled to match.
+     *
+     * Refuses rather than clamps a percentage the pump cannot do. Clamping would leave AAPS
+     * believing it had set a rate the pump is not running, which is a silent difference in
+     * delivered insulin; a visible failure is the lesser harm.
+     */
+    suspend fun setTbrConfirmed(percentage: Int, durationMinutes: Int): ConfirmedTbr = withConnection {
+        if (percentage !in tbrPercentRange) {
+            return@withConnection tbrFailure(
+                percentage, durationMinutes,
+                "$percentage% is outside the range this pump accepts (${tbrPercentRange.first}–${tbrPercentRange.last}%)"
+            )
+        }
+        if (durationMinutes < 0) {
+            return@withConnection tbrFailure(percentage, durationMinutes, "Duration cannot be negative")
+        }
+
+        // 100% is how this pump expresses "none", so a request for it is a cancellation however it
+        // arrived. Treating it as a set would leave AAPS thinking a temporary basal was running.
+        if (percentage == SystemStatusData.TBR_PERCENT_NONE) {
+            log("setTbr($percentage%) is this pump's 'no TBR' value — cancelling instead")
+            val cancelled = cancelTbrConfirmed()
+            return@withConnection cancelled.copy(durationMinutes = durationMinutes)
+        }
+
+        val baselineSequence = newestEventSequence()
+
+        if (!suspendStartTbr(percentage, durationMinutes)) {
+            return@withConnection tbrFailure(percentage, durationMinutes, "The pump refused the temporary basal command")
+        }
+        delay(TBR_SETTLE_MS)
+
+        val status = suspendGetSystemStatus()
+        if (status == null) {
+            return@withConnection tbrFailure(
+                percentage, durationMinutes,
+                "The status did not read back after the write — whether a temporary basal is running is UNKNOWN, check the pump"
+            )
+        }
+        updateStatusFromSystem(status)
+
+        if (status.tbrPercent != percentage) {
+            return@withConnection tbrFailure(
+                percentage, durationMinutes,
+                "Pump reports ${status.tbrPercent}% after being asked for $percentage%"
+            )
+        }
+
+        val record = baselineSequence?.let { findTbrRecord(it) }
+        log(
+            "TBR confirmed by read-back: ${status.tbrPercent}% with ${status.tbrRemainingMinutes}min left" +
+                (record?.let { ", logged as seq=${it.sequence} v1=${it.value1} v2=${it.value2}" }
+                    ?: ", but no type-9 entry found so it cannot be recorded")
+        )
+
+        ConfirmedTbr(
+            percentage = status.tbrPercent,
+            durationMinutes = if (status.tbrRemainingMinutes > 0) status.tbrRemainingMinutes else durationMinutes,
+            pumpSequence = record?.sequence,
+            timestampMillis = record?.let { it.timestamp * 1000L },
+            confirmed = true,
+            errorMessage = null
+        )
+    }
+
+    override suspend fun cancelTbr(): Boolean = cancelTbrConfirmed().confirmed
+
+    /**
+     * Cancels the running temporary basal, confirmed by byte 10 returning to 100.
+     *
+     * Reports success when the pump already had none running: the caller's intent — no temporary
+     * basal — is satisfied, and failing would make AAPS retry something already true.
+     */
+    suspend fun cancelTbrConfirmed(): ConfirmedTbr = withConnection {
+        // Baselined for the same reason as everything else: the end record needs the pump's own
+        // sequence number as its id, or a later history sync would store the same TBR-end twice.
+        val baselineSequence = newestEventSequence()
+
+        if (!suspendCancelTbr()) {
+            return@withConnection tbrFailure(
+                SystemStatusData.TBR_PERCENT_NONE, 0, "The pump refused the temporary basal cancel"
+            )
+        }
+        delay(TBR_SETTLE_MS)
+
+        val status = suspendGetSystemStatus()
+        if (status == null) {
+            return@withConnection tbrFailure(
+                SystemStatusData.TBR_PERCENT_NONE, 0,
+                "The status did not read back after the cancel — whether a temporary basal is still running is UNKNOWN, check the pump"
+            )
+        }
+        updateStatusFromSystem(status)
+
+        if (status.isTbrRunning) {
+            return@withConnection tbrFailure(
+                SystemStatusData.TBR_PERCENT_NONE, 0,
+                "Pump still reports ${status.tbrPercent}% after the cancel"
+            )
+        }
+
+        val record = baselineSequence?.let { findTbrEndRecord(it) }
+        log(
+            "TBR cancel confirmed by read-back: byte 10 is back to ${status.tbrPercent}" +
+                (record?.let { ", logged as seq=${it.sequence} type=${it.entryType}" }
+                    ?: ", but no end entry found so the stop cannot be recorded")
+        )
+
+        ConfirmedTbr(
+            percentage = SystemStatusData.TBR_PERCENT_NONE,
+            durationMinutes = 0,
+            pumpSequence = record?.sequence,
+            timestampMillis = record?.let { it.timestamp * 1000L },
+            confirmed = true,
+            errorMessage = null
+        )
+    }
+
+    private fun tbrFailure(percentage: Int, durationMinutes: Int, reason: String): ConfirmedTbr {
+        log("TBR refused/failed: $reason")
+        return ConfirmedTbr(
+            percentage = percentage,
+            durationMinutes = durationMinutes,
+            pumpSequence = null,
+            timestampMillis = null,
+            confirmed = false,
+            errorMessage = reason
+        )
+    }
+
+    /** Finds the `9 Basal Profile Temp Running` entry the pump wrote for the TBR just set. */
+    private suspend fun findTbrRecord(afterSequence: Long): HistoryEntry? =
+        findNewestEntry(afterSequence, setOf(EventType.BASAL_PROFILE_TEMP_RUNNING))
+
+    /**
+     * Finds the entry that ends a temporary basal: `10` when it ran to term, `32` when it was
+     * aborted. Which of the two this pump writes for a cancel over BLE is unknown — the bolus
+     * turned out to log an abort as a *completion* (§4f), so both are accepted rather than assuming.
+     */
+    private suspend fun findTbrEndRecord(afterSequence: Long): HistoryEntry? =
+        findNewestEntry(afterSequence, setOf(EventType.BASAL_PROFILE_TEMP, EventType.BASAL_PROFILE_TEMP_ABORT))
+
+    private suspend fun findNewestEntry(afterSequence: Long, types: Set<Int>): HistoryEntry? =
+        suspendReadHistoryEvents(HISTORY_SEARCH_ENTRIES)
+            .filter { it.sequence > afterSequence && it.entryType in types }
+            .maxByOrNull { it.sequence }
+
     // ==================== DELIVERY — NOT IMPLEMENTED ====================
     //
     // Nothing below touches the pump. These exist only to satisfy the PumpManager contract;
@@ -935,16 +1124,6 @@ class YpsoPumpManagerImpl private constructor(
         extendedAmount: Double,
         durationMinutes: Int
     ): BolusDeliveryResult = refuseDelivery("deliverMultiwaveBolus($immediateAmount, $extendedAmount, $durationMinutes)")
-
-    override suspend fun setTbr(percentage: Int, durationMinutes: Int): Boolean {
-        log("REFUSED setTbr($percentage%, ${durationMinutes}min) — $NOT_IMPLEMENTED")
-        return false
-    }
-
-    override suspend fun cancelTbr(): Boolean {
-        log("REFUSED cancelTbr — $NOT_IMPLEMENTED")
-        return false
-    }
 
     override suspend fun writeBasalProfile(profile: BasalProfile): Boolean {
         log("REFUSED writeBasalProfile(${profile.name}) — $NOT_IMPLEMENTED")
@@ -1004,6 +1183,12 @@ class YpsoPumpManagerImpl private constructor(
 
     private suspend fun suspendReadAlertsCount(): Int? =
         suspendCancellableCoroutine { cont -> bleManager.readHistoryAlertsCount { cont.resume(it) } }
+
+    private suspend fun suspendStartTbr(percentage: Int, durationMinutes: Int): Boolean =
+        suspendCancellableCoroutine { cont -> bleManager.startTbr(percentage, durationMinutes) { cont.resume(it) } }
+
+    private suspend fun suspendCancelTbr(): Boolean =
+        suspendCancellableCoroutine { cont -> bleManager.cancelTbr { cont.resume(it) } }
 
     // ==================== INTERNAL ====================
 

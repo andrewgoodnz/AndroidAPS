@@ -267,6 +267,30 @@ and the AAPS treatment record.
 
 ---
 
+## Outstanding test — the alarm notification ⏳
+
+**Deferred, not passed.** The alert-count path is proven (`readHistoryCount(…fcbec83b7bc5): 144`
+runs on every status read), but the branch that raises the notification has never fired, because
+the occlusion that motivated it was already inside the count before the baseline was taken. It
+cannot fire retroactively.
+
+**To run it:** with the pump running on saline, **pull the cartridge** — that should raise alert
+**103 No cartridge**, which is in the urgent set. Then press **Refresh** and expect:
+
+```
+Pump alert log grew from <N> to <N+1> — reading the 1 newest
+PUMP ALERT: Alert: No Cartridge (type 103, seq …)
+```
+
+plus an urgent AAPS notification **with sound**.
+
+**If it does not fire, suspect the `SharedFlow`.** `_newAlerts` has `replay = 0`, so an emission
+with no subscriber attached is silently dropped — the service's collector must be subscribed before
+`checkForNewAlerts` runs. A dropped occlusion notification is exactly the failure this feature
+exists to prevent, so it needs to be seen working before insulin.
+
+---
+
 ## Phase 3 — temporary basal (not yet implemented)
 
 **The read side is already confirmed**, which was not true when this phase was planned. Setting a

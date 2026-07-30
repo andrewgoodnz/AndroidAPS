@@ -59,11 +59,13 @@ import javax.inject.Inject
  * calls into pump drivers from its own thread and expects a synchronous answer. Everything below
  * that line stays suspending.
  *
- * **This build can set the clock and deliver a standard bolus, and nothing else.** There is still
- * no temporary-basal or basal-profile entry point on this service at all — an absence of method,
- * not a flag to check. Each is added on its own, behind its own saline test.
+ * **This build can set the clock, deliver a standard bolus and set a temporary basal.** There is
+ * still no basal-profile entry point on this service at all — an absence of method, not a flag to
+ * check. It gets added on its own, behind its own saline test.
  *
- * [deliverBolus] is under test on saline and writes nothing to `PumpSync`; see its comment.
+ * Every write here is confirmed against the pump before it is reported as done, and each records
+ * into `PumpSync` under the pump's own sequence number so that a later history sync of the same
+ * event resolves to one record rather than two.
  */
 class YpsoService : DaggerService() {
 
@@ -480,6 +482,87 @@ class YpsoService : DaggerService() {
     fun stopBolus() {
         aapsLogger.info(LTag.PUMP, "stopBolus requested")
         scope.launch { pumpManager.cancelBolus(null) }
+    }
+
+    /**
+     * Sets a temporary basal as a percentage and records it.
+     *
+     * Recorded under the type-9 history entry's sequence number, the same identity history sync
+     * uses — see [deliverBolus] for why that matters. A temporary basal the pump confirmed but did
+     * not log cannot be recorded, and says so; the TBR is still running either way, which is what
+     * `confirmed` reports.
+     */
+    fun setTempBasalPercent(percent: Int, durationMinutes: Int, tbrType: PumpSync.TemporaryBasalType): YpsoPumpManagerImpl.ConfirmedTbr {
+        val failed = YpsoPumpManagerImpl.ConfirmedTbr(
+            percentage = percent, durationMinutes = durationMinutes,
+            pumpSequence = null, timestampMillis = null, confirmed = false,
+            errorMessage = rh.gs(R.string.ypso_tbr_failed)
+        )
+
+        return awaitResult("setTempBasalPercent", failed) {
+            val result = pumpManager.setTbrConfirmed(percent, durationMinutes)
+            aapsLogger.info(
+                LTag.PUMP,
+                "setTempBasalPercent: asked $percent% for ${durationMinutes}min, confirmed=${result.confirmed}" +
+                    (result.errorMessage?.let { ", $it" } ?: "")
+            )
+
+            if (result.confirmed) {
+                val sequence = result.pumpSequence
+                if (sequence == null) {
+                    aapsLogger.warn(LTag.PUMP, "TBR is running but the pump logged no type-9 entry, so it cannot be recorded")
+                } else {
+                    val synced = pumpSync.syncTemporaryBasalWithPumpId(
+                        // The phone's clock, for the reason in recordBolus.
+                        timestamp = dateUtil.now(),
+                        rate = result.percentage.toDouble(),
+                        duration = result.durationMinutes * 60L * 1000L,
+                        isAbsolute = false,
+                        type = tbrType,
+                        pumpId = sequence,
+                        pumpType = PumpType.YPSOPUMP,
+                        pumpSerial = pumpSerial()
+                    )
+                    aapsLogger.info(LTag.PUMP, "Recorded TBR ${result.percentage}% under pumpId=$sequence, new=$synced")
+                }
+            }
+            rxBus.send(EventYpsoPumpDataChanged())
+            result
+        }
+    }
+
+    /** Cancels the running temporary basal and closes the AAPS record. */
+    fun cancelTempBasal(): YpsoPumpManagerImpl.ConfirmedTbr {
+        val failed = YpsoPumpManagerImpl.ConfirmedTbr(
+            percentage = 100, durationMinutes = 0,
+            pumpSequence = null, timestampMillis = null, confirmed = false,
+            errorMessage = rh.gs(R.string.ypso_tbr_cancel_failed)
+        )
+
+        return awaitResult("cancelTempBasal", failed) {
+            val result = pumpManager.cancelTbrConfirmed()
+            aapsLogger.info(
+                LTag.PUMP,
+                "cancelTempBasal: confirmed=${result.confirmed}" + (result.errorMessage?.let { ", $it" } ?: "")
+            )
+
+            if (result.confirmed) {
+                val sequence = result.pumpSequence
+                if (sequence == null) {
+                    aapsLogger.warn(LTag.PUMP, "TBR is stopped but the pump logged no end entry, so the stop cannot be recorded")
+                } else {
+                    val synced = pumpSync.syncStopTemporaryBasalWithPumpId(
+                        timestamp = dateUtil.now(),
+                        endPumpId = sequence,
+                        pumpType = PumpType.YPSOPUMP,
+                        pumpSerial = pumpSerial()
+                    )
+                    aapsLogger.info(LTag.PUMP, "Recorded TBR stop under endPumpId=$sequence, new=$synced")
+                }
+            }
+            rxBus.send(EventYpsoPumpDataChanged())
+            result
+        }
     }
 
     /** The pump's own speed index: `0` = 3 U/min, `1` = 12 U/min, `2` = 33.3 U/min. */

@@ -65,6 +65,12 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
         /** Confirmed by the pump accepting 13 + 2 CRC where a bare 13 was refused. */
         private const val BOLUS_PAYLOAD_BYTES = 13
 
+        /** Two GLB pairs: percent with its complement, minutes with its complement. */
+        private const val TBR_PAYLOAD_BYTES = 16
+
+        /** The pump's "no temporary basal" percentage, in both directions. */
+        private const val TBR_PERCENT_NONE = 100
+
         /** Which arrangement of those 13 bytes to send. See [buildBolusPayload]. */
         private val BOLUS_PAYLOAD_LAYOUT = BolusPayloadLayout.UPSTREAM
 
@@ -1196,19 +1202,31 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
     fun startTbr(percent: Int, durationMinutes: Int, callback: (Boolean) -> Unit) {
         val char = charTbrStartStop
         if (char == null) {
+            log("startTbr: CHAR_TBR_START_STOP not found")
             callback(false)
             return
         }
 
-        val payload = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
+        val payload = tbrPayload(percent, durationMinutes)
+        log("Starting TBR: $percent% for ${durationMinutes}min")
+        writeCommandPayload(char, payload, "TBR", callback)
+    }
+
+    /**
+     * The 16-byte TBR payload: two GLB pairs, each value beside its own bitwise complement.
+     *
+     * Note that upstream sends this **without** a CRC while it sends the bolus payload **with** one
+     * — so the two command characteristics were already known to differ, and the envelope here is
+     * discovered rather than copied from the bolus (§4f). The percentage is an absolute figure:
+     * 25 means 25%, not 2500.
+     */
+    private fun tbrPayload(percent: Int, durationMinutes: Int): ByteArray =
+        ByteBuffer.allocate(TBR_PAYLOAD_BYTES).order(ByteOrder.LITTLE_ENDIAN)
             .putInt(percent)
             .putInt(percent.inv())
             .putInt(durationMinutes)
             .putInt(durationMinutes.inv())
             .array()
-
-        writeFramesSequentially(char, YpsoFraming.chunkPayload(payload), 0, callback)
-    }
 
     /**
      * Cancela la tasa basal temporal (TBR) activa y restablece la tasa basal normal.
@@ -1221,20 +1239,15 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
     fun cancelTbr(callback: (Boolean) -> Unit) {
         val char = charTbrStartStop
         if (char == null) {
+            log("cancelTbr: CHAR_TBR_START_STOP not found")
             callback(false)
             return
         }
 
-        val percent = 100
-        val duration = 0
-        val payload = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
-            .putInt(percent)
-            .putInt(percent.inv())
-            .putInt(duration)
-            .putInt(duration.inv())
-            .array()
-
-        writeFramesSequentially(char, YpsoFraming.chunkPayload(payload), 0, callback)
+        // 100% for 0 minutes is this pump's "no temporary basal" — the same value byte 10 of the
+        // system status reads when none is running, which is what makes the cancel confirmable.
+        log("Cancelling TBR (100% for 0min)")
+        writeCommandPayload(char, tbrPayload(TBR_PERCENT_NONE, 0), "TBR cancel", callback)
     }
 
     // ==================== SETTINGS ====================

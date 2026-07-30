@@ -56,15 +56,16 @@ import javax.inject.Singleton
  * Shaped on `MedtrumPlugin`: the plugin binds [YpsoService] and forwards to it; the service owns
  * the connection. See [YpsoService] for why there is no delivery path in this build.
  *
- * **Saline test build.** Two things reach the pump: the clock, via [YpsoSyncTimeCommand], and a
- * **standard bolus**, via [deliverTreatment]. Everything else that would move insulin or change
- * pump configuration — temporary basal, extended bolus, basal profile — still returns a failed
- * [PumpEnactResult] without contacting the pump. Those are overridden individually rather than
- * left to a default, so that "does nothing" is visible at each call site and enabling one has to
- * be a deliberate act with its own hardware test.
+ * **Saline test build.** Three things reach the pump: the clock via [YpsoSyncTimeCommand], a
+ * **standard bolus** via [deliverTreatment], and a **temporary basal** via [setTempBasalPercent] /
+ * [setTempBasalAbsolute] / [cancelTempBasal]. The extended bolus and the basal profile write still
+ * return a failed [PumpEnactResult] without contacting the pump, and are overridden individually
+ * rather than left to a default so that "does nothing" is visible at each call site and enabling
+ * one has to be a deliberate act with its own hardware test.
  *
- * The bolus path reports the amount the **pump** says it delivered, never the amount asked for,
- * and `success` is true only when the two agree.
+ * Nothing here reports success on the strength of a write. The bolus reports the amount the **pump**
+ * says it delivered, and the temporary basal reports what byte 10 of the pump's status reads back —
+ * in both cases `success` means the pump confirmed the effect, not that the command was accepted.
  */
 @Singleton
 class YpsoPlugin @Inject constructor(
@@ -179,7 +180,7 @@ class YpsoPlugin @Inject constructor(
         append("Firmware: ${ypsoPump.firmwareVersion.ifBlank { "?" }}")
         if (!veryShort) {
             append("\nMode: ${ypsoPump.deliveryModeName.ifBlank { "?" }}")
-            append("\nSaline test build: bolus only")
+            append("\nSaline test build: bolus + temp basal")
         }
     }
 
@@ -264,23 +265,85 @@ class YpsoPlugin @Inject constructor(
         ypsoService?.stopBolus()
     }
 
+    /**
+     * Converts an absolute rate to the percentage the pump works in, then sets it.
+     *
+     * **Divided by the rate the pump is programmed to run, not the AAPS profile's.** The pump
+     * applies the percentage to its own basal program, so if the two disagree — and they do until a
+     * profile write exists, which is why [isThisProfileSet] returns false — converting against the
+     * AAPS profile would ask for one rate and get another. `baseBasalRate` is read from the pump.
+     *
+     * ⚠ A percentage is only correct for the basal block it was computed in. When the pump crosses
+     * into an hour with a different programmed rate, the same percentage becomes a different
+     * absolute rate. That is inherent to a percent-only pump and cannot be fixed here; AAPS
+     * re-evaluates each loop iteration, which is what limits the exposure.
+     */
+    @Synchronized
     override fun setTempBasalAbsolute(
         absoluteRate: Double,
         durationInMinutes: Int,
         profile: Profile,
         enforceNew: Boolean,
         tbrType: PumpSync.TemporaryBasalType
-    ): PumpEnactResult = notImplemented("setTempBasalAbsolute($absoluteRate U/h, ${durationInMinutes}min)")
+    ): PumpEnactResult {
+        val result = pumpEnactResultProvider.get()
+        if (!isInitialized() || ypsoService == null) {
+            return result.success(false).enacted(false).comment(rh.gs(R.string.ypso_bolus_not_connected))
+        }
 
+        val pumpBase = baseBasalRate
+        if (pumpBase <= 0.0) {
+            // Without the pump's own rate there is no divisor, and guessing one would ask for a
+            // rate nobody chose. 0.0 means the profile has not been read yet.
+            aapsLogger.error(LTag.PUMP, "setTempBasalAbsolute refused: the pump's base rate is not known yet")
+            return result.success(false).enacted(false).comment(rh.gs(R.string.ypso_tbr_no_base_rate))
+        }
+
+        val percent = Math.round(absoluteRate / pumpBase * 100.0).toInt()
+        aapsLogger.info(
+            LTag.PUMP,
+            "setTempBasalAbsolute: ${absoluteRate}U/h against the pump's ${pumpBase}U/h = $percent% for ${durationInMinutes}min"
+        )
+        return setTempBasalPercent(percent, durationInMinutes, profile, enforceNew, tbrType)
+    }
+
+    @Synchronized
     override fun setTempBasalPercent(
         percent: Int,
         durationInMinutes: Int,
         profile: Profile,
         enforceNew: Boolean,
         tbrType: PumpSync.TemporaryBasalType
-    ): PumpEnactResult = notImplemented("setTempBasalPercent($percent%, ${durationInMinutes}min)")
+    ): PumpEnactResult {
+        val result = pumpEnactResultProvider.get()
+        val service = ypsoService
+        if (!isInitialized() || service == null) {
+            return result.success(false).enacted(false).comment(rh.gs(R.string.ypso_bolus_not_connected))
+        }
 
-    override fun cancelTempBasal(enforceNew: Boolean): PumpEnactResult = notImplemented("cancelTempBasal")
+        val outcome = service.setTempBasalPercent(percent, durationInMinutes, tbrType)
+        result.success(outcome.confirmed).enacted(outcome.confirmed)
+        result.percent = outcome.percentage
+        result.duration = outcome.durationMinutes
+        result.isPercent = true
+        result.comment(outcome.errorMessage ?: rh.gs(app.aaps.core.ui.R.string.ok))
+        return result
+    }
+
+    @Synchronized
+    override fun cancelTempBasal(enforceNew: Boolean): PumpEnactResult {
+        val result = pumpEnactResultProvider.get()
+        val service = ypsoService
+        if (!isInitialized() || service == null) {
+            return result.success(false).enacted(false).comment(rh.gs(R.string.ypso_bolus_not_connected))
+        }
+
+        val outcome = service.cancelTempBasal()
+        result.success(outcome.confirmed).enacted(outcome.confirmed)
+        result.isTempCancel = true
+        result.comment(outcome.errorMessage ?: rh.gs(app.aaps.core.ui.R.string.ok))
+        return result
+    }
 
     override fun setExtendedBolus(insulin: Double, durationInMinutes: Int): PumpEnactResult =
         notImplemented("setExtendedBolus(${insulin}U, ${durationInMinutes}min)")
