@@ -130,9 +130,18 @@ class YpsoPumpManagerImpl private constructor(
         private const val BOLUS_HISTORY_RETRY_MS = 2_000L
 
         /**
-         * Event types a standard bolus can produce. `2` completed and `29` aborted are the two that
-         * settle the outcome; `19` means still running, which is worth recognising so a slow pump is
-         * not mistaken for one that logged nothing.
+         * Cap on how many alert entries one check will fetch. A pump that has been offline for a
+         * long time can come back with a large jump in the count, and reading hundreds of entries
+         * would stall the status poll for minutes; the newest few are what matter.
+         */
+        private const val MAX_NEW_ALERTS_PER_CHECK = 5
+
+        /**
+         * Event types a standard bolus can produce. `2` settles the outcome and carries the amount
+         * — including for a bolus stopped from AAPS, which this pump logs as type 2 with the
+         * partial rather than as type 29. `29` and `19` are listed because the firmware may use
+         * them in cases not yet seen, and missing the entry entirely is worse than matching a type
+         * that never appears.
          */
         private val STANDARD_BOLUS_TYPES = setOf(
             EventType.BOLUS_IMMEDIATE,
@@ -429,7 +438,70 @@ class YpsoPumpManagerImpl private constructor(
         // pump's clock has drifted before anyone asks for it to be written.
         _pumpClockSkewMs.value = suspendReadClock()?.let { it.epochMillis() - System.currentTimeMillis() }
 
+        checkForNewAlerts()
+
         _pumpStatus.value!!
+    }
+
+    // ==================== ALARMS ====================
+
+    /**
+     * Alerts the pump has raised since the last status read.
+     *
+     * An occlusion means insulin is not reaching the patient, and during phase 2 one stopped the
+     * pump without AAPS learning anything at all — the alert sat in the pump's log, and the log is
+     * only read on request. This turns the pump's alert log into something AAPS is told about.
+     */
+    private val _newAlerts = MutableSharedFlow<PumpHistoryEvent.Alert>(replay = 0, extraBufferCapacity = 8)
+    val newAlerts: SharedFlow<PumpHistoryEvent.Alert> = _newAlerts
+
+    /**
+     * Entries in the pump's alert log as of the last check; -1 means "not yet known".
+     *
+     * The caller seeds this from storage so a restart does not re-announce alarms already seen,
+     * and so the very first check establishes a baseline rather than firing for every occlusion in
+     * the pump's two-year history.
+     */
+    var lastKnownAlertCount: Int = -1
+        private set
+
+    fun seedAlertBaseline(count: Int) {
+        lastKnownAlertCount = count
+    }
+
+    /**
+     * Notices new alerts cheaply: one GLB read of the alert *count* per status poll, and entries
+     * are only fetched when that count has actually moved. Reading the entries every time would
+     * roughly double the cost of a status read for something that changes very rarely.
+     */
+    private suspend fun checkForNewAlerts() {
+        val count = suspendReadAlertsCount() ?: return
+        val previous = lastKnownAlertCount
+        lastKnownAlertCount = count
+
+        if (previous < 0) {
+            log("Alert log has $count entries; taking that as the baseline")
+            return
+        }
+        if (count <= previous) return
+
+        val fresh = (count - previous).coerceAtMost(MAX_NEW_ALERTS_PER_CHECK)
+        log("Pump alert log grew from $previous to $count — reading the $fresh newest")
+
+        suspendReadHistoryAlerts(fresh)
+            .sortedBy { it.sequence }
+            .forEach { entry ->
+                val alert = PumpHistoryEvent.Alert(
+                    entry.entryType,
+                    entry.entryTypeName,
+                    entry.timestamp * 1000L,
+                    entry.sequence
+                )
+                log("PUMP ALERT: ${entry.entryTypeName} (type ${entry.entryType}, seq ${entry.sequence})")
+                _newAlerts.tryEmit(alert)
+                emitEvent(PumpEvent.Occlusion(entry.entryTypeName).takeIf { entry.entryType == EventType.A_OCCLUSION }
+                    ?: PumpEvent.DeliveryStopped(entry.entryTypeName))
+            }
     }
 
     // ==================== BASAL PROFILES ====================
@@ -586,7 +658,45 @@ class YpsoPumpManagerImpl private constructor(
      * runs. A disagreement means the payload was misparsed and the wrong dose is on its way, so it
      * is cancelled immediately. That catches a wrong payload *layout*, which a length check cannot.
      */
-    override suspend fun deliverStandardBolus(amount: Double): BolusDeliveryResult = withConnection {
+    /**
+     * A delivery as the pump's own event log describes it.
+     *
+     * [pumpSequence] is the identity the bolus is stored under, and it is deliberately the same
+     * sequence number `readHistory` puts in `PumpHistoryEvent.position`. That is what lets a bolus
+     * recorded at delivery time and the same bolus seen later by a history sync be recognised as
+     * one event rather than two — the entanglement §8 warned about, resolved by both paths naming
+     * the event the way the pump names it.
+     *
+     * Null when the log did not confirm the bolus, in which case nothing may be recorded: an
+     * invented identity is worse than a missing record, because it cannot be reconciled later.
+     */
+    data class ConfirmedBolus(
+        val requestedUnits: Double,
+        val deliveredUnits: Double,
+        val pumpSequence: Long?,
+        val timestampMillis: Long?,
+        val complete: Boolean,
+        val errorMessage: String?
+    )
+
+    override suspend fun deliverStandardBolus(amount: Double): BolusDeliveryResult =
+        deliverBolusConfirmed(amount).let {
+            BolusDeliveryResult(
+                success = it.complete,
+                errorMessage = it.errorMessage,
+                deliveredUnits = it.deliveredUnits.toFloat(),
+                requestedUnits = amount.toFloat()
+            )
+        }
+
+    /**
+     * Delivers a standard bolus and reports it as the pump's log describes it.
+     *
+     * Preferred over [deliverStandardBolus] inside this driver: it keeps the amount in `Double`
+     * (the pump's figure is exact centi-units, and squeezing it through a `Float` turns 1.82 into
+     * 1.8200000524520874) and it carries the sequence number needed to record the bolus.
+     */
+    suspend fun deliverBolusConfirmed(amount: Double): ConfirmedBolus = withConnection {
         if (amount <= 0.0) {
             return@withConnection bolusFailure(amount, "Bolus amount must be greater than zero")
         }
@@ -665,7 +775,7 @@ class YpsoPumpManagerImpl private constructor(
         val record = findBolusRecord(baselineSequence)
         val outcome = bolusOutcome(amount, record, progressSeen, mismatch)
         _bolusProgress.value = BolusProgress(
-            outcome.deliveredUnits?.toDouble() ?: progressSeen,
+            outcome.deliveredUnits,
             amount,
             finished = true,
             cancelled = outcome.errorMessage != null
@@ -685,19 +795,21 @@ class YpsoPumpManagerImpl private constructor(
         record: HistoryEntry?,
         progressSeen: Double,
         mismatch: String?
-    ): BolusDeliveryResult {
+    ): ConfirmedBolus {
         if (record == null) {
             // Nothing in the log. It may still have been delivered and simply not logged yet, so
             // this must not be reported as "nothing happened" — the honest answer is that the
             // amount is unknown and the pump has to be looked at.
             val floor = if (progressSeen > 0.0) " The pump reported at least $progressSeen U before the log was read." else ""
             log("Bolus NOT CONFIRMED: no new bolus entry in the pump's event log.$floor")
-            return BolusDeliveryResult(
-                success = false,
+            return ConfirmedBolus(
+                requestedUnits = amount,
+                deliveredUnits = progressSeen,
+                pumpSequence = null,
+                timestampMillis = null,
+                complete = false,
                 errorMessage = "Not confirmed: the pump's log shows no bolus for this request. " +
-                    "Check the pump before bolusing again.$floor",
-                deliveredUnits = progressSeen.takeIf { it > 0.0 }?.toFloat(),
-                requestedUnits = amount.toFloat()
+                    "Check the pump before bolusing again.$floor"
             )
         }
 
@@ -724,11 +836,13 @@ class YpsoPumpManagerImpl private constructor(
                 (error?.let { " — $it" } ?: "")
         )
 
-        return BolusDeliveryResult(
-            success = complete,
-            errorMessage = error,
-            deliveredUnits = delivered.toFloat(),
-            requestedUnits = amount.toFloat()
+        return ConfirmedBolus(
+            requestedUnits = amount,
+            deliveredUnits = delivered,
+            pumpSequence = record.sequence,
+            timestampMillis = record.timestamp * 1000L,
+            complete = complete,
+            errorMessage = error
         )
     }
 
@@ -777,13 +891,15 @@ class YpsoPumpManagerImpl private constructor(
         return sent
     }
 
-    private fun bolusFailure(amount: Double, reason: String): BolusDeliveryResult {
+    private fun bolusFailure(amount: Double, reason: String): ConfirmedBolus {
         log("Bolus refused: $reason")
-        return BolusDeliveryResult(
-            success = false,
-            errorMessage = reason,
-            deliveredUnits = 0f,
-            requestedUnits = amount.toFloat()
+        return ConfirmedBolus(
+            requestedUnits = amount,
+            deliveredUnits = 0.0,
+            pumpSequence = null,
+            timestampMillis = null,
+            complete = false,
+            errorMessage = reason
         )
     }
 
@@ -876,6 +992,12 @@ class YpsoPumpManagerImpl private constructor(
     private suspend fun suspendReadHistoryEvents(maxEntries: Int): List<HistoryEntry> =
         suspendCancellableCoroutine { cont -> bleManager.readHistoryEvents(maxEntries) { cont.resume(it) } }
 
+    private suspend fun suspendReadHistoryAlerts(maxEntries: Int): List<HistoryEntry> =
+        suspendCancellableCoroutine { cont -> bleManager.readHistoryAlerts(maxEntries) { cont.resume(it) } }
+
+    private suspend fun suspendReadAlertsCount(): Int? =
+        suspendCancellableCoroutine { cont -> bleManager.readHistoryAlertsCount { cont.resume(it) } }
+
     // ==================== INTERNAL ====================
 
     private fun updateStatusFromSystem(status: SystemStatusData) {
@@ -903,9 +1025,9 @@ class YpsoPumpManagerImpl private constructor(
 
     private suspend fun readPumpInfo() {
         suspendCancellableCoroutine<String?> { cont -> bleManager.readDeviceName { cont.resume(it) } }
-            ?.let { _pumpStatus.value = (_pumpStatus.value ?: PumpStatus()).copy(serialNumber = it) }
+            ?.let { _pumpStatus.value = (_pumpStatus.value ?: PumpStatus()).copy(serialNumber = it.cleanBleString()) }
         suspendCancellableCoroutine<String?> { cont -> bleManager.readManufacturer { cont.resume(it) } }
-            ?.let { _pumpStatus.value = (_pumpStatus.value ?: PumpStatus()).copy(manufacturer = it) }
+            ?.let { _pumpStatus.value = (_pumpStatus.value ?: PumpStatus()).copy(manufacturer = it.cleanBleString()) }
         suspendCancellableCoroutine<String?> { cont -> bleManager.readSoftwareRevision { cont.resume(it) } }
             ?.let { _pumpStatus.value = (_pumpStatus.value ?: PumpStatus()).copy(firmwareVersion = it) }
     }
@@ -923,6 +1045,16 @@ class YpsoPumpManagerImpl private constructor(
         } else {
             ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         }
+
+    /**
+     * Strips the NUL terminator the pump leaves on its string characteristics.
+     *
+     * `getStringValue` hands back the terminator as part of the value, so the serial arrived as
+     * `10074292`. Cosmetic on screen, but this string becomes `pumpSerial` on every
+     * `PumpSync` call — and a serial that differs by an invisible byte would split records between
+     * two apparent pumps.
+     */
+    private fun String.cleanBleString(): String = trim { it.code <= 0x20 }
 
     private fun log(message: String) {
         Log.d(TAG, message)

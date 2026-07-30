@@ -61,6 +61,8 @@
     <string name="ypso_clock_set_failed">Pump clock NOT confirmed. Check the clock on the pump itself and read the log before trying again.</string>
 
     <string name="ypso_bolus_not_connected">Pump not connected — no bolus was sent</string>
+    <string name="ypso_bolus_failed">Bolus failed — the pump did not confirm any delivery</string>
+    <string name="ypso_pump_alert">YpsoPump: %1$s</string>
     <string name="ypso_bolus_over_pump_max">Bolus of %1$.2f U exceeds the pump maximum of %2$.2f U</string>
 
     <string name="ypso_bolus_speed_title">Bolus speed</string>

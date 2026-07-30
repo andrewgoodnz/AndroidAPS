@@ -8,7 +8,9 @@ import app.aaps.core.data.model.TE
 import app.aaps.core.data.pump.defs.PumpType
 import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.logging.LTag
+import app.aaps.core.interfaces.notifications.Notification
 import app.aaps.core.interfaces.pump.BolusProgressData
+import app.aaps.core.interfaces.pump.DetailedBolusInfo
 import app.aaps.core.interfaces.pump.PumpSync
 import app.aaps.core.interfaces.resources.ResourceHelper
 import app.aaps.core.interfaces.rx.AapsSchedulers
@@ -17,6 +19,7 @@ import app.aaps.core.interfaces.rx.events.EventAppExit
 import app.aaps.core.interfaces.rx.events.EventOverviewBolusProgress
 import app.aaps.core.interfaces.rx.events.EventPreferenceChange
 import app.aaps.core.interfaces.rx.events.EventPumpStatusChanged
+import app.aaps.core.interfaces.ui.UiInteraction
 import app.aaps.core.interfaces.utils.DateUtil
 import app.aaps.core.interfaces.utils.fabric.FabricPrivacy
 import app.aaps.core.keys.interfaces.Preferences
@@ -26,8 +29,8 @@ import app.aaps.pump.ypso.events.EventYpsoPumpDataChanged
 import app.aaps.pump.ypso.events.EventYpsoPumpDeviceChanged
 import app.aaps.pump.ypso.keys.YpsoBooleanKey
 import app.aaps.pump.ypso.keys.YpsoIntKey
+import app.aaps.pump.ypso.keys.YpsoIntNonKey
 import app.aaps.pump.ypso.keys.YpsoStringKey
-import com.pump.common.BolusDeliveryResult
 import com.pump.common.PumpConnectionState
 import com.pump.common.PumpHistoryEvent
 import com.ypsopump.sdk.YpsoEventTypes
@@ -74,6 +77,7 @@ class YpsoService : DaggerService() {
     @Inject lateinit var pumpSync: PumpSync
     @Inject lateinit var dateUtil: DateUtil
     @Inject lateinit var fabricPrivacy: FabricPrivacy
+    @Inject lateinit var uiInteraction: UiInteraction
 
     private val binder: IBinder = LocalBinder()
     private val disposable = CompositeDisposable()
@@ -169,6 +173,39 @@ class YpsoService : DaggerService() {
                 rxBus.send(EventOverviewBolusProgress(rh, progress.deliveredUnits))
             }
         }
+
+        // Alerts the pump has raised since the last status read. An occlusion means insulin is not
+        // reaching the patient, and during phase 2 one stopped the pump with AAPS none the wiser —
+        // the alert sat in a log nobody reads unless asked.
+        pumpManager.seedAlertBaseline(preferences.get(YpsoIntNonKey.LastAlertCount))
+        scope.launch {
+            pumpManager.newAlerts.collect { alert -> raisePumpAlert(alert) }
+        }
+    }
+
+    /**
+     * Puts a pump alert in front of the user.
+     *
+     * Occlusions are [Notification.URGENT] with a sound: the pump has stopped and insulin is not
+     * being delivered, which is not something to discover at the next glance at the phone.
+     * Everything else the pump logs as an alert is still worth saying, at a lower level.
+     */
+    private fun raisePumpAlert(alert: PumpHistoryEvent.Alert) {
+        val urgent = alert.code in URGENT_ALERT_CODES
+        val text = rh.gs(R.string.ypso_pump_alert, alert.message)
+        aapsLogger.warn(LTag.PUMP, "Pump alert ${alert.code} (${alert.message}), urgent=$urgent")
+
+        if (urgent) {
+            uiInteraction.addNotificationWithSound(
+                Notification.PUMP_ERROR, text, Notification.URGENT, app.aaps.core.ui.R.raw.alarm
+            )
+        } else {
+            uiInteraction.addNotification(Notification.PUMP_WARNING, text, Notification.NORMAL)
+        }
+
+        // Remember how far through the alert log we have got, so a restart does not re-announce
+        // alarms the user has already been shown.
+        preferences.put(YpsoIntNonKey.LastAlertCount, pumpManager.lastKnownAlertCount)
     }
 
     override fun onDestroy() {
@@ -337,32 +374,84 @@ class YpsoService : DaggerService() {
     }
 
     /**
-     * Delivers a standard bolus and reports what the **pump** says went in.
+     * Delivers a standard bolus, reports what the **pump** says went in, and records it.
      *
-     * Saline testing note: this deliberately writes **nothing to `PumpSync`**. During phase 2 the
-     * pump is on saline and off-body, so a treatment record would be a lie in the therapy log.
-     * Recording boluses is part of enabling [YpsoBooleanKey.YpsoSyncHistoryToAaps], which is its
-     * own gate — and doing it here as well would need a `pumpId` scheme that agrees with the
-     * sequence numbers history sync uses, or the two would duplicate every bolus.
+     * The treatment is recorded under the **pump's own sequence number** for the bolus, which is
+     * the same identity `readHistory` puts in `PumpHistoryEvent.position`. That is what stops this
+     * record and a later history sync of the same bolus becoming two boluses — the two paths name
+     * the event the way the pump names it, so `syncBolusWithPumpId` recognises them as one.
+     *
+     * A bolus the pump's log did not confirm has no sequence number and is **not recorded**. An
+     * invented identity would be worse than a missing record, because nothing could reconcile it
+     * afterwards; the failure is reported loudly instead.
+     *
+     * A partial delivery — stopped by the user, or cut short by the pump — **is** recorded, for the
+     * amount that actually went in. That is the case where not recording would corrupt IOB.
      */
-    fun deliverBolus(insulin: Double): BolusDeliveryResult =
-        awaitResult("deliverBolus", BolusDeliveryResult(success = false, errorMessage = "Bolus failed", deliveredUnits = 0f)) {
+    fun deliverBolus(detailedBolusInfo: DetailedBolusInfo): YpsoPumpManagerImpl.ConfirmedBolus {
+        val insulin = detailedBolusInfo.insulin
+        val failed = YpsoPumpManagerImpl.ConfirmedBolus(
+            requestedUnits = insulin,
+            deliveredUnits = 0.0,
+            pumpSequence = null,
+            timestampMillis = null,
+            complete = false,
+            errorMessage = rh.gs(R.string.ypso_bolus_failed)
+        )
+
+        return awaitResult("deliverBolus", failed) {
             pumpManager.bolusSpeedUnitsPerMinute = configuredBolusSpeedUnitsPerMinute()
-            val result = pumpManager.deliverStandardBolus(insulin)
+            val result = pumpManager.deliverBolusConfirmed(insulin)
             aapsLogger.info(
                 LTag.PUMP,
-                "deliverBolus: asked ${insulin}U, pump delivered ${result.deliveredUnits}U, success=${result.success}" +
-                    (result.errorMessage?.let { ", $it" } ?: "")
+                "deliverBolus: asked ${insulin}U, pump delivered ${result.deliveredUnits}U, " +
+                    "success=${result.complete}" + (result.errorMessage?.let { ", $it" } ?: "")
             )
-            result.deliveredUnits?.let { delivered ->
-                if (delivered > 0f) {
-                    ypsoPump.lastBolusAmount = delivered.toDouble()
-                    ypsoPump.lastBolusTime = dateUtil.now()
-                }
+
+            if (result.deliveredUnits > 0.0) {
+                ypsoPump.lastBolusAmount = result.deliveredUnits
+                ypsoPump.lastBolusTime = result.timestampMillis ?: dateUtil.now()
             }
+            recordBolus(detailedBolusInfo, result)
+
             rxBus.send(EventYpsoPumpDataChanged())
             result
         }
+    }
+
+    private fun recordBolus(detailedBolusInfo: DetailedBolusInfo, result: YpsoPumpManagerImpl.ConfirmedBolus) {
+        val sequence = result.pumpSequence
+        if (sequence == null || result.deliveredUnits <= 0.0) {
+            aapsLogger.warn(
+                LTag.PUMP,
+                "Not recording a treatment: " +
+                    if (sequence == null) "the pump's log did not confirm this bolus, so it has no stable id"
+                    else "the pump delivered nothing"
+            )
+            return
+        }
+
+        val synced = pumpSync.syncBolusWithPumpId(
+            timestamp = result.timestampMillis ?: dateUtil.now(),
+            amount = result.deliveredUnits,
+            type = detailedBolusInfo.bolusType,
+            pumpId = sequence,
+            pumpType = PumpType.YPSOPUMP,
+            pumpSerial = pumpSerial()
+        )
+        aapsLogger.info(
+            LTag.PUMP,
+            "Recorded ${result.deliveredUnits}U under pumpId=$sequence (the pump's own sequence), new=$synced"
+        )
+    }
+
+    /**
+     * Identity used for every `PumpSync` call. Trimmed, because the pump's device-name
+     * characteristic used to hand back a NUL terminator and a serial differing by an invisible
+     * byte would split records between two apparent pumps.
+     */
+    private fun pumpSerial(): String =
+        ypsoPump.serialNumber.trim { it.code <= 0x20 }.ifBlank { ypsoPump.pumpMac }
 
     /**
      * Asks the pump to stop the running bolus.
@@ -497,5 +586,18 @@ class YpsoService : DaggerService() {
     companion object {
 
         private const val YPSOPUMP_NAME_PREFIX = "YpsoPump_"
+
+        /**
+         * Alert codes that mean insulin is not being delivered. These get an urgent, audible
+         * notification; the rest of the pump's alerts are informational by comparison.
+         */
+        private val URGENT_ALERT_CODES = setOf(
+            YpsoEventTypes.A_OCCLUSION,
+            YpsoEventTypes.A_CARTRIDGE_EMPTY,
+            YpsoEventTypes.A_NO_CARTRIDGE,
+            YpsoEventTypes.A_AUTO_STOP,
+            YpsoEventTypes.A_BATTERY_EMPTY,
+            YpsoEventTypes.A_REUSABLE_ERROR
+        )
     }
 }
