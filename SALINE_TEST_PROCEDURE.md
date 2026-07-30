@@ -9,7 +9,8 @@ As of 2026-07-31, **all four phases have passed on hardware.** What is left:
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
-| 1 | **The alarm notification** | Pull the cartridge. An occlusion means insulin has stopped and AAPS must not miss it. Note a low reservoir is **not** one of these — see `PORTING_NOTES` §4g | Outstanding test |
+| 0 | **Re-run: 4 U bolus, cancelled on the pump** | It recorded 4.0 U against ~2.5 U delivered. Fixed 2026-07-31; only this test proves it | `PORTING_NOTES` §4f |
+| 1 | **The alarm notification — by occlusion, not by pulling the cartridge** | Removing the cartridge raises nothing: it is a deliberate procedure that stops the pump first. Clamp the line while it delivers. A low reservoir is **not** a pump alert either — §4g | Outstanding test |
 | 2 | **Restore a profile you care about** | A write you cannot reverse is not finished. Untested only in the sense that nothing has needed it | 4g |
 | 3 | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
 | 4 | **Reconnect mid-bolus** | Pull BLE range during delivery. The bolus is confirmed from history, so it *should* resolve on reconnect | — |

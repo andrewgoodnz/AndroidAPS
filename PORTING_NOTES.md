@@ -514,6 +514,17 @@ treats a type-19 match as *not yet an answer* and re-reads until the entry settl
 settles the entry is still returned, but `bolusOutcome` refuses to call it complete at any value and
 says plainly that the figure is the request rather than the delivery. Tests pin both.
 
+**[verified] The entry did settle, and to the right number.** A history dump 19 minutes later:
+
+```
+idx=0  seq=160492  type=2(Bolus Immediate)  v1=249   → 2.49 U
+```
+
+Same sequence, now type 2, `v1` rewritten from `400` to `249`. The reservoir fell 16.90 → 14.34 U
+across the bolus and the basal either side of it, which agrees. **Waiting was all that was needed** —
+the correct answer was going to be there, and the driver read the entry a second and a half too
+early and then reported the wrong number as a success.
+
 **The general rule this pump keeps teaching, now in a third place:** an entry that is still being
 written is not evidence, and "not the state I was waiting for" is not the same as "the state I was
 waiting for has passed". Clock, TBR and bolus have each produced one variant of it.
@@ -741,6 +752,15 @@ Two entries for a write that set all 24 slots, because only two slots held anyth
 basal-profile-changed entry cannot be used as the confirmation that a write happened — a write that
 changes nothing logs nothing. The read-back diff is the confirmation, which is what the code uses.
 
+Confirmed at scale by a 50-entry dump: a write that genuinely changed all 24 slots produced **24
+consecutive type-7 entries**, `seq=160465…160488`, slots 0–23 in order, each carrying its own before
+and after (`v1=10 v2=100 v3=120` — slot 10, 1.20 → 1.00). Single-slot edits produced exactly one
+entry each (`v1=18 v2=124 v3=116`, `v1=6 v2=124 v3=40`, `v1=2 v2=2 v3=20`). The write is slot-precise
+in the pump's own record, not merely in the read-back.
+
+Note the cost this implies for a history sync: **one profile write can add 24 entries**, which is
+half the default 50-entry read window. Any `sincePosition` scheme has to cope with a burst that size.
+
 **⚠ AAPS fires this write by itself.** `setNewBasalProfile` is called whenever `isThisProfileSet`
 returns false, so un-refusing it meant the most destructive command in the driver ran **15 seconds
 after the app started**, unattended, before the phase had been gated by a human. It behaved correctly
@@ -885,6 +905,26 @@ and it is the reason the sync switch was gated off rather than shipped on.
 |---|---|---|---|---|
 | events | 3000 | 2950–2999 (old code) | 156828–156880 | 2026-03-14 → 03-15 |
 | alerts | 142 | 92–141 (old code) | 392–67766 | 2024-06-11 → 2025-02-28 |
+
+⚠ **Both rows are the *oldest* slots**, because they were captured before the index direction was
+corrected. They say nothing about what is at the top of either log, and reading the alert row as
+"the newest alert is from 2025" is what later cast unwarranted doubt on the alert feature (§8.2).
+
+### ⚠ [verified] Events and alerts share one sequence counter
+
+The 2026-07-31 dump read both logs newest-first, and the two interleave in one space:
+
+| | newest sequences |
+|---|---|
+| events | …160462, 160463, …160492 |
+| alerts | 160319, 160350 |
+
+Alert `160350` sits *between* event sequences. So `position` is unique across **both** logs, not just
+within one, and a single monotonic watermark is enough for `sincePosition` (§8.5) — no per-log
+bookkeeping and no risk of an alert and an event colliding on an id in `PumpSync`.
+
+It also means the two logs are windows onto one journal, which is consistent with the alert count
+moving only when an alert is appended while events keep their own count of 3000.
 
 ### ⚠ The epoch was "verified" by a check that could not fail
 
@@ -1120,36 +1160,44 @@ Three wire envelopes are established and, per the envelope table in §4, **each 
 characteristic, not of the firmware**: bolus is 13 B + CRC, TBR is 16 B bare, the clock and every GLB
 setting are bare. Discovery remains as a fallback for any characteristic not yet written.
 
-### 8.2 ⚠ The alert path has never been observed working, and the evidence for it is thinner than it looks
+### 8.2 [verified] The alert log does append — and removing the cartridge is not an alert
 
-This is the largest live gap, and it is worth stating precisely because an earlier revision of these
-notes over-claimed it.
+An earlier revision of this section over-claimed the alert feature; a later one over-corrected and
+doubted whether the log grew at all. A 50-entry dump on 2026-07-31 settles it.
 
-**What is actually proven:** `readHistoryCount(…fcbec83b7bc5)` returns a number, on every status poll.
-That is all.
+**The log appends, and the newest entries are the right ones.** Index 0 and 1 are the two occlusions
+from 2026-07-30 — the ones that stopped the pump during phase 2:
 
-**What is not proven:** that this pump ever *appends* to the alert log. The count has read **144 on
-every poll across two days**, including a session in which an occlusion physically stopped the pump.
-The one full dump of the alert log was taken with the **old code, which read the oldest slots** — the
-table in §5 showing alerts from 2024-06-11 → 2025-02-28 is therefore the *bottom* of the log, not the
-top. **The newest alert entry has never been read.** So "the newest alert is from 2025" is not a
-finding; it is an artefact of which end was read.
+```
+idx=0  seq=160350  type=105 (Alert: Occlusion)
+idx=1  seq=160319  type=105 (Alert: Occlusion)
+idx=2  seq=160207  type=100 (Alert: Battery Removed)
+idx=7  seq=153818  type=103 (Alert: No Cartridge)
+```
 
-**Removing the cartridge did not raise anything** (2026-07-31). A plausible explanation is that a
-cartridge change on this pump is a *user-initiated procedure* that stops the pump first, so there is
-no unexpected condition to alert on — but that is a hypothesis, not a finding.
+The doubt came from the one earlier dump having been taken with the **old code, which read the
+oldest slots** — the §5 table showing alerts ending 2025-02-28 is the *bottom* of the log, not the
+top. It was an artefact of which end was read, and it is now corrected.
 
-**The cheap decisive test, in this order:**
+**So the count-based detection is sound in principle, and simply has not been exercised**: the count
+has read 144 throughout because no *new* alert has occurred since the baseline was taken. The
+occlusions predate it.
 
-1. Press **Read history** and look at the alert entries it dumps. `readHistoryWithDump` reads both
-   logs, newest-first. If yesterday's occlusion is near index 0, the log works and only the *count*
-   needs to move. If the newest alert is still from 2025, this firmware does not append alerts and
-   the entire feature rests on a characteristic that never changes.
-2. Only then decide how to raise an alarm — from the delivery mode (§8.3) rather than the alert log,
-   if the log turns out to be inert.
+**⚠ [verified] Removing the cartridge does not raise an alert.** Index 0 is still the 07-30 occlusion
+afterwards. The pump can raise `103 No Cartridge` — index 7 is one — but a cartridge change made
+through the pump's own menu is a *user-initiated procedure that stops the pump first*, so there is no
+unexpected condition to report. **A deliberate action is not an alarm.** Any test of the notification
+branch has to create a condition the pump did not expect.
 
-Until step 1 is done, **do not describe pump alarms as covered.** And note §4g's separate finding:
-a low reservoir is not a pump alert at all, it is the controller doing arithmetic.
+**The reliable one is occlusion**, which this pump has raised repeatedly: clamp or kink the line while
+it is delivering. `105 Occlusion` is in the urgent set.
+
+Two caveats that bound what this feature can ever catch:
+
+- **A low reservoir is not a pump alert** (§4g). The mylife controller computes it on the phone; the
+  pump's count did not move. Nothing in the alert log will ever surface it.
+- **AAPS only polls when the command queue has work.** An alert raised while the driver is
+  disconnected is unseen until the next connection, and the latency of that is unmeasured (§8.4).
 
 ### 8.3 ⚠ The delivery-mode byte is mapped for two values out of 256
 
