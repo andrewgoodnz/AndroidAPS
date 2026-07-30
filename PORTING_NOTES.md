@@ -438,6 +438,56 @@ fallback in `readExtended` has to stay.
 nearer 25 U/min. It only affects the completion timeout, which is generous, so nothing is broken —
 but `YpsoBolusSpeed` should not be trusted as a rate until it is measured properly.
 
+### 4g. Recording a bolus, and raising the pump's alarms — **[verified]**
+
+**Boluses reach `PumpSync` under the pump's own sequence number.** That identity exists only
+because delivery already confirms from the event log (§4f), and it is deliberately the same one
+`readHistory` puts in `PumpHistoryEvent.position` — so a bolus recorded at delivery time and the
+same bolus seen later by a history sync resolve to **one** record rather than two. This is the
+entanglement §8 warned about, and it dissolves once both paths name the event the way the pump
+names it.
+
+Verified end to end on 2026-07-30:
+
+```
+baseline seq 160368 → confirmed seq=160369 type=2 v1=150 → 1.5 U, success=true
+Recorded 1.5U under pumpId=160369, new=true
+```
+
+with the treatment then visible on the AAPS home screen at the right time and IOB reading 1.50 U.
+
+Three rules, each chosen for a reason:
+
+- **Unconfirmed bolus → not recorded.** No log entry means no stable identity, and an invented one
+  is worse than a missing record because nothing could reconcile it afterwards.
+- **Partial delivery → recorded** for what actually went in. This is the case where *not* recording
+  corrupts IOB.
+- **Timestamp comes from the phone, not the pump.** See the epoch trap in §5. Even with that fixed,
+  making a treatment's time depend on the pump's clock being right is a poor trade when the phone
+  knows it exactly, and dedupe does not need it — `syncBolusWithPumpId` matches on `pumpId`.
+
+**The amount stays a `Double` end to end.** `BolusDeliveryResult.deliveredUnits` is a `Float`, and
+widening 1.82f gives 1.8200000524520874 — §4d's trap, on a figure that becomes a treatment record.
+`deliverBolusConfirmed` carries the `Double`, the sequence and the timestamp; the `PumpManager`
+contract method keeps the `Float` form for interface compliance only.
+
+**Pump alarms now reach AAPS.** An occlusion stopped the pump during phase 2 and AAPS learned
+nothing, because the alert log is only read on request. Each status poll now reads the alert
+**count** — one GLB read — and fetches entries only when it has moved, so noticing costs almost
+nothing for something that changes rarely. Occlusion, cartridge empty, no cartridge, auto-stop,
+battery empty and reusable error raise an urgent notification with sound; every one of them means
+insulin has stopped.
+
+The stored count is a **high-water mark of what the user has been told about**, persisted on every
+change rather than only when an alarm fires. That distinction is the whole feature: persist only on
+alarms and an alert arriving while AAPS is closed gets absorbed into a fresh baseline at the next
+start, which is precisely the moment AAPS could have said the pump had stopped.
+
+**Also fixed: the NUL terminator on the pump's string characteristics.** `getStringValue` returns
+it as part of the value, so the serial was stored as `10074292` plus `U+0000`. Invisible on screen,
+but it becomes `pumpSerial` on every `PumpSync` call, and a serial differing by one unprintable byte
+would split records across two apparent pumps.
+
 ### What is read, and what was verified
 
 | Value | Source | Status |
@@ -555,8 +605,41 @@ and it is the reason the sync switch was gated off rather than shipped on.
 | events | 3000 | 2950–2999 (old code) | 156828–156880 | 2026-03-14 → 03-15 |
 | alerts | 142 | 92–141 (old code) | 392–67766 | 2024-06-11 → 2025-02-28 |
 
-**[verified] The 2000-01-01 epoch is right.** Converted timestamps land on plausible real dates
-across a two-year span, so `HistoryEntry.parse`'s offset is correct.
+### ⚠ The epoch was "verified" by a check that could not fail
+
+An earlier revision of this section said: *"[verified] The 2000-01-01 epoch is right. Converted
+timestamps land on plausible real dates across a two-year span."* **That was wrong, and the
+verification was worthless** — not weak, but incapable of failing.
+
+The pump counts **local wall-clock seconds** since 2000-01-01, not seconds since 2000-01-01 UTC.
+It has no concept of a time zone: `syncTime` writes local hour, minute and second into it. Adding
+the UTC epoch offset therefore produced the *right wall-clock reading attached to the wrong
+instant*, out by the local offset — 12 hours in New Zealand.
+
+And that is exactly why the check passed. A local counter read as UTC hands the original wall time
+straight back, so comparing "the entry says 21:58" against "the bolus was at 21:58" agrees no matter
+how wrong the instant is. Both the plausible-dates check and the matched-actions table below
+compared **wall-clock readings**, and neither could have detected this.
+
+The proof, from a capture already in this file: the 1.5 U bolus delivered at 21:58 local logged
+`ts=1785362330`, which under the old arithmetic decodes to 2026-07-29 **21:58:50 UTC**.
+
+**What finally caught it was a consumer that cares about the instant.** A bolus recorded at one of
+these timestamps landed 12 hours in the future, showed nowhere in AAPS and produced no IOB, while
+the delivery itself reported success because the *amount* had been confirmed.
+
+`HistoryEntry.pumpSecondsToUnix` now converts through a local calendar rather than adding a
+constant, which is also correct across daylight saving — the pump's epoch falls in NZDT while July
+is NZST, so a fixed offset would be wrong half the year. Two tests pin it, one of them built with
+`LocalDateTime` arithmetic because subtracting two instants across a DST boundary is itself an hour
+out and would have quietly agreed with the wrong answer.
+
+**The lesson worth keeping:** matching a wall-clock reading proves nothing about an instant. To
+verify a timestamp decode, check it against something that consumes the instant — IOB, a graph
+position, an interval — not against how the time reads.
+
+**The times quoted in the tables below are still correct as wall-clock readings**, which is what
+they were used for. They are not correct as UTC instants.
 
 **[verified] The corrected read returns today's activity, matched against known actions.**
 After fitting a cartridge and starting the pump, the read returned:
@@ -739,29 +822,21 @@ Firmware confirmed **V05.02.03**.
 
 ## 8. What remains before insulin
 
-Two of the four items this section used to list are now settled and have been struck: the
-status bytes are fully mapped (§4, including byte 10 as TBR percent), and the history mapping is
-verified against actions performed on the pump (§5). What is left is the write path, and it is
-gated one step at a time by `SALINE_TEST_PROCEDURE.md`.
+**Done and verified on hardware, 2026-07-30:** the clock write (§4e), the standard bolus with abort
+(§4f), recording boluses into `PumpSync` and raising the pump's alarms (§4g). The status bytes were
+already fully mapped (§4) and the history mapping verified against actions on the pump (§5).
 
-**Phases 1 and 2 are done.** ✅ Both passed on hardware on 2026-07-30 — the clock write (§4e) and
-the standard bolus with abort (§4f).
+What is left is the remaining two writes, gated one step at a time by
+`SALINE_TEST_PROCEDURE.md`.
 
 **Next, in order, one refusal per hardware test:**
-1. **⚠ Record boluses into `PumpSync`.** The bolus path deliberately writes **nothing** to
-   PumpSync, because the pump is on saline and a treatment record would be a lie in the therapy
-   log. That must change before insulin — a delivered bolus that AAPS has no record of is IOB
-   under-counting by another route. It is entangled with the last item below: whatever `pumpId`
-   scheme delivery uses has to agree with the sequence numbers history sync uses, or the two will
-   duplicate every bolus. **Decide both together.**
-2. **Surface pump alarms.** An occlusion during phase 2 stopped the pump, and AAPS learned nothing
-   about it — history type 105 maps to a `PumpEvent` that goes nowhere while history sync is off.
-   An occlusion means insulin is not being delivered, which AAPS must not miss.
-3. **Temporary basal** (phase 3). Only the write is left — the read side is confirmed (§4).
+
+1. **Temporary basal** (phase 3). Only the write is left — the read side is confirmed (§4).
    `setTempBasalAbsolute` converts U/h→% in the plugin, clamped to `tbrPercentRange`, and must be
    checked at a profile-block boundary. Confirm via history (type 9, `v1` = %) *and* the byte-10
-   read-back.
-5. **Basal profile write** (phase 4). AAPS `Profile` → 24 `BasalBlock`s; read back and diff all
+   read-back. **Read `CHAR_TBR_START_STOP` before writing it** — it still goes out framed, and §4f
+   is three demonstrations that nothing carries over between attributes.
+2. **Basal profile write** (phase 4). AAPS `Profile` → 24 `BasalBlock`s; read back and diff all
    24 in `Double` (§4d). Record the pump's existing 24 rates first — this one is destructive.
 6. **Delivery-mode map.** Extend `DeliveryMode` by observation as the phases above run: record
    byte 0 while priming, bolusing and running a TBR. Anything but `3` and `10` still reads as

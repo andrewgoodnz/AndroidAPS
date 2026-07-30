@@ -180,8 +180,17 @@ whole point of the canary is that it fails cheaply.
 > confirmation was moved to the event log; and a bolus stopped from AAPS is logged as **type 2**
 > carrying the partial, **not** type 29.
 >
-> Still outstanding before this is more than a saline result: nothing is written to `PumpSync`, so
-> no treatment is recorded. See §8.
+> **Bolus recording and pump alarms were added and verified afterwards** (`PORTING_NOTES` §4g). A
+> 1.5 U bolus confirmed as `seq=160369 type=2 v1=150`, recorded under `pumpId=160369`, visible on
+> the home screen with IOB reading 1.50 U.
+>
+> **⚠ That test is what exposed the epoch bug** (`PORTING_NOTES` §5): treatments were landing 12
+> hours in the future because the pump counts *local* wall-clock seconds and the decoder read them
+> as UTC. The bolus reported success while showing nowhere and producing no IOB. Two sessions of
+> "verified" timestamps had compared wall-clock readings, which cannot detect it.
+>
+> **So when checking a timestamp, check something that consumes the instant** — IOB, or the marker's
+> position on the graph — never how the time reads.
 
 **What will be proven:** that a delivery command reaches the pump, that its progress can be
 followed, and — before anything else — that it can be stopped.
