@@ -5,20 +5,27 @@ which records what the pump has actually been observed to do.
 
 ## ⏳ Everything still to run — read this first
 
-As of 2026-07-30, phases 1–3 have passed on hardware. Phase 4 is coded and **completely untested**.
-In rough order of value:
+As of 2026-07-31, **all four phases have passed on hardware.** What is left:
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
-| 1 | **Basal profile write**, all of §Phase 4 | The last write, and the destructive one. Nothing has touched hardware | Phase 4 |
-| 2 | **A 0.00 U/h basal slot** | The driver writes `0`; the pump may want `-1`. I expect this to fail | 4e |
-| 3 | **A rate needing rounding** (1.23 U/h) | If the write and `isThisProfileSet` round differently, AAPS rewrites the profile every loop | 4f |
-| 4 | **Restore the original profile** | A write you cannot reverse is not finished | 4g |
-| 5 | **The alarm notification** | Pull the cartridge. An occlusion means insulin has stopped and AAPS must not miss it | Outstanding test |
-| 6 | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
-| 7 | **A bolus while a TBR runs** | Never tried together; both use the pump's sequence numbers | — |
-| 8 | **Reconnect mid-bolus** | Pull BLE range during delivery. The bolus is confirmed from history, so it *should* resolve on reconnect | — |
-| 9 | **The extended bolus** | Still refused. Out of scope until the standard bolus has soaked | — |
+| 1 | **The alarm notification** | Pull the cartridge. An occlusion means insulin has stopped and AAPS must not miss it. Note a low reservoir is **not** one of these — see `PORTING_NOTES` §4g | Outstanding test |
+| 2 | **Restore a profile you care about** | A write you cannot reverse is not finished. Untested only in the sense that nothing has needed it | 4g |
+| 3 | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
+| 4 | **Reconnect mid-bolus** | Pull BLE range during delivery. The bolus is confirmed from history, so it *should* resolve on reconnect | — |
+| 5 | **The extended bolus** | Still refused. Out of scope until the standard bolus has soaked | — |
+
+**Retired: 4e, the 0.00 U/h slot.** It cannot be reached from AAPS. The profile editor refuses a
+zero rate and `ProfileSealed` hard-limits basal to `[0.01, maxBasal]`, so the driver is never handed
+one. The *read* direction is still live though: the pump uses `-1` for an unprogrammed slot and the
+SDK maps it to `0.0`, which no valid AAPS profile can equal — so a pump holding an unprogrammed slot
+makes `isThisProfileSet` false for ever and AAPS offers the write on every loop iteration. It heals
+on the first write, and is worth recognising rather than debugging from scratch.
+
+**Two controllers can reach the research pump.** The old study phone running Lotus writes the basal
+profile unprompted the moment it wakes; it did so twice on 2026-07-31 and both times looked like an
+unexplained pump-side change. Turn it off before any basal test, or a read-back diff cannot
+distinguish a driver bug from the other app.
 
 **Before `YpsoSyncHistoryToAaps` goes on** (`PORTING_NOTES` §8): decide how `sincePosition` skips
 already-seen entries, and decide whether a bolus is recorded at the phone's time or the pump's — the
@@ -398,10 +405,34 @@ produces the rate you predicted before running it.
 
 ---
 
-## Phase 4 — basal profile write ⏳ **CODED, COMPLETELY UNTESTED**
+## Phase 4 — basal profile write ✅ **PASSED 2026-07-31**
 
-**This is the destructive one, and nothing about it has touched hardware.** Read this section before
-running any of it.
+> **Result.** Verified on pump 10074292, saline, off-body. Five writes, every one confirmed slot by
+> slot.
+>
+> - **A 24-slot profile crossing both step boundaries** — `0.10…0.55` on the 0.01 grid, `1.00…1.18`
+>   on 0.02, `2.00 2.10 2.00 2.50` on 0.1 — read back **exactly**, all 24. Hour 0 and hour 23 checked
+>   against the pump's own display.
+> - **`isThisProfileSet` agrees afterwards.** It logs only on mismatch and went quiet after every
+>   write, so AAPS stopped offering to rewrite. That is 4d.
+> - **Rounding (4f) passed with a real value:** 1.23 U/h entered in AAPS, stored as **1.24** — the
+>   0.02 step above 1 U/h — and `isThisProfileSet` still agreed. Write and comparison round through
+>   the same `hourlyRatesFor`, which is what makes that possible.
+> - **Single-slot edits change one slot.** Two writes that differed from the pump in exactly one hour
+>   confirmed with the other 23 untouched, so the write is slot-precise.
+> - **History: type 7 is `v1 = slot, v2 = new value, v3 = previous value`**, centi-U/h — and the pump
+>   logs **only slots whose value actually changed**. A 24-slot write where 22 slots already held the
+>   target produced two entries, not 24. So "expect a basal-profile-changed entry" is wrong as a
+>   confirmation rule: a write that changes nothing logs nothing.
+>
+> **⚠ The first two of those five writes fired with nobody asking.** AAPS pushes the profile itself
+> whenever `isThisProfileSet` is false, so un-refusing `setNewBasalProfile` meant the destructive
+> write ran 15 seconds after the app started — before the 24 rates had been written down, and before
+> a human had gated the phase. The code behaved correctly; the *procedure* assumed a human presses a
+> button, and for this phase alone that assumption does not hold. Anyone re-running phase 4 from
+> scratch should expect the write to have happened already by the time they open the tab.
+
+**This is the destructive one.** Read this section before running any of it.
 
 **Write down the pump's 24 rates by hand first.** The driver logs the program it is about to replace
 (`BASAL PROGRAM x BEFORE OVERWRITE …`), and that log line is the only copy — the pump has no undo. Do

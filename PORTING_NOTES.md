@@ -614,6 +614,44 @@ byte 10 regardless of what the log yields** — falling back to a timestamp id i
 identified. A possible dedupe collision on a sync switch that is off is a far smaller problem than a
 temporary basal AAPS believes is still running.
 
+#### ⚠ …and the `>=` was still wrong, because there is no lower bound at all
+
+`>=` was measured against `newestEventSequence()`, on the reasoning that a running TBR's entry *is*
+the newest one. That holds for a cancel a minute after the set, which was the only case phase 3 ever
+ran. It fails the moment the pump logs anything else in between.
+
+A 0% TBR cancelled after nine hours had three newer entries — two basal-slot changes and a daily
+total — so its own `seq=160374` sat **below** the baseline and was filtered out. The cancel was
+confirmed by byte 10, the entry was sitting at index 3 the whole time, and the driver still reported
+"no end entry found" and closed the record under a timestamp id. The fallback did its job, which is
+the only reason this was cosmetic rather than harmful.
+
+The entry is written when the TBR **starts** and never re-appended, so no function of "the newest
+sequence now" can bound it. The bound is gone. AAPS already holds the `pumpId` of the temporary basal
+it believes is running, so `cancelTempBasal` passes that down as the identity to go and find; without
+one — an app restart having lost it — the newest TBR-typed entry in the window stands in. The search
+window went 5 → 12 entries: at index 3 after nine hours, one more event would have pushed the entry
+out of a 5-entry read no matter what the filter said.
+
+**[verified] Reproduced and fixed in one minute rather than nine hours:** set 149%, deliver a 0.5 U
+bolus so a newer entry lands on top, cancel.
+
+```
+TBR confirmed by read-back: 149% with 15min left, logged as seq=160462 v1=149 v2=15
+Bolus confirmed from the pump's log: seq=160463 type=2 v1=50 → 0.5 U
+TBR cancel confirmed by read-back: byte 10 is back to 100, logged as seq=160462 type=10
+Recorded TBR stop under endPumpId=160462, new=true
+```
+
+**A TBR's effective rate is not on the basal step grid.** 149% of 1.20 is 1.788 and the pump reported
+**1.79 U/h** — rounded to 0.01, not to the 0.02 step that governs stored rates above 1 U/h. A
+temporary basal can therefore put the pump on a rate that could not be programmed into a profile slot.
+
+**The reservoir reading is not a delivery meter.** It fell 18.08 → 17.49 across that 0.5 U bolus
+(0.59), but the preceding 33 minutes at 1.2 U/h moved it only 0.19 against an expected 0.66. It is
+sound as gross confirmation — it is what disproved "the pump never delivered" in §4f — but an amount
+cannot be checked against it.
+
 **[verified] The entry's `timestamp` is the TBR's *start*, and it survives the rewrite.** `seq=160371`
 was read at 19:52, after the cancel, and its timestamp decoded to 19:46:55 — the moment the TBR was
 set (19:46:57), not the moment it stopped.
@@ -628,6 +666,54 @@ them describes a complete temporary basal. Mapping type 10 to `TbrEnded` threw a
 and the duration and handed AAPS an end for a start it had never seen — a read taken after the TBR
 finished never sees the type-9 state at all. Both states share the sequence number, so both produce
 the same `position` and PumpSync sees one temporary basal rather than two.
+
+### 4i. Basal profile write — **[verified]**
+
+Confirmed on hardware 2026-07-31, five writes on pump 10074292. The wire format needed no work:
+`writeBasalProfile` → `writeSetting` → `writeGlb`, the bare 8 bytes already exercised by every
+profile *read*. What was untested was writing a setting **value** rather than a setting **index**.
+
+A 24-slot profile crossing both step boundaries — `0.10…0.55` on the 0.01 grid, `1.00…1.18` on 0.02,
+`2.00 2.10 2.00 2.50` on 0.1 — was written and **all 24 slots read back exactly**, with hour 0 and
+hour 23 checked against the pump's own display. Two later writes that differed in exactly one hour
+changed that hour and left the other 23 alone, so the write is slot-precise.
+
+**Rounding holds both ways.** 1.23 U/h entered in AAPS stored as **1.24** (the 0.02 step above 1
+U/h), and `isThisProfileSet` still agreed afterwards. That only works because the write and the
+comparison both go through `hourlyRatesFor`; had they rounded independently, a correctly written
+profile would read as not set and AAPS would rewrite it on every loop iteration for ever.
+
+**[verified] Type 7 `Basal Profile A Changed` is `v1 = slot, v2 = new value, v3 = previous value`**,
+centi-U/h — and **the pump logs only slots whose value actually changed**:
+
+```
+seq 160383  type 7  v1=0 v2=120 v3=2     slot 0: 0.02 → 1.20
+seq 160384  type 7  v1=1 v2=120 v3=96    slot 1: 0.96 → 1.20
+```
+
+Two entries for a write that set all 24 slots, because only two slots held anything different. So a
+basal-profile-changed entry cannot be used as the confirmation that a write happened — a write that
+changes nothing logs nothing. The read-back diff is the confirmation, which is what the code uses.
+
+**⚠ AAPS fires this write by itself.** `setNewBasalProfile` is called whenever `isThisProfileSet`
+returns false, so un-refusing it meant the most destructive command in the driver ran **15 seconds
+after the app started**, unattended, before the phase had been gated by a human. It behaved correctly
+— read the old program, logged it, wrote, read back all 24 — but the phase discipline in
+`SALINE_TEST_PROCEDURE` assumes a person presses a button, and for this one command that assumption
+is simply false. Anyone repeating phase 4 should expect the write to have already happened.
+
+**A zero rate cannot arrive from AAPS**, so the `-1`-versus-`0` question for an unprogrammed slot is
+unreachable in the write direction: the profile editor refuses zero and `ProfileSealed` hard-limits
+basal to `[0.01, maxBasal]`. The **read** direction is still live — `readBasalRateSequential` maps a
+`-1` slot to `0.0`, which no valid AAPS profile can equal, so a pump holding an unprogrammed slot
+makes `isThisProfileSet` false permanently and AAPS offers the write every loop iteration. It heals
+on the first write; it is worth recognising rather than debugging from scratch.
+
+**⚠ Two controllers can reach the research pump.** The old study phone running Lotus writes the basal
+profile unprompted when it wakes. It did so twice on 2026-07-31, each time looking like an
+unexplained pump-side change, and it is the likeliest origin of the `[0.02, 0.96, …]` program found
+that morning. Before treating a pump-side change as a driver bug, establish that no other app is
+connected.
 
 **⚠ Inherent, not a bug: a percentage is only correct for the basal block it was computed in.** When
 the pump crosses into an hour with a different programmed rate, the same percentage becomes a

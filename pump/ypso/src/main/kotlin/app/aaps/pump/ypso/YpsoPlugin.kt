@@ -257,6 +257,21 @@ class YpsoPlugin @Inject constructor(
         val wanted = hourlyRatesFor(profile)
         aapsLogger.info(LTag.PUMP, "setNewBasalProfile: writing ${wanted.map { "%.2f".format(it) }}")
 
+        // Name the slots rounding actually moved. Both this write and isThisProfileSet log the
+        // *rounded* figure, so without this a log cannot tell "the two rounded the same way" from
+        // "neither had anything to round" — and the two agreeing is the whole point of sharing
+        // hourlyRatesFor. A rounding test needs to see the value that was asked for.
+        val rounded = (0 until HOURS_IN_DAY)
+            .map { it to profile.getBasalTimeFromMidnight(it * 60 * 60) }
+            .filter { (hour, asked) -> abs(asked - wanted[hour]) > BASAL_RATE_EPSILON }
+        if (rounded.isNotEmpty()) {
+            aapsLogger.info(
+                LTag.PUMP,
+                "setNewBasalProfile: rounded to the pump's step " +
+                    rounded.joinToString { (hour, asked) -> "hour $hour ${"%.3f".format(asked)}→${"%.2f".format(wanted[hour])}" }
+            )
+        }
+
         val written = service.writeBasalProfile(wanted)
         if (written) {
             uiInteraction.addNotificationValidFor(
