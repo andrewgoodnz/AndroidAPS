@@ -191,21 +191,27 @@ The fifth (§4e) is the same lesson applied to the write path, and is the one st
 
 ### 4a. Reads carry no framing header
 
-The system-status reply is a bare CRC-terminated message:
+The system-status reply is a bare CRC-terminated message. Logged verbatim off the pump:
 
 ```
-03 8B 16 00 00 02 78 00 00 00 64 00 00 00 00 00 00 00  F1 52
+03 42 14 00 00 02 00 00 00 00 64 00 00 00 00 00 00 00  15 30
 └─ payload (18 bytes) ─────────────────────────────┘  └CRC┘
 ```
 
-CRC-16 over the first 18 bytes is `F1 52` — it matches, so the 20-byte read is complete.
+CRC-16 over the first 18 bytes is `15 30` — it matches, so the 20-byte read is complete.
 Recomputing with the leading byte treated as a framing header does *not* match. Upstream assumed
 reads are framed like writes, took the low nibble of the first *data* byte as a frame count, read
 `0x03` as "frame 1 of 3", and chased continuation frames on `CHAR_EXTENDED_READ` that do not
 exist — `GATT_INVALID_OFFSET` (status 7), killing every session about a second after auth.
 
 `readExtended` now validates the CRC first and returns the message when it is already complete.
-**The CRC is the discriminator, never the nibble** — the nibble may be data.
+**The CRC is the discriminator, never the nibble** — the nibble may be data, and in this frame it
+is: the leading `0x03` is the delivery mode.
+
+(An earlier revision of this section printed a different frame,
+`03 8B 16 00 00 02 78 … F1 52`, whose payload is real but whose CRC is not — `F1 52` is not the
+CRC of those 18 bytes. `YpsoWireFormatTest` is what caught it, which is the argument for having
+these vectors in tests rather than only in prose. The frame above is copied from a log.)
 
 ### 4b. GLB writes must not be framed
 
@@ -693,10 +699,23 @@ path is open and the envelope rule is observed rather than guessed.
    all settled (§5); what remains is deciding how `sincePosition` filters entries already seen.
    Its own gate, because getting it wrong corrupts IOB silently rather than visibly.
 
+### Unit tests
+
+`:pump:ypso:sdk` now has a test source set, with **40 tests** covering the decodes the hardware
+findings live in: the CRC and GLB formats (§4a–4c), the full 18-byte status payload against both
+captured samples (§4), the 17-byte history entry and its 2000 epoch (§5), the clock decode and its
+plausibility guard (§4e), and the history mapping — including that `position` is the sequence
+number and never the slot index, which is the regression that would corrupt IOB.
+
+They earned their keep on the first run by failing: §4a's illustrative frame carried a CRC that is
+not the CRC of its payload. Prose drifts; a vector in a test does not.
+
+`:pump:ypso` itself is still untested — the plugin and service need Android test doubles, and the
+decodes were the valuable part.
+
 Also worth doing eventually, none of it blocking: a history screen (Medtronic's
-`MedtronicHistoryActivity` is the pattern), unit tests for the history mapping (nothing in the
-new module is tested yet), and deleting `:pump:ypsopump` once the last useful reference is mined
-out of it.
+`MedtronicHistoryActivity` is the pattern), and deleting `:pump:ypsopump` once the last useful
+reference is mined out of it.
 
 ---
 
