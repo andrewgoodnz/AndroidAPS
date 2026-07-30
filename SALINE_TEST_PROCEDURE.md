@@ -9,12 +9,21 @@ As of 2026-07-31, **all four phases have passed on hardware.** What is left:
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
-| 0 | **Re-run: 4 U bolus, cancelled on the pump** | It recorded 4.0 U against ~2.5 U delivered. Fixed 2026-07-31; only this test proves it | `PORTING_NOTES` §4f |
-| 1 | **The alarm notification — by occlusion, not by pulling the cartridge** | Removing the cartridge raises nothing: it is a deliberate procedure that stops the pump first. Clamp the line while it delivers. A low reservoir is **not** a pump alert either — §4g | Outstanding test |
-| 2 | **Restore a profile you care about** | A write you cannot reverse is not finished. Untested only in the sense that nothing has needed it | 4g |
-| 3 | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
-| 4 | **Reconnect mid-bolus** | Pull BLE range during delivery. The bolus is confirmed from history, so it *should* resolve on reconnect | — |
-| 5 | **The extended bolus** | Still refused. Out of scope until the standard bolus has soaked | — |
+| 1 | **Decide the alarm poll interval** | Not a test — a decision. An occlusion took **27 minutes** to reach AAPS, because the driver polls every 20 min when idle. See `PORTING_NOTES` §8.2 | — |
+| 2 | **The delivery-mode byte in every state** | Mapped for 2 values out of 256. An unmapped one makes AAPS call the pump suspended, and a *stopped* pump is how an alarm should really surface | `PORTING_NOTES` §8.3 |
+| 3 | **Reconnect mid-bolus** | Pull BLE range during delivery. The bolus is confirmed from history, so it *should* resolve on reconnect | — |
+| 4 | **A bolus while a TBR runs** | Never tried together; both are identified by sequence | — |
+| 5 | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
+| 6 | **Restore a profile you care about** | A write you cannot reverse is not finished. Untested only in the sense that nothing has needed it | 4g |
+| 7 | **The extended bolus** | Still refused. Out of scope until the standard bolus has soaked | — |
+
+**✅ Passed 2026-07-31 and no longer on the list:** the bolus cancelled *on the pump* (recorded 0.58 U
+of 2.0 U requested, `success=false`, after previously recording the full amount — §4f); and the alarm
+notification, raised by **occlusion** with an urgent AAPS alert and sound (§8.2).
+
+**Removing the cartridge is not a valid alarm test.** It raises nothing, and correctly so: a cartridge
+change through the pump's menu stops the pump first, so there is no unexpected condition. Use an
+occlusion — clamp the line while it delivers.
 
 **Retired: 4e, the 0.00 U/h slot.** It cannot be reached from AAPS. The profile editor refuses a
 zero rate and `ProfileSealed` hard-limits basal to `[0.01, maxBasal]`, so the driver is never handed

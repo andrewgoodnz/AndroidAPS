@@ -820,14 +820,14 @@ class YpsoPumpManagerImpl private constructor(
                     sawDelivering = true
                     progressSeen = maxOf(progressSeen, status.fastInjected.toDouble())
                     _bolusProgress.value = BolusProgress(progressSeen, amount, finished = false, cancelled = cancelRequested)
-                } else if (sawDelivering && BolusNotificationStatus.isTerminal(status.fastStatus)) {
+                } else if (sawDelivering && BolusNotificationStatus.hasFinished(status.fastStatus)) {
                     log("Pump bolus status reached ${BolusNotificationStatus.name(status.fastStatus)}")
                     break
                 } else if (sawDelivering) {
                     // ⚠ Not the same thing as finishing. Cancelling on the pump produced status 2,
-                    // which is in no table we have, and `COMPLETED` followed 2.2 s later. Breaking
-                    // here decided the outcome before the pump had finished revising its own log,
-                    // and the entry read at that instant still carried the requested amount.
+                    // which is in no table we have, and the delivery had not settled. Breaking here
+                    // decided the outcome before the pump had finished revising its own log, and the
+                    // entry read at that instant still carried the requested amount.
                     log("Pump bolus status left DELIVERING for ${BolusNotificationStatus.name(status.fastStatus)} — not terminal, still waiting")
                 }
             }

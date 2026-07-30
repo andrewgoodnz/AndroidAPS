@@ -514,6 +514,29 @@ treats a type-19 match as *not yet an answer* and re-reads until the entry settl
 settles the entry is still returned, but `bolusOutcome` refuses to call it complete at any value and
 says plainly that the figure is the request rather than the delivery. Tests pin both.
 
+**✅ [verified] Re-tested on hardware, 2026-07-31.** A 2 U bolus cancelled on the pump:
+
+```
+Pump bolus status left DELIVERING for Unknown(2) — not terminal, still waiting
+Bolus confirmed from the pump's log: seq=160493 type=2(Bolus Immediate) v1=58 → 0.58 U
+  — Pump delivered only 0.58 U of the 2.0 U requested — check the pump
+deliverBolus: asked 2.0U, pump delivered 0.58U, success=false
+```
+
+Right amount, right verdict. A full 2 U bolus straight afterwards still confirmed at 2.0 U with
+`success=true`, so nothing regressed.
+
+**The whitelist was initially too strict, and the same log showed it.** Neither bolus ever reached a
+terminal *polled* status: `COMPLETED` arrives on the **notify** characteristic, by which time the
+polled status has already been cleared to `IDLE`. So every bolus ran to the elapsed-time fallback —
+correct, but 14 s here and close to a minute for a large bolus cancelled early.
+
+`IDLE` now counts as finished once `DELIVERING` has been seen. It is a *mapped* state meaning nothing
+is running, and this section already established the pump clears its bolus status when delivery ends,
+so `IDLE`-after-`DELIVERING` is exactly that clearing. Status `2` still does not count, which is the
+distinction that matters: both observed endings are `DELIVERING → IDLE` (completed) and
+`DELIVERING → 2 → IDLE` (pump-side cancel).
+
 **[verified] The entry did settle, and to the right number.** A history dump 19 minutes later:
 
 ```
@@ -1192,12 +1215,49 @@ branch has to create a condition the pump did not expect.
 **The reliable one is occlusion**, which this pump has raised repeatedly: clamp or kink the line while
 it is delivering. `105 Occlusion` is in the urgent set.
 
+#### ✅ [verified] The notification branch fires — 2026-07-31
+
+An occlusion forced on saline was logged by the pump as `seq=160532 type=105`, moving the count 144 →
+145, and the whole chain ran on the next status poll:
+
+```
+Pump alert log grew from 144 to 145 — reading the 1 newest
+PUMP ALERT: Alert: Occlusion (type 105, seq 160532)
+Pump alert 105 (Alert: Occlusion), urgent=true
+Notification received: YpsoPump: Alert: Occlusion
+Starting alarm from YpsoPump: Alert: Occlusion
+```
+
+Urgent AAPS notification **with sound**. The `replay = 0` `SharedFlow` worry recorded in the test
+procedure was unfounded — the service's collector was subscribed in time.
+
+#### ⚠⚠ [verified] …but it took 27 minutes, and that is the real limit
+
+The occlusion happened at **07:04:48**. The notification fired at **07:31:51**. Nothing was wrong;
+the driver simply had no reason to talk to the pump in between.
+
+**AAPS only polls when the command queue has work, and this driver disconnects when it is empty.**
+The measured idle cadence is **20 minutes** — status reads at 07:31:49, 07:51:48, 08:11:49, evenly
+spaced. So the worst case between a pump alarm and AAPS knowing about it is one full poll interval,
+and the observed case was 27 minutes.
+
+For an occlusion that is a long time to believe basal is being delivered when it has stopped. Three
+things bound the harm and none of them is this driver: the pump alarms locally and loudly, the user
+is normally near it, and AAPS's own pump-unreachable alert will not help because the pump *is*
+reachable — it is simply not being asked.
+
+**This is a decision, not a defect, and it has not been made.** Shortening the poll costs battery and
+BLE airtime on a pump that is otherwise contacted only when needed. Deciding it wants a view on how
+long a stopped pump may go unannounced, which is a therapy question rather than a protocol one.
+
 Two caveats that bound what this feature can ever catch:
 
 - **A low reservoir is not a pump alert** (§4g). The mylife controller computes it on the phone; the
   pump's count did not move. Nothing in the alert log will ever surface it.
-- **AAPS only polls when the command queue has work.** An alert raised while the driver is
-  disconnected is unseen until the next connection, and the latency of that is unmeasured (§8.4).
+- **The count is only checked in `readPumpStatus`.** Pressing **Read history** also reads the alert
+  count — the 145 first appeared there — but through `readHistoryAlerts`, which does not run the
+  alert check. So a path that observes the count can still fail to announce what it saw. Harmless
+  today because it does not move the baseline either, but it is a second entrance to the same room.
 
 ### 8.3 ⚠ The delivery-mode byte is mapped for two values out of 256
 
@@ -1234,9 +1294,10 @@ Mapping this is cheap — put the pump in each state and read byte 0 — and it 
    happen. A half-written basal program is the worst outcome the driver can produce.
 3. **A temporary basal crossing an hour boundary.** Inherent, not a bug (§4h), but it has never been
    watched happen and the size of the discontinuity is unmeasured.
-4. **The pump stopped from its own buttons while AAPS is connected.** Does AAPS notice, and how fast?
-   It only polls when the command queue has work, so an alarm or a stop while idle is unseen until
-   the next connection. **The latency of noticing anything is itself unmeasured.**
+4. **The pump stopped from its own buttons.** Does AAPS notice, and how fast? The latency question is
+   now **measured** — a 20-minute idle poll interval, and 27 minutes from occlusion to notification
+   (§8.2) — but a *stop* is a different signal from an *alert*: it should show as delivery-mode 3,
+   and whether that reaches `isSuspended()` promptly has never been watched.
 5. **Reservoir `-1`.** Coded for (`reservoirKnown`), never observed. Likewise an unprogrammed basal
    slot reading `-1` → `0.0`, which would make `isThisProfileSet` false permanently (§4i).
 6. **Low battery.** Only 2-of-4 bars has ever been seen. The mapping of 0 and 1 bars, and whether the

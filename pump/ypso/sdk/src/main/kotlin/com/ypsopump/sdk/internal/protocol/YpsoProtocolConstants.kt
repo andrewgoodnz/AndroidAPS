@@ -210,18 +210,27 @@ internal object BolusNotificationStatus {
     }
 
     /**
-     * Whether delivery has **finished**, by whitelist.
+     * Whether this status, **seen after `DELIVERING`**, means delivery has finished.
      *
      * ⚠ This was `status != IDLE && status != DELIVERING`, which makes every unmapped value
      * terminal. Cancelling a 4 U bolus on the pump produced status **2** — a value not in this
-     * table — and the driver concluded delivery was over. The real end, `4 COMPLETED`, arrived
-     * 2.2 seconds later, by which time the outcome had already been decided and recorded.
+     * table — and the driver concluded delivery was over while the pump was still revising its
+     * event log, then read the requested amount out of it and reported that as delivered.
      *
-     * A blacklist of the two states we happen to know are non-terminal asserts something about
-     * 252 values nobody has seen. Only a state confirmed to mean "finished" ends the wait; anything
-     * else means keep waiting, and the caller's own timeout bounds it.
+     * `IDLE` is here and `2` is not, which is the whole distinction. `IDLE` is a *mapped* state
+     * meaning nothing is running, and §4f established that this pump **clears** its bolus status
+     * when delivery ends — so `IDLE` after `DELIVERING` is exactly "it finished and the status was
+     * cleared". `2` is an intermediate nobody has characterised.
+     *
+     * Both of the observed endings are covered: a completed bolus polls `DELIVERING → IDLE` (the
+     * `COMPLETED` notification arrives on the notify characteristic and the *polled* status has
+     * already been cleared by then), and a pump-side cancel polls `DELIVERING → 2 → IDLE`.
+     *
+     * Anything unmapped means keep waiting, bounded by the caller's own timeout — which is what
+     * caught both cases before this was tightened, at the cost of up to a minute of waiting on a
+     * large bolus cancelled early.
      */
-    fun isTerminal(status: Int): Boolean = status == CANCELLED || status == COMPLETED
+    fun hasFinished(status: Int): Boolean = status == CANCELLED || status == COMPLETED || status == IDLE
 }
 
 /**
