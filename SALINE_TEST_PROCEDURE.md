@@ -163,7 +163,25 @@ whole point of the canary is that it fails cheaply.
 
 ---
 
-## Phase 2 — standard bolus (not yet implemented)
+## Phase 2 — standard bolus ✅ **PASSED 2026-07-30**
+
+> **Result.** Delivery, confirmation and abort all verified on pump 10074292, on saline, off-body.
+>
+> - **Envelope:** `CHAR_BOLUS_START_STOP` is write-only (`0x08`) and takes **13 bytes + CRC,
+>   unframed — 15 on the wire**. A 13-byte bare write was refused with status 13 first.
+> - **Layout:** upstream's `total(4) + duration(4) + immediate(4) + type(1)` is correct.
+> - **2.0 U:** confirmed from the pump's log, `seq=160362 type=2 v1=200 → 2.0 U`, `success=true`,
+>   resolved in 5.4 s.
+> - **Abort:** a 5.0 U bolus stopped from AAPS after ~3 s logged
+>   `seq=160363 type=2 v1=182 → 1.82 U`, reported `success=false` with the partial amount.
+>
+> **Two traps found the hard way, both recorded in `PORTING_NOTES` §4f:** the pump *clears* its
+> bolus status when delivery ends, so polling it reported successful boluses as failures until the
+> confirmation was moved to the event log; and a bolus stopped from AAPS is logged as **type 2**
+> carrying the partial, **not** type 29.
+>
+> Still outstanding before this is more than a saline result: nothing is written to `PumpSync`, so
+> no treatment is recorded. See §8.
 
 **What will be proven:** that a delivery command reaches the pump, that its progress can be
 followed, and — before anything else — that it can be stopped.

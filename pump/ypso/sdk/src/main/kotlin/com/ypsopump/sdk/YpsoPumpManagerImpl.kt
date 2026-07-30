@@ -707,8 +707,14 @@ class YpsoPumpManagerImpl private constructor(
 
         val error = when {
             mismatch != null -> "$mismatch (the pump logged $delivered U)"
-            aborted          -> "Bolus aborted after $delivered U of $amount U"
-            !complete        -> "Pump logged $delivered U of the $amount U requested"
+            // ⚠ Verified on hardware: a bolus stopped from AAPS is logged as type **2**
+            // (Bolus Immediate) carrying the partial amount — *not* type 29. So a cancellation
+            // cannot be recognised from the entry type, and [cancelRequested] is what distinguishes
+            // "the user stopped it" from "the pump stopped short on its own". Both are failures,
+            // but only one of them warrants looking at the pump.
+            cancelRequested  -> "Bolus stopped after $delivered U of $amount U"
+            aborted          -> "Bolus aborted by the pump after $delivered U of $amount U"
+            !complete        -> "Pump delivered only $delivered U of the $amount U requested — check the pump"
             else             -> null
         }
 

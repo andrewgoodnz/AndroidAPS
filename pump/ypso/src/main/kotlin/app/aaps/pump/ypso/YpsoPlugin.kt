@@ -247,7 +247,11 @@ class YpsoPlugin @Inject constructor(
 
         aapsLogger.info(LTag.PUMP, "deliverTreatment: ${requested}U")
         val delivery = service.deliverBolus(requested)
-        val delivered = delivery.deliveredUnits?.toDouble() ?: 0.0
+        // Round back onto the pump's 0.01 U resolution. The amount is exact in the pump's log
+        // (centi-units), but `deliveredUnits` is a Float, and widening 1.82f gives
+        // 1.8200000524520874 — the same trap as §4d, now on a figure that becomes a treatment
+        // record. Rounding to the resolution the value actually has is exact, not lossy.
+        val delivered = delivery.deliveredUnits?.let { Math.round(it * 100.0) / 100.0 } ?: 0.0
 
         result.bolusDelivered = delivered
         result.success(delivery.success).enacted(delivered > 0.0)

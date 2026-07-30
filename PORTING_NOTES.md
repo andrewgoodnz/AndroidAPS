@@ -183,11 +183,17 @@ of the AAPS dependency graph — upstream needed both only for Proregia.
 
 ---
 
-## 4. Wire format — five corrections to the vendored SDK
+## 4. Wire format — six corrections to the vendored SDK
 
 **Upstream's framing does not match firmware V05.02.03.** Four separate bugs, each found by
 looking at raw bytes rather than at the code's own assumptions; together they broke every read.
-The fifth (§4e) is the same lesson applied to the write path, and is the one still unproven.
+§4e and §4f are the same lesson applied to the write path, and both are now verified on hardware.
+
+**The one-line version, if you read nothing else here:** the envelope is chosen **per
+characteristic**, not per firmware, and the pump **never rejects a wrong payload** — it accepts the
+write and does nothing. Only a length error comes back (`GATT_INVALID_ATTRIBUTE_LENGTH`, 13).
+Assume nothing carries over from one attribute to the next, and confirm every write by an effect
+you can go and read.
 
 ### 4a. Reads carry no framing header
 
@@ -363,6 +369,74 @@ finding — the bolus and TBR characteristics are different attributes and have 
 (A length probe was designed as a fallback in case the characteristics would not read — try
 candidates in ascending length, treat status 13 as "wrong length, next". It was never needed
 and is not implemented.)
+
+### 4f. The bolus command — **[verified]**, and every assumption about it was wrong once
+
+Three separate mistakes, each caught by a different check. Worth reading in order, because the
+lesson is the same each time: **this pump's conventions are per attribute, and it never says no.**
+
+**1. The envelope is not the clock's.** §4e found the clock characteristics take a bare payload,
+and carrying that over to `CHAR_BOLUS_START_STOP` got `GATT_INVALID_ATTRIBUTE_LENGTH` on a 13-byte
+write. Upstream's flow (`appendCrc` → encrypt → `chunkPayload`) puts 16 bytes on the wire for a
+plaintext pump, so 13 was never right — it came from stripping framing that should only have been
+stripped where the pump asked for it. `CHAR_BOLUS_START_STOP` is **write-only** (properties `0x08`),
+so there is nothing to read the envelope from. Candidates were tried in ascending order and the
+first was accepted:
+
+```
+13B bare                   → refused, GATT status 13
+15B payload+CRC, unframed  → ACCEPTED     ← 32 00 00 00 00 00 00 00 00 00 00 00 01 9B D3
+```
+
+So the convention across this firmware is: **simple registers bare, command and status channels
+CRC-terminated**, and nothing is framed. The accepted envelope is remembered per characteristic.
+
+**2. Upstream's payload layout was right after all.** With 15 bytes accepted, the pump delivered —
+but the driver could not see it, and the temporary conclusion was that the layout must be wrong. A
+GLB-style replacement (`total, ~total, duration, ~duration, type`) was written and reverted
+unrun: the reservoir settled it, falling 51.86 → 51.30 U across a 0.5 U bolus. Upstream's
+`total(4) + duration(4) + immediate(4) + type(1)` is correct.
+
+**3. ⚠ The pump clears its bolus status when delivery ends, and that is not "no delivery".**
+`CHAR_BOLUS_STATUS` reads `status=0 injected=0 total=0` once a bolus finishes. A 0.5 U bolus takes
+2.5 s at 12 U/min, so every poll landed after it and saw zeros — which was read as "the pump never
+started". **The driver reported failure and 0.0 U delivered for boluses that had gone in**, twice,
+before the reservoir gave it away. On insulin that is AAPS under-counting IOB for a dose the
+patient received.
+
+So **the outcome comes from the pump's event log, never from its bolus status**: read the newest
+sequence number before sending, then find the newer bolus entry afterwards. `type 2` with `v1` in
+centi-units. If the baseline cannot be read, nothing is sent. If no entry appears afterwards the
+result is "not confirmed" — never "zero delivered", because it may have gone in and not been
+logged yet.
+
+The status characteristic keeps two jobs it is good at: live progress, and the **total the pump
+echoes back**, which cancels delivery on a disagreement. That is the only check that can catch a
+misparsed payload *layout*, since a length check cannot.
+
+**⚠ A bolus stopped from AAPS is logged as type 2, not type 29.** A 5 U bolus stopped after ~3 s
+logged `type=2(Bolus Immediate) v1=182` — a completed-bolus entry carrying the partial amount.
+Type 29 `Bolus Immediate Abort` was never written. So a cancellation cannot be recognised from the
+entry type; the driver's own "stop was requested" flag is what distinguishes a user stop from the
+pump falling short on its own. Both fail, but only the second means something is wrong with the
+pump.
+
+**Also: `CHAR_BOLUS_STATUS` is genuinely multi-frame**, unlike `CHAR_SYSTEM_STATUS` (§4a). It
+answers in three frames assembled through `CHAR_EXTENDED_READ`:
+
+```
+13 …(19B)   0x13 = frame 1 of 3
+23 …(19B)   frame 2 of 3
+33 00 00 00 00 3E DB   frame 3 of 3 — 4 data bytes then the CRC
+```
+
+19 + 19 + 4 = the 42-byte payload the decoder expects. So "reads are not framed" is true of the
+system status and false here — another per-attribute difference, and the reason the frame-count
+fallback in `readExtended` has to stay.
+
+**Bolus speed looks faster than the configured 12 U/min.** 1.82 U went in over roughly 4.4 s,
+nearer 25 U/min. It only affects the completion timeout, which is generous, so nothing is broken —
+but `YpsoBolusSpeed` should not be trusted as a rate until it is measured properly.
 
 ### What is read, and what was verified
 
@@ -652,7 +726,8 @@ Firmware confirmed **V05.02.03**.
 
 **Two cosmetic decode faults noticed while running phase 1, neither blocking:**
 
-- `ypso_serial_number` is stored as `10074292 ` — `getStringValue(0)` on the device-name
+- `ypso_serial_number` is stored with a trailing NUL — `10074292` followed by `U+0000`, which the
+  preferences XML shows as `&#0;`. `getStringValue(0)` on the device-name
   characteristic keeps the NUL terminator. It is harmless on screen but it also feeds
   `pumpSerial` on every `PumpSync` call, so it wants fixing **before** `YpsoSyncHistoryToAaps`
   is switched on, or records could split on a serial mismatch.
@@ -669,24 +744,20 @@ status bytes are fully mapped (§4, including byte 10 as TBR percent), and the h
 verified against actions performed on the pump (§5). What is left is the write path, and it is
 gated one step at a time by `SALINE_TEST_PROCEDURE.md`.
 
-**Phase 1 is done.** ✅ The clock write passed on hardware on 2026-07-30 (§4e), so the write
-path is open and the envelope rule is observed rather than guessed.
+**Phases 1 and 2 are done.** ✅ Both passed on hardware on 2026-07-30 — the clock write (§4e) and
+the standard bolus with abort (§4f).
 
 **Next, in order, one refusal per hardware test:**
-
-1. **Standard bolus** (phase 2). Add the `YpsoService` entry point and the `YpsoPlugin` override
-   → `deliverStandardBolus`. **Read `CHAR_BOLUS_START_STOP` before writing it**, the way
-   `syncTime` reads the clock characteristics — the 13-byte payload currently goes out framed
-   and CRC'd, which §4e says will be refused, but "bare" should be confirmed on that specific
-   attribute rather than assumed from the clock's. **Abort is part of this phase, not a
-   follow-up:** wire AAPS's bolus-stop to `cancelBolus()` and confirm a partial delivery in
-   history before the phase counts as done. Confirm every bolus by the history entry (type 2,
-   `v1` in centi-units), never by the write.
-3. **Bolus progress** — collect `pumpEvents` / the bolus-notification characteristic into
-   `EventOverviewBolusProgress`. A Flow collection, not Medtrum's sleep-poll. Scale the
-   completion timeout to the configured bolus speed (`YpsoBolusSpeed`, 12 U/min); a progress bar
-   that finishes early is worse than one that finishes late.
-4. **Temporary basal** (phase 3). Only the write is left — the read side is confirmed (§4).
+1. **⚠ Record boluses into `PumpSync`.** The bolus path deliberately writes **nothing** to
+   PumpSync, because the pump is on saline and a treatment record would be a lie in the therapy
+   log. That must change before insulin — a delivered bolus that AAPS has no record of is IOB
+   under-counting by another route. It is entangled with the last item below: whatever `pumpId`
+   scheme delivery uses has to agree with the sequence numbers history sync uses, or the two will
+   duplicate every bolus. **Decide both together.**
+2. **Surface pump alarms.** An occlusion during phase 2 stopped the pump, and AAPS learned nothing
+   about it — history type 105 maps to a `PumpEvent` that goes nowhere while history sync is off.
+   An occlusion means insulin is not being delivered, which AAPS must not miss.
+3. **Temporary basal** (phase 3). Only the write is left — the read side is confirmed (§4).
    `setTempBasalAbsolute` converts U/h→% in the plugin, clamped to `tbrPercentRange`, and must be
    checked at a profile-block boundary. Confirm via history (type 9, `v1` = %) *and* the byte-10
    read-back.
