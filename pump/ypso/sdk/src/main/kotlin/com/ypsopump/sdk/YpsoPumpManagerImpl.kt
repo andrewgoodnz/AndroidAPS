@@ -29,6 +29,7 @@ import com.ypsopump.sdk.internal.parsing.PumpEventProcessor
 import com.ypsopump.sdk.internal.parsing.YpsoHistoryMapper
 import com.ypsopump.sdk.internal.protocol.BolusNotificationStatus
 import com.ypsopump.sdk.internal.protocol.DeliveryMode
+import com.ypsopump.sdk.internal.protocol.EventType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -113,6 +114,31 @@ class YpsoPumpManagerImpl private constructor(
          * what was asked for.
          */
         private const val BOLUS_AMOUNT_EPSILON = 0.005
+
+        /**
+         * Grace period after the expected delivery time before going to the pump's log. The pump
+         * writes the entry when delivery *ends*, so reading immediately can beat it there.
+         */
+        private const val BOLUS_LOG_SETTLE_MS = 3_000L
+
+        /** How many of the newest event-log entries to search for the bolus just delivered. */
+        private const val BOLUS_HISTORY_SEARCH_ENTRIES = 5
+
+        /** Re-reads of the log before giving up on finding the entry. */
+        private const val BOLUS_HISTORY_ATTEMPTS = 3
+
+        private const val BOLUS_HISTORY_RETRY_MS = 2_000L
+
+        /**
+         * Event types a standard bolus can produce. `2` completed and `29` aborted are the two that
+         * settle the outcome; `19` means still running, which is worth recognising so a slow pump is
+         * not mistaken for one that logged nothing.
+         */
+        private val STANDARD_BOLUS_TYPES = setOf(
+            EventType.BOLUS_IMMEDIATE,
+            EventType.BOLUS_IMMEDIATE_ABORT,
+            EventType.BOLUS_IMMEDIATE_RUNNING
+        )
 
         fun create(context: Context): YpsoPumpManagerImpl = YpsoPumpManagerImpl(context.applicationContext)
     }
@@ -547,13 +573,18 @@ class YpsoPumpManagerImpl private constructor(
      * Delivers a standard bolus, reporting only what the pump says it actually delivered.
      *
      * The write result is ignored as evidence, per §0: this pump accepts a bad write silently.
-     * Progress and the final amount both come from reading `CHAR_BOLUS_STATUS`, which carries the
-     * pump's own injected/total figures.
      *
-     * **The pump echoes back the total it understood, and that is checked.** If it does not match
-     * what was asked, the payload was misparsed and the pump is about to deliver the wrong dose,
-     * so delivery is cancelled immediately rather than allowed to run. That is the single most
-     * valuable check here — it catches a wrong payload *layout*, which a length check cannot.
+     * **The outcome comes from the pump's own event log, not from its bolus status.** The status
+     * characteristic is useful for progress while delivery runs, but the pump *clears* it the moment
+     * delivery ends — so all-zeros means "nothing running now" and says nothing about whether a
+     * bolus just completed. Reading that as "nothing was delivered" is what reported a successful
+     * 0.5 U bolus as a failure on 2026-07-30, and under-reporting a delivered dose is the direction
+     * that corrupts IOB. The log entry (type 2 completed, type 29 aborted, `v1` in centi-units) is
+     * written by the pump about itself and does not evaporate.
+     *
+     * **The pump also echoes back the total it understood, and that is checked** while delivery
+     * runs. A disagreement means the payload was misparsed and the wrong dose is on its way, so it
+     * is cancelled immediately. That catches a wrong payload *layout*, which a length check cannot.
      */
     override suspend fun deliverStandardBolus(amount: Double): BolusDeliveryResult = withConnection {
         if (amount <= 0.0) {
@@ -566,78 +597,157 @@ class YpsoPumpManagerImpl private constructor(
         cancelRequested = false
         _bolusProgress.value = BolusProgress(0.0, amount, finished = false, cancelled = false)
 
-        val before = suspendGetBolusStatus()
-        log(
-            "Bolus $amount U requested. Pump bolus status before: status=${before?.fastStatus} " +
-                "seq=${before?.fastSequence} injected=${before?.fastInjected} total=${before?.fastTotal}"
-        )
+        // Baseline the event log first. This is what lets the bolus we are about to start be told
+        // apart from every bolus already in the log, and without it a stale entry could be read
+        // back as confirmation of this one. If it cannot be read, nothing is sent: an
+        // unconfirmable delivery is not one this driver makes (§0).
+        val baselineSequence = newestEventSequence()
+        if (baselineSequence == null) {
+            return@withConnection bolusFailure(
+                amount,
+                "The pump's event log could not be read, so a bolus could not be confirmed — nothing was sent"
+            )
+        }
+        log("Bolus $amount U requested. Newest event sequence before sending: $baselineSequence")
 
         if (!suspendStartBolus(amount)) {
             _bolusProgress.value = BolusProgress(0.0, amount, finished = true, cancelled = false)
             return@withConnection bolusFailure(amount, "The pump refused the bolus command")
         }
 
+        val expectedMs = expectedDeliveryMs(amount)
         val timeoutMs = bolusTimeoutMs(amount)
         val startedAt = System.currentTimeMillis()
-        log("Bolus sent. Waiting up to ${timeoutMs / 1000}s at $bolusSpeedUnitsPerMinute U/min")
+        log("Bolus sent. Expecting ~${expectedMs / 1000}s at $bolusSpeedUnitsPerMinute U/min, giving up after ${timeoutMs / 1000}s")
 
-        var delivered = 0.0
-        var finishedByPump = false
-        var cancelled = false
+        var progressSeen = 0.0
+        var sawDelivering = false
         var mismatch: String? = null
 
+        // Follow the pump's bolus status for *progress only*. It is not the outcome: the pump
+        // clears these fields the moment delivery finishes, so all-zeros means "nothing running
+        // now" and says nothing about whether a bolus just ran. Reading that as "nothing was
+        // delivered" is exactly the mistake that reported a successful 0.5 U bolus as a failure.
         var firstPoll = true
         while (System.currentTimeMillis() - startedAt < timeoutMs) {
-            // The first read happens immediately: it carries the total the pump understood, and
-            // the sooner a disagreement is seen the less has gone in by the time we cancel.
             if (firstPoll) firstPoll = false else delay(BOLUS_POLL_INTERVAL_MS)
-            val status = suspendGetBolusStatus() ?: continue
+            val status = suspendGetBolusStatus()
 
-            // The pump's own idea of what it was asked for. A disagreement here means the 13-byte
-            // payload was not parsed the way this code laid it out.
-            if (status.fastTotal > 0f && abs(status.fastTotal - amount) > BOLUS_AMOUNT_EPSILON) {
-                mismatch = "pump reports a bolus total of ${status.fastTotal} U but $amount U was requested"
-                log("BOLUS MISMATCH: $mismatch — cancelling immediately")
-                suspendCancelBolus()
-                cancelled = true
-                delivered = status.fastInjected.toDouble()
-                break
+            if (status != null) {
+                // The pump echoes the total it understood. A disagreement means the payload was
+                // not parsed the way this code laid it out, so stop it rather than let it run.
+                if (status.fastTotal > 0f && abs(status.fastTotal - amount) > BOLUS_AMOUNT_EPSILON) {
+                    mismatch = "pump reports a bolus total of ${status.fastTotal} U but $amount U was requested"
+                    log("BOLUS MISMATCH: $mismatch — cancelling immediately")
+                    suspendCancelBolus()
+                    break
+                }
+
+                if (status.fastStatus == BolusNotificationStatus.DELIVERING) {
+                    sawDelivering = true
+                    progressSeen = maxOf(progressSeen, status.fastInjected.toDouble())
+                    _bolusProgress.value = BolusProgress(progressSeen, amount, finished = false, cancelled = cancelRequested)
+                } else if (sawDelivering) {
+                    log("Pump bolus status left DELIVERING (${BolusNotificationStatus.name(status.fastStatus)})")
+                    break
+                }
             }
 
-            delivered = status.fastInjected.toDouble()
-            _bolusProgress.value = BolusProgress(delivered, amount, finished = false, cancelled = cancelRequested)
-
-            if (BolusNotificationStatus.isTerminal(status.fastStatus)) {
-                finishedByPump = true
-                cancelled = status.fastStatus == BolusNotificationStatus.CANCELLED
-                log("Bolus finished: pump status ${BolusNotificationStatus.name(status.fastStatus)}, injected $delivered U")
+            // A bolus short enough to finish between polls never shows as DELIVERING at all, so
+            // elapsed time has to be able to end the wait too.
+            if (System.currentTimeMillis() - startedAt >= expectedMs + BOLUS_LOG_SETTLE_MS) {
+                log("Expected delivery time has passed; going to the pump's log for the outcome")
                 break
             }
         }
 
-        // One last read, so the reported amount is the pump's final word rather than the last
-        // sample taken mid-delivery.
-        suspendGetBolusStatus()?.let { delivered = it.fastInjected.toDouble() }
-        _bolusProgress.value = BolusProgress(delivered, amount, finished = true, cancelled = cancelled)
+        // The authoritative record: what the pump wrote into its own event log.
+        val record = findBolusRecord(baselineSequence)
+        val outcome = bolusOutcome(amount, record, progressSeen, mismatch)
+        _bolusProgress.value = BolusProgress(
+            outcome.deliveredUnits?.toDouble() ?: progressSeen,
+            amount,
+            finished = true,
+            cancelled = outcome.errorMessage != null
+        )
+        outcome
+    }
 
-        val complete = finishedByPump && !cancelled && abs(delivered - amount) <= BOLUS_AMOUNT_EPSILON
+    /**
+     * Turns the pump's own history entry into the result AAPS is told about.
+     *
+     * `success` requires a completed-bolus entry whose amount matches the request. An aborted entry
+     * carries the partial amount and reports failure while still passing that amount up, because
+     * the caller needs both halves of that to get IOB right.
+     */
+    private fun bolusOutcome(
+        amount: Double,
+        record: HistoryEntry?,
+        progressSeen: Double,
+        mismatch: String?
+    ): BolusDeliveryResult {
+        if (record == null) {
+            // Nothing in the log. It may still have been delivered and simply not logged yet, so
+            // this must not be reported as "nothing happened" — the honest answer is that the
+            // amount is unknown and the pump has to be looked at.
+            val floor = if (progressSeen > 0.0) " The pump reported at least $progressSeen U before the log was read." else ""
+            log("Bolus NOT CONFIRMED: no new bolus entry in the pump's event log.$floor")
+            return BolusDeliveryResult(
+                success = false,
+                errorMessage = "Not confirmed: the pump's log shows no bolus for this request. " +
+                    "Check the pump before bolusing again.$floor",
+                deliveredUnits = progressSeen.takeIf { it > 0.0 }?.toFloat(),
+                requestedUnits = amount.toFloat()
+            )
+        }
+
+        val delivered = record.value1 / 100.0
+        val aborted = record.entryType == EventType.BOLUS_IMMEDIATE_ABORT
+        val complete = !aborted && mismatch == null && abs(delivered - amount) <= BOLUS_AMOUNT_EPSILON
+
         val error = when {
-            mismatch != null -> mismatch
-            cancelled        -> "Bolus cancelled after $delivered U of $amount U"
-            !finishedByPump  -> "Timed out waiting for the pump to finish; it reported $delivered U of $amount U"
-            !complete        -> "Pump delivered $delivered U of the $amount U requested"
+            mismatch != null -> "$mismatch (the pump logged $delivered U)"
+            aborted          -> "Bolus aborted after $delivered U of $amount U"
+            !complete        -> "Pump logged $delivered U of the $amount U requested"
             else             -> null
         }
-        error?.let { log("Bolus result: $it") }
-            ?: log("Bolus complete and confirmed by the pump: $delivered U")
 
-        BolusDeliveryResult(
+        log(
+            "Bolus confirmed from the pump's log: seq=${record.sequence} " +
+                "type=${record.entryType}(${record.entryTypeName}) v1=${record.value1} → $delivered U" +
+                (error?.let { " — $it" } ?: "")
+        )
+
+        return BolusDeliveryResult(
             success = complete,
             errorMessage = error,
             deliveredUnits = delivered.toFloat(),
             requestedUnits = amount.toFloat()
         )
     }
+
+    /**
+     * Looks for a standard-bolus entry newer than [afterSequence], retrying briefly because the
+     * pump writes the entry when delivery ends rather than when it starts.
+     */
+    private suspend fun findBolusRecord(afterSequence: Long): HistoryEntry? {
+        repeat(BOLUS_HISTORY_ATTEMPTS) { attempt ->
+            val newest = suspendReadHistoryEvents(BOLUS_HISTORY_SEARCH_ENTRIES)
+                .filter { it.sequence > afterSequence && it.entryType in STANDARD_BOLUS_TYPES }
+                .maxByOrNull { it.sequence }
+
+            if (newest != null) return newest
+            if (attempt < BOLUS_HISTORY_ATTEMPTS - 1) {
+                log("No bolus entry above sequence $afterSequence yet; re-reading the log")
+                delay(BOLUS_HISTORY_RETRY_MS)
+            }
+        }
+        return null
+    }
+
+    /** Newest sequence number in the event log, or null if the log could not be read. */
+    private suspend fun newestEventSequence(): Long? =
+        suspendReadHistoryEvents(1).maxOfOrNull { it.sequence }
 
     /**
      * Asks the pump to stop the running bolus.
@@ -671,14 +781,16 @@ class YpsoPumpManagerImpl private constructor(
         )
     }
 
+    /** How long the pump should take to deliver [amount] at the configured speed. */
+    private fun expectedDeliveryMs(amount: Double): Long =
+        ((amount / (bolusSpeedUnitsPerMinute / 60.0)) * 1000).toLong()
+
     /**
      * How long to wait for the pump to finish, from the configured bolus speed plus slack for the
      * command round trip and the pump's own start-up.
      */
-    private fun bolusTimeoutMs(amount: Double): Long {
-        val deliverySeconds = amount / (bolusSpeedUnitsPerMinute / 60.0)
-        return ((deliverySeconds + BOLUS_TIMEOUT_SLACK_SECONDS) * 1000).toLong()
-    }
+    private fun bolusTimeoutMs(amount: Double): Long =
+        expectedDeliveryMs(amount) + (BOLUS_TIMEOUT_SLACK_SECONDS * 1000).toLong()
 
     // ==================== DELIVERY — NOT IMPLEMENTED ====================
     //
@@ -754,6 +866,9 @@ class YpsoPumpManagerImpl private constructor(
 
     private suspend fun suspendCancelBolus(): Boolean =
         suspendCancellableCoroutine { cont -> bleManager.cancelBolus("fast") { cont.resume(it) } }
+
+    private suspend fun suspendReadHistoryEvents(maxEntries: Int): List<HistoryEntry> =
+        suspendCancellableCoroutine { cont -> bleManager.readHistoryEvents(maxEntries) { cont.resume(it) } }
 
     // ==================== INTERNAL ====================
 
