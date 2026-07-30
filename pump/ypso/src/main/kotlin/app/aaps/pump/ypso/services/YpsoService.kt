@@ -416,7 +416,7 @@ class YpsoService : DaggerService() {
 
             if (result.deliveredUnits > 0.0) {
                 ypsoPump.lastBolusAmount = result.deliveredUnits
-                ypsoPump.lastBolusTime = result.timestampMillis ?: dateUtil.now()
+                ypsoPump.lastBolusTime = dateUtil.now()
             }
             recordBolus(detailedBolusInfo, result)
 
@@ -437,8 +437,19 @@ class YpsoService : DaggerService() {
             return
         }
 
+        // The **phone's** clock, not the pump's entry timestamp.
+        //
+        // Using the pump's put a bolus 12 hours into the future and so out of every window AAPS
+        // cares about: the treatment existed but showed nowhere and contributed no IOB, while the
+        // dialog reported success because the *amount* had been confirmed. The pump counts its
+        // clock in local terms and the decoder read it as UTC (see PORTING_NOTES §5), and beyond
+        // that bug, a treatment time that depends on the pump's clock being right is a bad trade
+        // for something the phone knows exactly.
+        //
+        // Dedupe is unaffected: `syncBolusWithPumpId` matches on `pumpId`, so a later history sync
+        // of this same bolus still resolves to one record.
         val synced = pumpSync.syncBolusWithPumpId(
-            timestamp = result.timestampMillis ?: dateUtil.now(),
+            timestamp = dateUtil.now(),
             amount = result.deliveredUnits,
             type = detailedBolusInfo.bolusType,
             pumpId = sequence,

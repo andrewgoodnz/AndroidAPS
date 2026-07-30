@@ -5,6 +5,9 @@ import com.ypsopump.sdk.internal.protocol.EventType
 import org.junit.jupiter.api.Test
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.time.Duration
+import java.time.LocalDateTime
+import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.ZonedDateTime
 
@@ -34,14 +37,45 @@ class HistoryEntryTest {
         .array()
 
     /**
-     * The 1.5 U bolus from §5, at 2026-07-29 21:58 local. The epoch offset is the thing under test:
-     * converted timestamps landed on plausible real dates across a two-year span, which is what
-     * confirmed the pump counts from 2000-01-01.
+     * ⚠ The pump counts **local** wall-clock seconds, not seconds since 2000-01-01 UTC.
+     *
+     * The real capture: a 1.5 U bolus delivered at **21:58 local** on 2026-07-29 logged
+     * `ts = 1785362330`. Adding the UTC epoch offset to that gives 2026-07-29 **21:58:50 UTC** —
+     * the right wall-clock reading attached to the wrong instant, out by the local UTC offset. It
+     * hid for exactly that reason: the dates looked plausible and the times matched what had been
+     * done to the pump, because a local counter read as UTC hands the original wall time straight
+     * back.
+     *
+     * It surfaced when a bolus recorded at one of these timestamps landed 12 hours in the future
+     * and produced no IOB at all.
+     */
+    @Test
+    fun `the pump counter is local wall-clock seconds, not UTC`() {
+        val pumpSeconds = 1_785_362_330L - 946_684_800L
+
+        val decoded = HistoryEntry.pumpSecondsToUnix(pumpSeconds)
+
+        // 21:58:50 as a local reading, whatever zone the test runs in.
+        val asLocalWallTime = ZonedDateTime.of(2026, 7, 29, 21, 58, 50, 0, ZoneId.systemDefault())
+            .toEpochSecond()
+        assertThat(decoded).isEqualTo(asLocalWallTime)
+
+        // And explicitly *not* the old UTC reading, except where the test host happens to be on UTC.
+        if (ZoneId.systemDefault().rules.getOffset(java.time.Instant.ofEpochSecond(decoded)).totalSeconds != 0) {
+            assertThat(decoded).isNotEqualTo(1_785_362_330L)
+        }
+    }
+
+    /**
+     * The counter has to be built by **wall-clock** arithmetic, not by subtracting two instants:
+     * 2000-01-01 is in summer time in New Zealand and July is not, so the two differ by an hour.
+     * That the pump is oblivious to this is the whole point — it counts wall time.
      */
     @Test
     fun `an entry decodes its fields and converts the pump epoch`() {
-        val wanted = ZonedDateTime.of(2026, 7, 29, 21, 58, 0, 0, ZoneOffset.UTC).toEpochSecond()
-        val pumpSeconds = wanted - 946_684_800L
+        val wall = LocalDateTime.of(2026, 7, 29, 21, 58, 0)
+        val pumpSeconds = Duration.between(LocalDateTime.of(2000, 1, 1, 0, 0, 0), wall).seconds
+        val wanted = wall.atZone(ZoneId.systemDefault()).toEpochSecond()
 
         val parsed = HistoryEntry.parse(
             encode(pumpSeconds, EventType.BOLUS_IMMEDIATE, value1 = 150, sequence = 160_265L, index = 9)

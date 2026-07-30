@@ -223,14 +223,29 @@ internal data class HistoryEntry(
     val index: Int
 ) {
     companion object {
-        // YpsoPump epoch: 2000-01-01 00:00:00 UTC = 946684800 Unix seconds
-        private const val YPSO_EPOCH_OFFSET_SEC = 946684800L
+
+        /**
+         * The pump's epoch, 2000-01-01 00:00:00 — but in the pump's **own local time**, not UTC.
+         *
+         * ⚠ This is the correction. Treating the counter as seconds since 2000-01-01 *UTC* put every
+         * timestamp out by the local UTC offset, which in New Zealand is 12 hours. It went unnoticed
+         * because the dates were checked for plausibility and the times were compared as wall-clock
+         * readings — and a local counter read as UTC gives back the original wall time, so the
+         * numbers *looked* right while the instants were wrong. It surfaced when a bolus recorded at
+         * one of these timestamps landed 12 hours in the future and produced no IOB.
+         *
+         * The pump has no idea what a time zone is: [syncTime] writes local hour/minute/second into
+         * it, so its counter measures local wall-clock seconds. Converting therefore has to go
+         * through a local calendar rather than adding a fixed offset, which also gets DST right —
+         * a fixed offset would be wrong for half the year.
+         */
+        private const val YPSO_EPOCH_YEAR = 2000
 
         fun parse(data: ByteArray): HistoryEntry {
             require(data.size >= 17) { "History entry must be at least 17 bytes, got ${data.size}" }
             val buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
             val pumpSeconds = buf.int.toLong() and 0xFFFFFFFFL
-            val timestamp = pumpSeconds + YPSO_EPOCH_OFFSET_SEC
+            val timestamp = pumpSecondsToUnix(pumpSeconds)
             val entryType = buf.get().toInt() and 0xFF
             val value1 = buf.short.toInt() and 0xFFFF
             val value2 = buf.short.toInt() and 0xFFFF
@@ -247,6 +262,24 @@ internal data class HistoryEntry(
                 sequence = sequence,
                 index = index
             )
+        }
+
+        /**
+         * Converts the pump's counter — local wall-clock seconds since 2000-01-01 — to Unix seconds.
+         *
+         * Goes through a local [Calendar] rather than adding a constant, so the answer is right on
+         * both sides of a daylight-saving change.
+         */
+        fun pumpSecondsToUnix(pumpSeconds: Long): Long {
+            val cal = Calendar.getInstance().apply {
+                clear()
+                set(YPSO_EPOCH_YEAR, Calendar.JANUARY, 1, 0, 0, 0)
+            }
+            // Added in two steps: the seconds count exceeds what Calendar.add takes comfortably in
+            // one go for dates far from the epoch.
+            cal.add(Calendar.DAY_OF_YEAR, (pumpSeconds / 86_400L).toInt())
+            cal.add(Calendar.SECOND, (pumpSeconds % 86_400L).toInt())
+            return cal.timeInMillis / 1000L
         }
     }
 }
