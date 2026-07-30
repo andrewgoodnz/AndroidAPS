@@ -181,6 +181,16 @@ class YpsoService : DaggerService() {
         scope.launch {
             pumpManager.newAlerts.collect { alert -> raisePumpAlert(alert) }
         }
+
+        // Persist every change, not just the ones that raised an alarm. The stored count is the
+        // high-water mark of what the user has been told about, so an alert that arrives while
+        // AAPS is closed still gets announced at the next connection instead of being absorbed
+        // into a fresh baseline.
+        scope.launch {
+            pumpManager.alertCount.collect { count ->
+                if (count >= 0) preferences.put(YpsoIntNonKey.LastAlertCount, count)
+            }
+        }
     }
 
     /**
@@ -202,10 +212,6 @@ class YpsoService : DaggerService() {
         } else {
             uiInteraction.addNotification(Notification.PUMP_WARNING, text, Notification.NORMAL)
         }
-
-        // Remember how far through the alert log we have got, so a restart does not re-announce
-        // alarms the user has already been shown.
-        preferences.put(YpsoIntNonKey.LastAlertCount, pumpManager.lastKnownAlertCount)
     }
 
     override fun onDestroy() {

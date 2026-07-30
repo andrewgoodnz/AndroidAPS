@@ -458,15 +458,22 @@ class YpsoPumpManagerImpl private constructor(
     /**
      * Entries in the pump's alert log as of the last check; -1 means "not yet known".
      *
-     * The caller seeds this from storage so a restart does not re-announce alarms already seen,
-     * and so the very first check establishes a baseline rather than firing for every occlusion in
-     * the pump's two-year history.
+     * A flow rather than a plain field so the caller can persist **every** change, not just the
+     * ones that raised an alarm. That is what makes an alert arriving while AAPS is closed get
+     * announced at the next connection: the stored count is the high-water mark, and the gap
+     * between it and the pump's count is the set of alerts nobody has been told about yet. Persist
+     * only on alarms and the baseline silently absorbs them instead.
+     *
+     * The caller seeds it from storage, so the very first check on a fresh install establishes a
+     * baseline rather than firing for every occlusion in the pump's two-year history.
      */
-    var lastKnownAlertCount: Int = -1
-        private set
+    private val _alertCount = MutableStateFlow(-1)
+    val alertCount: StateFlow<Int> = _alertCount
+
+    val lastKnownAlertCount: Int get() = _alertCount.value
 
     fun seedAlertBaseline(count: Int) {
-        lastKnownAlertCount = count
+        _alertCount.value = count
     }
 
     /**
@@ -477,7 +484,7 @@ class YpsoPumpManagerImpl private constructor(
     private suspend fun checkForNewAlerts() {
         val count = suspendReadAlertsCount() ?: return
         val previous = lastKnownAlertCount
-        lastKnownAlertCount = count
+        _alertCount.value = count
 
         if (previous < 0) {
             log("Alert log has $count entries; taking that as the baseline")
