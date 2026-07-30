@@ -566,11 +566,14 @@ class YpsoService : DaggerService() {
                 // smaller problem than a temporary basal AAPS thinks is still running.
                 val sequence = result.pumpSequence
                 val endPumpId = sequence ?: dateUtil.now()
-                if (sequence == null) {
+                // Only a mismatch worth warning about: AAPS held an id for a running temporary basal
+                // and the pump's log could not be made to agree. A cancel with nothing running finds
+                // no entry because there is none, which is not a fault and should not read like one.
+                if (sequence == null && expectedSequence != null) {
                     aapsLogger.warn(
                         LTag.PUMP,
-                        "TBR is stopped but the pump logged no identifiable entry; closing the AAPS record " +
-                            "under a timestamp id instead of leaving it open"
+                        "TBR is stopped but the entry AAPS expected (seq=$expectedSequence) was not in the log; " +
+                            "closing the AAPS record under a timestamp id instead of leaving it open"
                     )
                 }
                 val synced = pumpSync.syncStopTemporaryBasalWithPumpId(

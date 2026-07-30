@@ -517,6 +517,15 @@ change rather than only when an alarm fires. That distinction is the whole featu
 alarms and an alert arriving while AAPS is closed gets absorbed into a fresh baseline at the next
 start, which is precisely the moment AAPS could have said the pump had stopped.
 
+**⚠ Not every notice the user sees on a pump app is a pump alert.** On 2026-07-31 the mylife
+controller raised `Insulin remaining 18.2U passed 20U` while AAPS was talking to the same pump, and
+the pump's alert count **did not move** — 144 before, 144 after, across every poll either side. So a
+low-reservoir notice is computed by the *controller* from the reservoir reading, not logged by the
+pump, and no amount of watching the alert log will ever surface it. If AAPS is to warn on a low
+reservoir it has to do the same arithmetic on the phone. This matters for judging the alert feature:
+the alert log carries events the pump itself raises, and reasoning about coverage from what another
+app displays will overstate what is there to be seen.
+
 **Also fixed: the NUL terminator on the pump's string characteristics.** `getStringValue` returns
 it as part of the value, so the serial was stored as `10074292` plus `U+0000`. Invisible on screen,
 but it becomes `pumpSerial` on every `PumpSync` call, and a serial differing by one unprintable byte
