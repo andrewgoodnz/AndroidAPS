@@ -306,9 +306,19 @@ exists to prevent, so it needs to be seen working before insulin.
 > - **Cancel:** byte 10 back to 100. Cancelling with nothing running reports success and "no end
 >   entry to record", which is correct on both counts.
 >
-> **Still open — one request each:** ask for **250%** to settle whether the pump's maximum is 200%
-> (this driver) or 500% (`PumpType.YPSOPUMP`); and see a temporary basal survive an **hour
-> boundary**, where the same percentage becomes a different absolute rate.
+> **⚠ The cancel initially left AAPS believing the TBR was still running** — the ACT tab kept
+> offering "CANCEL 150%" while byte 10 read 100, because this pump *rewrites* the TBR entry in place
+> instead of appending an end record (`PORTING_NOTES` §4h). Fixed and re-verified: two full
+> set→cancel cycles recorded start and stop under the same sequence (160371, 160372), and the ACT tab
+> now reads "TEMPBASAL".
+>
+> **The UI was the check that caught it.** Byte 10, the history entry and the driver's own log all
+> said the cancel had worked. Only "CANCEL 150%" still being offered showed that AAPS disagreed —
+> so when a write changes AAPS state, look at AAPS, not just at the pump.
+>
+> **Still open:** ask for **250%** to settle whether the pump's ceiling is 200% or 500% — the driver
+> no longer refuses it, so byte 10 will answer. And see a temporary basal cross an **hour boundary**,
+> where the same percentage becomes a different absolute rate.
 
 ---
 

@@ -254,17 +254,21 @@ class YpsoPumpManagerImpl private constructor(
     override val maxBolusAmount: Double = 25.0
 
     /**
-     * ⚠ **Unsettled, and narrower than AAPS believes.** This 0–200% comes from upstream, while
-     * `PumpType.YPSOPUMP.tbrSettings` declares a maximum of **500%** — so AAPS will offer rates
-     * this driver then refuses.
+     * Matches what `PumpType.YPSOPUMP.tbrSettings` declares, so AAPS is not offered rates this
+     * driver refuses out of hand.
      *
-     * Refusing is the deliberate choice: clamping would leave AAPS believing it had set a rate the
-     * pump is not running, and a silent difference in delivered insulin is worse than a visible
-     * failure. Only hardware can settle which figure is right — ask for 250% on saline and see
-     * whether byte 10 comes back as 250 or the command is rejected. Until then the narrower bound
-     * holds, because over-stating what the pump accepts is the dangerous direction.
+     * **The pump is the arbiter, not this range.** Upstream had 0–200% and AAPS declares 500%, and
+     * nothing in the sources settles which is right — so a narrow guess here refused 250% *before it
+     * reached the pump*, which meant the one experiment that would answer the question could never
+     * run. Guarding against the pump's limits by guessing them is not a guard; it is a different
+     * guess.
+     *
+     * Asking is safe because every set is confirmed by reading byte 10 back: if the pump clamps 250%
+     * to 200%, the read-back disagrees with the request and the result is an honest failure naming
+     * both figures. If it honours 250%, byte 10 says so. Either way hardware answers, and a wrong
+     * rate cannot be reported as a right one.
      */
-    override val tbrPercentRange: IntRange = 0..200
+    override val tbrPercentRange: IntRange = 0..500
 
     /**
      * Selects the salt mixed into the MD5 auth password. `false` (default) uses the salt from

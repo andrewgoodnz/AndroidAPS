@@ -549,13 +549,24 @@ running reports success with "no end entry to record" — correct on both counts
 Setting it would otherwise leave AAPS believing a temporary basal was running while byte 10 says
 none is.
 
-**⚠ Still unsettled: the maximum percentage.** This driver allows 0–200% while
-`PumpType.YPSOPUMP.tbrSettings` declares **500%**, so AAPS will offer rates the driver refuses.
-Refusing is deliberate — clamping would leave AAPS believing it had set a rate the pump is not
-running, and a silent difference in delivered insulin is worse than a visible failure. **One
-hardware request settles it:** ask for 250% on saline and see whether byte 10 comes back as 250 or
-the command is rejected. Until then the narrower bound holds, because over-stating what the pump
-accepts is the dangerous direction.
+### ⚠ The maximum percentage — and a guard that prevented its own test
+
+Upstream had `tbrPercentRange = 0..200`; `PumpType.YPSOPUMP.tbrSettings` declares **500%**. Nothing
+in the sources settles which is right.
+
+The first attempt kept the narrow bound on the grounds that over-stating what the pump accepts is
+the dangerous direction. On hardware that turned out to be self-defeating: a 250% request was
+**refused by the driver before it reached the pump**, so the one experiment that could answer the
+question was the one thing the guard made impossible. Guarding against the pump's limits by guessing
+them is not a guard — it is a different guess, wearing the costume of caution.
+
+The range now matches what AAPS declares, and **the pump is the arbiter**. That is safe precisely
+because every set is confirmed by reading byte 10 back: ask for 250% and if the pump clamps to 200%
+the read-back disagrees with the request and the result is an honest failure naming both figures; if
+it honours 250%, byte 10 says so. A wrong rate cannot be reported as a right one either way, which
+is what makes asking cheaper than guessing.
+
+**Still to run:** ask 250% and read the answer off byte 10.
 
 ### ⚠⚠ [verified] The pump rewrites the TBR history entry in place
 
