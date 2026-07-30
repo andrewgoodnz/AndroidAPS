@@ -472,6 +472,52 @@ fallback in `readExtended` has to stay.
 nearer 25 U/min. It only affects the completion timeout, which is generous, so nothing is broken —
 but `YpsoBolusSpeed` should not be trusted as a rate until it is measured properly.
 
+#### ⚠⚠ [verified] Cancelling on the *pump* made AAPS record the full amount
+
+2026-07-31. A 4 U bolus was started from AAPS and stopped on the pump's own buttons partway.
+**AAPS recorded 4.0 U. The reservoir says about 2.5 U went in.** IOB over-counted by roughly 1.5 U,
+reported as a success, with every check the driver had passing.
+
+Two independent defects lined up, and each alone would have been caught by the other:
+
+**1. The pump rewrites the bolus entry in place, exactly like the TBR entry (§4h).** Type
+**19 `Bolus Immediate Running`** while delivering, becoming type **2 `Bolus Immediate`** when it
+stops — same sequence number, with `v1` rewritten from the amount *requested* to the amount
+*given*. The driver's `STANDARD_BOLUS_TYPES` accepted type 19, so it read:
+
+```
+Bolus confirmed from the pump's log: seq=160492 type=19(Bolus Immediate Running) v1=400 → 4.0 U
+deliverBolus: asked 4.0U, pump delivered 4.0U, success=true
+```
+
+`400` is the 4.00 U that was asked for. **The confirmation was the command, echoed back.** The
+entire discipline of this driver is that a write is confirmed by an effect you go and read, never by
+the command — and it was defeated by a log entry that restates the command. It was justified in a
+comment on the grounds that "missing the entry entirely is worse than matching a type that never
+appears"; the type does appear, and matching it is worse than missing it.
+
+**2. Leaving `DELIVERING` was treated as finishing.** `isTerminal` was `status != IDLE && status !=
+DELIVERING`, a blacklist, so every one of the 254 values nobody had observed counted as an end
+state. The pump-side cancel produced status **2**, which is in no table here:
+
+```
+06:35:13.733  BolusNotification: 02 …    Pump bolus status left DELIVERING (Unknown(2))
+06:35:15.200  Bolus confirmed from the pump's log … type=19 … → 4.0 U
+06:35:15.914  BolusNotification: 04 …    COMPLETED — 2.2 s after the outcome was decided
+```
+
+So the log was read during the window in which the pump had not yet revised it. Had the wait run to
+`COMPLETED`, the entry would already have settled to type 2 with the partial.
+
+**Both fixed.** `isTerminal` is now a whitelist of `CANCELLED` and `COMPLETED` only. `findBolusRecord`
+treats a type-19 match as *not yet an answer* and re-reads until the entry settles; if it never
+settles the entry is still returned, but `bolusOutcome` refuses to call it complete at any value and
+says plainly that the figure is the request rather than the delivery. Tests pin both.
+
+**The general rule this pump keeps teaching, now in a third place:** an entry that is still being
+written is not evidence, and "not the state I was waiting for" is not the same as "the state I was
+waiting for has passed". Clock, TBR and bolus have each produced one variant of it.
+
 ### 4g. Recording a bolus, and raising the pump's alarms — **[verified]**
 
 **Boluses reach `PumpSync` under the pump's own sequence number.** That identity exists only
@@ -1055,30 +1101,120 @@ Firmware confirmed **V05.02.03**.
 
 ---
 
-## 8. What remains before insulin
+## 8. Where this stands, and what is still unmapped
 
-**Done and verified on hardware, 2026-07-30:** the clock write (§4e), the standard bolus with abort
-(§4f), bolus recording into `PumpSync` and pump alarms (§4g), and the temporary basal with cancel
-(§4h). The status bytes were already fully mapped (§4) and the history mapping verified against
-actions on the pump (§5).
+### 8.1 Confirmed on hardware
 
-**Phase 4, the basal profile write, is coded and completely untested.** It is the last write and the
-destructive one. Its envelope is probably already right — `writeSetting` → `writeGlb` is the bare
-8-byte path every profile *read* exercises — but per the envelope table that is a prediction until a
-setting *value* has actually been written, and writing an *index* is not the same thing.
+All four delivery phases are verified on pump 10074292, firmware V05.02.03, on saline, off-body.
 
-**The full list of outstanding tests is at the top of `SALINE_TEST_PROCEDURE.md`.** The two I would
-expect to fail:
+| | What | Confirmed by | §|
+|---|---|---|---|
+| Read | status bytes, 24 basal rates, clock, history, alert **count** | parity against the pump's display | §4, §4e |
+| Write | pump clock | read-back, the pump's display, and a type 12/13 entry | §4e |
+| Write | standard bolus **and abort** | the event log's type-2 entry and its amount | §4f |
+| Write | temporary basal, set and cancel | byte 10, plus the effective rate arithmetic | §4h |
+| Write | basal profile, 24 slots | all 24 read back, and the pump's display | §4i |
+| Record | bolus, TBR and TBR-stop into `PumpSync` under the pump's sequence | IOB on the home screen | §4g |
 
-- **A 0.00 U/h slot.** The driver writes `0`; the pump uses `-1` for an unprogrammed slot (§4c). One
-  of those is wrong and only hardware knows which.
-- **The alarm notification.** The alert-count path is proven, but the branch that raises the
-  notification has never fired.
+Three wire envelopes are established and, per the envelope table in §4, **each is a property of the
+characteristic, not of the firmware**: bolus is 13 B + CRC, TBR is 16 B bare, the clock and every GLB
+setting are bare. Discovery remains as a fallback for any characteristic not yet written.
 
-**Remaining before `YpsoSyncHistoryToAaps` goes on:**
+### 8.2 ⚠ The alert path has never been observed working, and the evidence for it is thinner than it looks
+
+This is the largest live gap, and it is worth stating precisely because an earlier revision of these
+notes over-claimed it.
+
+**What is actually proven:** `readHistoryCount(…fcbec83b7bc5)` returns a number, on every status poll.
+That is all.
+
+**What is not proven:** that this pump ever *appends* to the alert log. The count has read **144 on
+every poll across two days**, including a session in which an occlusion physically stopped the pump.
+The one full dump of the alert log was taken with the **old code, which read the oldest slots** — the
+table in §5 showing alerts from 2024-06-11 → 2025-02-28 is therefore the *bottom* of the log, not the
+top. **The newest alert entry has never been read.** So "the newest alert is from 2025" is not a
+finding; it is an artefact of which end was read.
+
+**Removing the cartridge did not raise anything** (2026-07-31). A plausible explanation is that a
+cartridge change on this pump is a *user-initiated procedure* that stops the pump first, so there is
+no unexpected condition to alert on — but that is a hypothesis, not a finding.
+
+**The cheap decisive test, in this order:**
+
+1. Press **Read history** and look at the alert entries it dumps. `readHistoryWithDump` reads both
+   logs, newest-first. If yesterday's occlusion is near index 0, the log works and only the *count*
+   needs to move. If the newest alert is still from 2025, this firmware does not append alerts and
+   the entire feature rests on a characteristic that never changes.
+2. Only then decide how to raise an alarm — from the delivery mode (§8.3) rather than the alert log,
+   if the log turns out to be inert.
+
+Until step 1 is done, **do not describe pump alarms as covered.** And note §4g's separate finding:
+a low reservoir is not a pump alert at all, it is the controller doing arithmetic.
+
+### 8.3 ⚠ The delivery-mode byte is mapped for two values out of 256
+
+Byte 0 of the system status is confirmed for exactly two states, both checked against the pump's own
+display: **3 = Stopped**, **10 = Running**. Everything else returns `null` from `isDeliveringOrNull`
+and shows as `Unverified mode N`.
+
+`YpsoPumpManagerImpl` collapses that with `isDeliveringOrNull(mode) == true`, so **an unmapped mode
+makes AAPS report the pump suspended.** That is the deliberate direction — claiming delivery that is
+not happening is the error that harms — but it means any state the pump enters that we have not seen
+presents to AAPS as a suspended pump, which stops the loop acting.
+
+What is known to still read `10`: a temporary basal running (checked repeatedly). What has **never
+been looked at**:
+
+| State | Why it matters |
+|---|---|
+| during a bolus | if byte 0 changes, AAPS flips to "suspended" mid-bolus, every bolus |
+| during priming / a cartridge change | the pump is genuinely not delivering; does it say so, or does it say something new? |
+| after an alarm has stopped the pump | **the most important one.** If an alarm stops delivery and byte 0 goes to a third value, this is where AAPS should learn insulin has stopped — and it may be a better channel than the alert log |
+| paused | upstream lists a `PAUSED = 7`; unobserved on V05 |
+
+Mapping this is cheap — put the pump in each state and read byte 0 — and it may make §8.2 moot.
+
+### 8.4 Other unmapped states, in rough order of how much they could cost
+
+1. **A bolus while a temporary basal runs.** Never tried together. Both are confirmed from the event
+   log by sequence, and a bolus entry landing between a TBR's entry and its cancel is exactly the
+   condition that broke `findTbrEndRecord` (§4h) — which is now fixed, but the *forward* case, a TBR
+   set while a bolus's entry is the newest, has not been exercised.
+2. **BLE loss mid-command.** Pull the pump out of range during a bolus, a TBR write and a profile
+   write. The bolus is confirmed from history so it *should* resolve on reconnect; the profile write
+   stops at the first failed slot and reads back to show how far it got, which has never been seen
+   happen. A half-written basal program is the worst outcome the driver can produce.
+3. **A temporary basal crossing an hour boundary.** Inherent, not a bug (§4h), but it has never been
+   watched happen and the size of the discontinuity is unmeasured.
+4. **The pump stopped from its own buttons while AAPS is connected.** Does AAPS notice, and how fast?
+   It only polls when the command queue has work, so an alarm or a stop while idle is unseen until
+   the next connection. **The latency of noticing anything is itself unmeasured.**
+5. **Reservoir `-1`.** Coded for (`reservoirKnown`), never observed. Likewise an unprogrammed basal
+   slot reading `-1` → `0.0`, which would make `isThisProfileSet` false permanently (§4i).
+6. **Low battery.** Only 2-of-4 bars has ever been seen. The mapping of 0 and 1 bars, and whether the
+   pump alerts, are both unknown — and AAPS acts on pump battery level.
+7. **Bolus and basal caps.** Event types 33 and 34 exist for them. Whether the pump refuses an
+   over-cap bolus, and what the driver then reports, is untested — and "the pump refused" must not
+   surface as success.
+8. **Extended and combined bolus.** Still refused by the driver. Out of scope until the standard
+   bolus has soaked, but they are two of the four bolus types the history mapper already decodes.
+9. **The event log filling or wrapping.** The count reads 3000 and looks capped. What happens to
+   sequence numbers at the cap decides whether `sincePosition` can work at all (§8.5).
+10. **A DST transition.** `pumpSecondsToUnix` converts through a local calendar and is tested across
+    a boundary in unit tests, but no real transition has occurred while the driver was running.
+11. **Two controllers at once.** Now known to be more than theoretical: the study phone running Lotus
+    writes the basal profile unprompted when it wakes (§4i). What happens if both are connected
+    during a delivery command is unknown, and the driver holds its connection rather than releasing
+    it between commands.
+
+### 8.5 Remaining before `YpsoSyncHistoryToAaps` goes on
+
+Still off, and still its own gate, because getting it wrong corrupts IOB silently rather than
+visibly. Ordering, epoch, `pumpId` and the event mapping are settled (§5); what remains:
 
 1. **`sincePosition` filtering** — how already-seen entries are skipped. Sort by sequence, never by
-   timestamp (§5's type-12 trap).
+   timestamp (§5's type-12 trap). Depends on item 9 above: if sequences wrap at the cap, a
+   monotonic `sincePosition` is not sound.
 2. **Delivery and history disagree on timestamps.** Delivery records at the phone's time
    (deliberately — §5); a history sync would record at the pump's. The `pumpId` is the same either
    way so they reconcile to one record, but decide which timestamp wins first.
@@ -1086,12 +1222,6 @@ expect to fail:
 The TBR reconstruction problem that looked like a third blocker is **resolved** — the entry's
 timestamp is the start and survives the rewrite, so a type-10 entry describes a complete temporary
 basal (§4h).
-6. **Delivery-mode map.** Extend `DeliveryMode` by observation as the phases above run: record
-   byte 0 while priming, bolusing and running a TBR. Anything but `3` and `10` still reads as
-   unverified, and `isDelivering` stays false, which under-reports a delivering pump.
-7. **`YpsoSyncHistoryToAaps`.** Still off. Ordering, epoch, `pumpId` and the event mapping are
-   all settled (§5); what remains is deciding how `sincePosition` filters entries already seen.
-   Its own gate, because getting it wrong corrupts IOB silently rather than visibly.
 
 ### Unit tests
 

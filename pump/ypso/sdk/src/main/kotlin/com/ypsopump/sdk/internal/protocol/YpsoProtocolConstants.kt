@@ -209,7 +209,19 @@ internal object BolusNotificationStatus {
         else -> "Unknown($status)"
     }
 
-    fun isTerminal(status: Int): Boolean = status != IDLE && status != DELIVERING
+    /**
+     * Whether delivery has **finished**, by whitelist.
+     *
+     * ⚠ This was `status != IDLE && status != DELIVERING`, which makes every unmapped value
+     * terminal. Cancelling a 4 U bolus on the pump produced status **2** — a value not in this
+     * table — and the driver concluded delivery was over. The real end, `4 COMPLETED`, arrived
+     * 2.2 seconds later, by which time the outcome had already been decided and recorded.
+     *
+     * A blacklist of the two states we happen to know are non-terminal asserts something about
+     * 252 values nobody has seen. Only a state confirmed to mean "finished" ends the wait; anything
+     * else means keep waiting, and the caller's own timeout bounds it.
+     */
+    fun isTerminal(status: Int): Boolean = status == CANCELLED || status == COMPLETED
 }
 
 /**

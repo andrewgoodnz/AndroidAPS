@@ -175,9 +175,13 @@ class YpsoPumpManagerImpl private constructor(
         /**
          * Event types a standard bolus can produce. `2` settles the outcome and carries the amount
          * — including for a bolus stopped from AAPS, which this pump logs as type 2 with the
-         * partial rather than as type 29. `29` and `19` are listed because the firmware may use
-         * them in cases not yet seen, and missing the entry entirely is worse than matching a type
-         * that never appears.
+         * partial rather than as type 29.
+         *
+         * ⚠ **`19` is listed so it can be recognised and waited out, not accepted.** It is the
+         * bolus still in progress and its `v1` is the amount *requested*; see [findBolusRecord],
+         * which will not return it as an answer while any attempt remains. It is in this set
+         * because the alternative — filtering it out — makes an in-progress bolus look like no
+         * entry at all, and "no entry" is reported as an unknown amount rather than as a partial.
          */
         private val STANDARD_BOLUS_TYPES = setOf(
             EventType.BOLUS_IMMEDIATE,
@@ -816,9 +820,15 @@ class YpsoPumpManagerImpl private constructor(
                     sawDelivering = true
                     progressSeen = maxOf(progressSeen, status.fastInjected.toDouble())
                     _bolusProgress.value = BolusProgress(progressSeen, amount, finished = false, cancelled = cancelRequested)
-                } else if (sawDelivering) {
-                    log("Pump bolus status left DELIVERING (${BolusNotificationStatus.name(status.fastStatus)})")
+                } else if (sawDelivering && BolusNotificationStatus.isTerminal(status.fastStatus)) {
+                    log("Pump bolus status reached ${BolusNotificationStatus.name(status.fastStatus)}")
                     break
+                } else if (sawDelivering) {
+                    // ⚠ Not the same thing as finishing. Cancelling on the pump produced status 2,
+                    // which is in no table we have, and `COMPLETED` followed 2.2 s later. Breaking
+                    // here decided the outcome before the pump had finished revising its own log,
+                    // and the entry read at that instant still carried the requested amount.
+                    log("Pump bolus status left DELIVERING for ${BolusNotificationStatus.name(status.fastStatus)} — not terminal, still waiting")
                 }
             }
 
@@ -874,10 +884,15 @@ class YpsoPumpManagerImpl private constructor(
 
         val delivered = record.value1 / 100.0
         val aborted = record.entryType == EventType.BOLUS_IMMEDIATE_ABORT
-        val complete = !aborted && mismatch == null && abs(delivered - amount) <= BOLUS_AMOUNT_EPSILON
+        // The entry never settled out of its running form, so `delivered` is the amount requested
+        // echoed back, not a measurement. It cannot be called complete at any value.
+        val stillRunning = record.entryType == EventType.BOLUS_IMMEDIATE_RUNNING
+        val complete = !aborted && !stillRunning && mismatch == null && abs(delivered - amount) <= BOLUS_AMOUNT_EPSILON
 
         val error = when {
             mismatch != null -> "$mismatch (the pump logged $delivered U)"
+            stillRunning     -> "Not confirmed: the pump's entry still reads 'running', so $delivered U is the " +
+                "amount requested and not the amount given. Check the pump."
             // ⚠ Verified on hardware: a bolus stopped from AAPS is logged as type **2**
             // (Bolus Immediate) carrying the partial amount — *not* type 29. So a cancellation
             // cannot be recognised from the entry type, and [cancelRequested] is what distinguishes
@@ -906,22 +921,45 @@ class YpsoPumpManagerImpl private constructor(
     }
 
     /**
-     * Looks for a standard-bolus entry newer than [afterSequence], retrying briefly because the
-     * pump writes the entry when delivery ends rather than when it starts.
+     * Looks for a standard-bolus entry newer than [afterSequence], retrying until it has **settled**.
+     *
+     * ⚠ **A type-19 entry is the bolus still running, and its `v1` is the amount that was asked
+     * for.** Like the temporary basal (§4h), the pump keeps one entry per bolus and rewrites it in
+     * place: type 19 `Bolus Immediate Running` while delivering, type 2 `Bolus Immediate` once it
+     * stops, with `v1` rewritten from the request to what was actually given.
+     *
+     * Accepting the type-19 form therefore reads our own request back and calls it a confirmation.
+     * A 4 U bolus cancelled on the pump after about 2.5 U logged `seq=160492 type=19 v1=400`, and the
+     * driver reported 4.0 U delivered — over-counting IOB by 1.5 U, silently, with every check it
+     * had passing. That is the precise failure the "confirm from an effect, never from the command"
+     * rule exists to prevent, defeated by an entry that echoes the command.
+     *
+     * So a type-19 match is treated as *not yet answered* and the read is repeated until the entry
+     * settles into a terminal type. If it never settles, the entry is returned anyway — with the
+     * caller told it is provisional — because a bolus whose amount is unknown must not be reported
+     * as nothing at all.
      */
     private suspend fun findBolusRecord(afterSequence: Long): HistoryEntry? {
+        var provisional: HistoryEntry? = null
         repeat(BOLUS_HISTORY_ATTEMPTS) { attempt ->
             val newest = suspendReadHistoryEvents(HISTORY_SEARCH_ENTRIES)
                 .filter { it.sequence > afterSequence && it.entryType in STANDARD_BOLUS_TYPES }
                 .maxByOrNull { it.sequence }
 
-            if (newest != null) return newest
+            if (newest != null && newest.entryType != EventType.BOLUS_IMMEDIATE_RUNNING) return newest
+            if (newest != null) {
+                provisional = newest
+                log(
+                    "Bolus entry seq=${newest.sequence} still reads type 19 (running) with v1=${newest.value1}, " +
+                        "which is the amount requested rather than the amount given; re-reading"
+                )
+            }
             if (attempt < BOLUS_HISTORY_ATTEMPTS - 1) {
-                log("No bolus entry above sequence $afterSequence yet; re-reading the log")
+                if (newest == null) log("No bolus entry above sequence $afterSequence yet; re-reading the log")
                 delay(BOLUS_HISTORY_RETRY_MS)
             }
         }
-        return null
+        return provisional
     }
 
     /** Newest sequence number in the event log, or null if the log could not be read. */
