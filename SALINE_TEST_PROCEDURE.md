@@ -3,10 +3,34 @@
 Hardware procedures for the YpsoPump driver's write path. Companion to `PORTING_NOTES.md`,
 which records what the pump has actually been observed to do.
 
-**Phase 1 has passed on hardware. Phases 2–4 have procedures but no code.** They are written up
-here so each phase's confirmation check is decided while nobody is under pressure to accept a
-weaker one. Their code is deliberately not written yet: each removes a refusal that lets insulin
-move, and each gets its own saline test.
+## ⏳ Everything still to run — read this first
+
+As of 2026-07-30, phases 1–3 have passed on hardware. Phase 4 is coded and **completely untested**.
+In rough order of value:
+
+| # | Test | Why it matters | Where |
+|---|---|---|---|
+| 1 | **Basal profile write**, all of §Phase 4 | The last write, and the destructive one. Nothing has touched hardware | Phase 4 |
+| 2 | **A 0.00 U/h basal slot** | The driver writes `0`; the pump may want `-1`. I expect this to fail | 4e |
+| 3 | **A rate needing rounding** (1.23 U/h) | If the write and `isThisProfileSet` round differently, AAPS rewrites the profile every loop | 4f |
+| 4 | **Restore the original profile** | A write you cannot reverse is not finished | 4g |
+| 5 | **The alarm notification** | Pull the cartridge. An occlusion means insulin has stopped and AAPS must not miss it | Outstanding test |
+| 6 | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
+| 7 | **A bolus while a TBR runs** | Never tried together; both use the pump's sequence numbers | — |
+| 8 | **Reconnect mid-bolus** | Pull BLE range during delivery. The bolus is confirmed from history, so it *should* resolve on reconnect | — |
+| 9 | **The extended bolus** | Still refused. Out of scope until the standard bolus has soaked | — |
+
+**Two known-broken things that are not tests but blockers**, both in `PORTING_NOTES` §8:
+history sync cannot reconstruct a finished temporary basal (the pump rewrites the entry in place),
+and boluses are recorded at delivery time while history sync would record them at the pump's
+timestamp. Both need settling before `YpsoSyncHistoryToAaps` goes on.
+
+---
+
+**Phases 1–3 have passed on hardware; phase 4 is coded but untested.** Each phase was written up
+before its code so that its confirmation check was decided while nobody was under pressure to accept
+a weaker one — which turned out to matter, because three of the phases initially "passed" against a
+check that could not fail.
 
 ---
 
@@ -375,7 +399,50 @@ produces the rate you predicted before running it.
 
 ---
 
-## Phase 4 — basal profile write (not yet implemented)
+## Phase 4 — basal profile write ⏳ **CODED, COMPLETELY UNTESTED**
+
+**This is the destructive one, and nothing about it has touched hardware.** Read this section before
+running any of it.
+
+**Write down the pump's 24 rates by hand first.** The driver logs the program it is about to replace
+(`BASAL PROGRAM x BEFORE OVERWRITE …`), and that log line is the only copy — the pump has no undo. Do
+not rely solely on the log surviving.
+
+**What the code does:**
+
+1. Reads which program is active, and **refuses** if it cannot tell — there would be no safe target.
+2. Reads and logs the existing 24 rates, and **refuses** if it cannot, so nothing is overwritten
+   without a record of what was there.
+3. Writes the 24 slots one at a time, **stopping at the first failure** and then reading back to show
+   how far it got. A half-written program is the worst outcome available.
+4. Reads all 24 back and diffs them. Success requires every slot to match; otherwise it names the
+   slots that differ.
+
+**Rates are rounded to the pump's step before writing**, because the step varies with the rate:
+0.01 U/h below 1, 0.02 to 2, 0.1 to 15, 0.5 above. `isThisProfileSet` compares against the same
+rounded values through the same function — if the two rounded differently, a freshly written profile
+would read as "not set" and AAPS would offer to rewrite it every loop iteration.
+
+### Tests, in order
+
+| # | Step | Confirms |
+|---|---|---|
+| 4a | Note the pump's 24 rates **on the pump itself** | the only reliable backup |
+| 4b | Build an AAPS profile differing in **every** slot, and push it | a flat profile would hide a partial write |
+| 4c | Refresh, then check several slots on the pump's own display, including hour 0 and hour 23 | the read-back diff agrees with the pump's screen |
+| 4d | Check AAPS stops offering to set the profile | `isThisProfileSet` agrees, i.e. the rounding matches |
+| 4e | Include a slot at **0.00 U/h** | ⚠ unknown — the pump uses `-1` for an unprogrammed slot and the driver writes `0`. This may be rejected or read back as something else |
+| 4f | Include a rate needing rounding, e.g. **1.23 U/h** | it should be stored as 1.22 or 1.24, and `isThisProfileSet` should still agree afterwards |
+| 4g | Restore the original 24 rates and confirm the same way | a write you cannot reverse is not finished |
+| 4h | Read history | expect a type **6/7/8** basal-profile-changed entry |
+
+**4e is the one I would expect to fail**, and it is a guess either way — see §4d in the notes. If the
+pump will not store 0.00, the driver needs to write `-1` instead, which is a one-line change once
+hardware says so.
+
+---
+
+## Phase 4 — the original procedure
 
 The most destructive of the four: it overwrites the pump's stored program. **Write down all 24
 rates from the pump before starting**, so the pump can be put back by hand if the write goes

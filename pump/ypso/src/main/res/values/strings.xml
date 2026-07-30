@@ -7,7 +7,7 @@
     <string name="ypso_pump_setting">YpsoPump settings</string>
 
     <string name="ypso_read_only_build">This driver does not deliver insulin</string>
-    <string name="ypso_read_only_banner">SALINE TEST BUILD — bolus and temp basal are enabled and under test. No basal profile write.</string>
+    <string name="ypso_read_only_banner">SALINE TEST BUILD — bolus, temp basal and basal profile write are all enabled. Basal profile write is UNTESTED.</string>
 
     <string name="ypso_pairing_title">Pair YpsoPump</string>
     <string name="ypso_pairing_summary">Scan for your pump and bond to it. Confirm the code shown on the pump.</string>
@@ -65,6 +65,7 @@
     <string name="ypso_tbr_failed">Temp basal failed — the pump did not confirm it</string>
     <string name="ypso_tbr_cancel_failed">Temp basal cancel failed — the pump did not confirm it</string>
     <string name="ypso_tbr_no_base_rate">Pump basal rate not read yet — cannot convert U/h to a percentage</string>
+    <string name="ypso_profile_write_failed">Basal profile NOT confirmed — check the 24 rates on the pump before relying on it</string>
     <string name="ypso_pump_alert">YpsoPump: %1$s</string>
     <string name="ypso_bolus_over_pump_max">Bolus of %1$.2f U exceeds the pump maximum of %2$.2f U</string>
 

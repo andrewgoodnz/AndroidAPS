@@ -71,6 +71,9 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
         /** The pump's "no temporary basal" percentage, in both directions. */
         private const val TBR_PERCENT_NONE = 100
 
+        /** Hourly slots in a basal program. */
+        private const val BASAL_SLOTS = 24
+
         /** Which arrangement of those 13 bytes to send. See [buildBolusPayload]. */
         private val BOLUS_PAYLOAD_LAYOUT = BolusPayloadLayout.UPSTREAM
 
@@ -693,8 +696,22 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
         }
     }
 
-    /** Envelope the pump has accepted for a given command characteristic, once one is known. */
-    private val learnedEnvelopes = mutableMapOf<UUID, CommandEnvelope>()
+    /**
+     * Envelope to use for each command characteristic.
+     *
+     * Seeded with what firmware V05.02.03 was **observed** to accept, so the common case costs no
+     * round trips: the bolus takes a CRC and the temporary basal does not (§4f, §4h). Discovery
+     * remains the fallback — a seeded envelope that gets refused for its length falls through to
+     * trying the rest, so a different firmware still works, just a little slower on its first
+     * command.
+     *
+     * Before seeding, every app start paid two ATT rejections per characteristic rediscovering
+     * facts already written down.
+     */
+    private val learnedEnvelopes = mutableMapOf(
+        YpsoPumpUuids.CHAR_BOLUS_START_STOP to CommandEnvelope.CRC,
+        YpsoPumpUuids.CHAR_TBR_START_STOP to CommandEnvelope.BARE
+    )
 
     /**
      * Writes a command payload to a **write-only** characteristic, discovering the envelope.
@@ -722,23 +739,30 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
         what: String,
         callback: (Boolean) -> Unit
     ) {
-        learnedEnvelopes[char.uuid]?.let { known ->
+        val known = learnedEnvelopes[char.uuid]
+        if (known != null) {
             val bytes = known.wrap(payload)
             log("$what: writing ${bytes.size}B to ${char.uuid} as ${known.label}: ${bytes.toHexString()}")
             writeCharacteristic(char, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
                 .with { _, _ -> callback(true) }
                 .fail { _, status ->
-                    // The envelope worked before, so this is a real failure rather than a wrong
-                    // guess. Forget it so the next attempt rediscovers instead of repeating.
-                    log("$what: write failed (GATT status=$status) using the previously accepted ${known.label}; forgetting it")
-                    learnedEnvelopes.remove(char.uuid)
-                    callback(false)
+                    if (status == GATT_INVALID_ATTRIBUTE_LENGTH) {
+                        // Wrong length, so this firmware disagrees with what was seeded or learned.
+                        // Refused by the ATT layer, nothing reached the pump: drop the assumption and
+                        // discover, rather than failing a command over a stale guess.
+                        log("$what: ${known.label} refused as the wrong length; rediscovering")
+                        learnedEnvelopes.remove(char.uuid)
+                        tryEnvelopes(char, payload, what, CommandEnvelope.entries - known, callback)
+                    } else {
+                        log("$what: write failed (GATT status=$status) using ${known.label} — not a length problem")
+                        callback(false)
+                    }
                 }
                 .enqueue()
             return
         }
 
-        log("$what: ${char.uuid} is write-only (properties=0x%02X), discovering the envelope".format(char.properties))
+        log("$what: ${char.uuid} has no known envelope (properties=0x%02X), discovering".format(char.properties))
         tryEnvelopes(char, payload, what, CommandEnvelope.entries.toList(), callback)
     }
 
@@ -1406,6 +1430,61 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
                 log("Basal profile read failed at index $currentIndex (slot ${currentIndex - rates.size})")
                 callback(null)
             }
+        }
+    }
+
+    /**
+     * Writes 24 hourly rates into a basal program, one setting at a time.
+     *
+     * Rates arrive already rounded to the pump's step — that is the caller's job, because the step
+     * varies with the rate (0.01 below 1 U/h, 0.02 to 2, 0.1 to 15, 0.5 above) and the table lives
+     * in AAPS's `PumpType`, not here.
+     *
+     * Stops at the first failure rather than pressing on. A half-written basal program is the worst
+     * outcome available, so the caller is told immediately and can read back to see how far it got.
+     * `writeSetting` uses the bare 8-byte GLB path (§4b) that every profile *read* already exercises.
+     */
+    fun writeBasalProfile(program: Char, ratesUnitsPerHour: List<Double>, callback: (Boolean) -> Unit) {
+        val startIndex = when (program) {
+            'A'  -> SettingsIndex.PROGRAM_A_START
+            'B'  -> SettingsIndex.PROGRAM_B_START
+            else -> null
+        }
+        if (startIndex == null) {
+            log("writeBasalProfile: unknown program '$program'")
+            callback(false)
+            return
+        }
+        if (ratesUnitsPerHour.size != BASAL_SLOTS) {
+            log("writeBasalProfile: need $BASAL_SLOTS hourly rates, got ${ratesUnitsPerHour.size}")
+            callback(false)
+            return
+        }
+
+        log("Writing basal program $program: ${ratesUnitsPerHour.map { "%.2f".format(it) }}")
+        writeBasalRateSequential(startIndex, 0, ratesUnitsPerHour, callback)
+    }
+
+    private fun writeBasalRateSequential(
+        startIndex: Int,
+        slot: Int,
+        rates: List<Double>,
+        callback: (Boolean) -> Unit
+    ) {
+        if (slot >= rates.size) {
+            log("Basal program write complete: ${rates.size} slots")
+            callback(true)
+            return
+        }
+
+        val centiUnits = Math.round(rates[slot] * 100).toInt()
+        writeSetting(startIndex + slot, centiUnits) { success ->
+            if (!success) {
+                log("Basal program write FAILED at hour $slot (setting index ${startIndex + slot}) — the program is now partly written")
+                callback(false)
+                return@writeSetting
+            }
+            writeBasalRateSequential(startIndex, slot + 1, rates, callback)
         }
     }
 

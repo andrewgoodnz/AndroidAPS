@@ -217,7 +217,11 @@ framing is what cost two hardware attempts.
 state-changing writes needed a different answer, and going from the clock to the bolus by
 assumption failed. Candidates are complete, correct encodings differing only in wrapper, a wrong
 length is refused by the ATT layer without reaching the pump, and the accepted one is remembered
-per characteristic. On the TBR it cost two harmless rejections and 300 ms:
+per characteristic. The map is now **seeded** with the two verified answers so the normal case costs
+no round trips — before that, every app start rediscovered facts already written down here — and
+discovery stays as the fallback, entered when a seeded envelope is refused for its length.
+
+On the TBR, before seeding, discovery cost two harmless rejections and 300 ms:
 
 ```
 18B payload+CRC        → refused (13)
@@ -561,12 +565,23 @@ question was the one thing the guard made impossible. Guarding against the pump'
 them is not a guard — it is a different guess, wearing the costume of caution.
 
 The range now matches what AAPS declares, and **the pump is the arbiter**. That is safe precisely
-because every set is confirmed by reading byte 10 back: ask for 250% and if the pump clamps to 200%
-the read-back disagrees with the request and the result is an honest failure naming both figures; if
-it honours 250%, byte 10 says so. A wrong rate cannot be reported as a right one either way, which
-is what makes asking cheaper than guessing.
+because every set is confirmed by reading byte 10 back: a rate the pump will not honour shows up as
+a read-back disagreeing with the request, and a wrong rate cannot be reported as a right one.
 
-**Still to run:** ask 250% and read the answer off byte 10.
+**[verified] The pump accepts 250%.** Asked for 250% for 15 minutes:
+
+```
+TBR: FA 00 00 00 05 FF FF FF 0F 00 00 00 F0 FF FF FF
+Status: Rate: 3.0U/h, TBR 250% 15min left
+TBR confirmed by read-back: 250% with 15min left, logged as seq=160373 v1=250 v2=15
+```
+
+1.20 U/h × 250% = **3.00 U/h exactly**, so it is genuinely running the rate.
+
+**So upstream's 0–200% is simply wrong**, and the narrow guard would not merely have blocked the
+experiment — it would have capped this driver at 200% for good, silently withholding a capability
+the pump has. The true ceiling above 250% is still unmeasured; the pump arbitrates, so it does not
+need to be guessed.
 
 ### ⚠⚠ [verified] The pump rewrites the TBR history entry in place
 
@@ -944,19 +959,30 @@ Firmware confirmed **V05.02.03**.
 (§4h). The status bytes were already fully mapped (§4) and the history mapping verified against
 actions on the pump (§5).
 
-**Next:**
+**Phase 4, the basal profile write, is coded and completely untested.** It is the last write and the
+destructive one. Its envelope is probably already right — `writeSetting` → `writeGlb` is the bare
+8-byte path every profile *read* exercises — but per the envelope table that is a prediction until a
+setting *value* has actually been written, and writing an *index* is not the same thing.
 
-1. **Basal profile write** (phase 4) — the last write. AAPS `Profile` → 24 `BasalBlock`s; read back
-   and diff all 24 in `Double` (§4d). Record the pump's existing 24 rates first, because this one is
-   destructive. Its envelope is likely already right: it goes through `writeSetting` → `writeGlb`,
-   which is the bare-8-byte path every profile *read* already exercises — but per the envelope table
-   that is a prediction, not a fact, until a setting *value* has been written.
+**The full list of outstanding tests is at the top of `SALINE_TEST_PROCEDURE.md`.** The two I would
+expect to fail:
 
-**Two small open questions, each one hardware request:**
+- **A 0.00 U/h slot.** The driver writes `0`; the pump uses `-1` for an unprogrammed slot (§4c). One
+  of those is wrong and only hardware knows which.
+- **The alarm notification.** The alert-count path is proven, but the branch that raises the
+  notification has never fired.
 
-2. **The TBR maximum** — 200% or 500%? Ask for 250% and read byte 10 (§4h).
-3. **The alarm notification** — the count path works but the notification branch has never fired.
-   See the outstanding test in `SALINE_TEST_PROCEDURE.md`.
+**Two blockers on `YpsoSyncHistoryToAaps`, both from today:**
+
+1. **A finished temporary basal cannot be reconstructed from history**, because the pump rewrites the
+   one entry in place (§4h). The mapper keys `TbrStarted` and `TbrEnded` on the same sequence and a
+   read only ever sees whichever state the entry is currently in.
+2. **Delivery and history disagree on timestamps.** Delivery records at the phone's time
+   (deliberately — §5); a history sync would record at the pump's. Same `pumpId`, so they reconcile,
+   but decide which timestamp wins before switching it on.
+
+Also unresolved: `sincePosition` filtering, and whether `entry.timestamp` on a mutated TBR entry is
+the start or the end of the temporary basal — that one is measurable and matters for reconstruction.
 6. **Delivery-mode map.** Extend `DeliveryMode` by observation as the phases above run: record
    byte 0 while priming, bolusing and running a TBR. Anything but `3` and `10` still reads as
    unverified, and `isDelivering` stays false, which under-reports a delivering pump.

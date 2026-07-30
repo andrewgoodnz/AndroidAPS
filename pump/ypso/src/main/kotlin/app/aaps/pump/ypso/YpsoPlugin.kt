@@ -14,6 +14,7 @@ import app.aaps.core.data.pump.defs.PumpDescription
 import app.aaps.core.data.pump.defs.PumpType
 import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.logging.LTag
+import app.aaps.core.interfaces.notifications.Notification
 import app.aaps.core.interfaces.plugin.PluginDescription
 import app.aaps.core.interfaces.profile.Profile
 import app.aaps.core.interfaces.pump.DetailedBolusInfo
@@ -21,6 +22,7 @@ import app.aaps.core.interfaces.pump.Pump
 import app.aaps.core.interfaces.pump.PumpEnactResult
 import app.aaps.core.interfaces.pump.PumpPluginBase
 import app.aaps.core.interfaces.pump.PumpSync
+import app.aaps.core.interfaces.pump.defs.determineCorrectBasalSize
 import app.aaps.core.interfaces.pump.defs.fillFor
 import app.aaps.core.interfaces.queue.CommandQueue
 import app.aaps.core.interfaces.queue.CustomCommand
@@ -28,6 +30,7 @@ import app.aaps.core.interfaces.resources.ResourceHelper
 import app.aaps.core.interfaces.rx.AapsSchedulers
 import app.aaps.core.interfaces.rx.bus.RxBus
 import app.aaps.core.interfaces.rx.events.EventAppExit
+import app.aaps.core.interfaces.ui.UiInteraction
 import app.aaps.core.interfaces.utils.fabric.FabricPrivacy
 import app.aaps.core.keys.interfaces.Preferences
 import app.aaps.core.validators.preferences.AdaptiveIntPreference
@@ -49,6 +52,7 @@ import io.reactivex.rxjava3.kotlin.plusAssign
 import javax.inject.Inject
 import javax.inject.Provider
 import javax.inject.Singleton
+import kotlin.math.abs
 
 /**
  * AAPS pump driver for the YpsoPump, running against an unlocked plaintext research pump.
@@ -78,6 +82,7 @@ class YpsoPlugin @Inject constructor(
     private val context: Context,
     private val fabricPrivacy: FabricPrivacy,
     private val ypsoPump: YpsoPump,
+    private val uiInteraction: UiInteraction,
     private val pumpEnactResultProvider: Provider<PumpEnactResult>
 ) : PumpPluginBase(
     pluginDescription = PluginDescription()
@@ -180,7 +185,7 @@ class YpsoPlugin @Inject constructor(
         append("Firmware: ${ypsoPump.firmwareVersion.ifBlank { "?" }}")
         if (!veryShort) {
             append("\nMode: ${ypsoPump.deliveryModeName.ifBlank { "?" }}")
-            append("\nSaline test build: bolus + temp basal")
+            append("\nSaline test build: profile write UNTESTED")
         }
     }
 
@@ -208,14 +213,84 @@ class YpsoPlugin @Inject constructor(
 
     // ==================== NO DELIVERY: NOTHING BELOW TOUCHES THE PUMP ====================
 
+    /**
+     * Whether the pump's basal program already matches [profile].
+     *
+     * Compared against the **rounded** rates, not the profile's own: the pump's step varies with the
+     * rate, so a profile asking for 1.23 U/h can only ever be stored as 1.22 or 1.24. Comparing
+     * against the unrounded value would report a mismatch on a correctly written profile for ever,
+     * and AAPS would offer to rewrite it on every loop iteration.
+     *
+     * Returns false whenever the pump's rates are not known — the honest answer when there is
+     * nothing to compare, and it makes AAPS offer the write rather than assume agreement.
+     */
     override fun isThisProfileSet(profile: Profile): Boolean {
-        // Claiming the profile is set would let AAPS believe the pump matches when it has never
-        // been written. Claiming it is not set makes AAPS offer to write it, which this build
-        // then refuses. The second is the honest answer, and the refusal is visible to the user.
-        return false
+        val pumpRates = ypsoPump.basalProfileRates
+        if (pumpRates.size != HOURS_IN_DAY) return false
+
+        val wanted = hourlyRatesFor(profile)
+        val mismatch = (0 until HOURS_IN_DAY).firstOrNull { abs(pumpRates[it] - wanted[it]) > BASAL_RATE_EPSILON }
+        if (mismatch != null) {
+            aapsLogger.debug(
+                LTag.PUMP,
+                "isThisProfileSet: hour $mismatch differs — pump ${pumpRates[mismatch]} vs wanted ${wanted[mismatch]}"
+            )
+        }
+        return mismatch == null
     }
 
-    override fun setNewBasalProfile(profile: Profile): PumpEnactResult = notImplemented("setNewBasalProfile")
+    /**
+     * Writes the AAPS profile into the pump's active basal program.
+     *
+     * **Destructive**, and only reported as done once all 24 slots have been read back and matched —
+     * see `YpsoPumpManagerImpl.writeBasalProfile`, which also logs the program it replaced, because
+     * the pump has no undo and that log line is the only copy.
+     */
+    @Synchronized
+    override fun setNewBasalProfile(profile: Profile): PumpEnactResult {
+        val result = pumpEnactResultProvider.get()
+        val service = ypsoService
+        if (!isInitialized() || service == null) {
+            return result.success(false).enacted(false).comment(rh.gs(R.string.ypso_bolus_not_connected))
+        }
+
+        val wanted = hourlyRatesFor(profile)
+        aapsLogger.info(LTag.PUMP, "setNewBasalProfile: writing ${wanted.map { "%.2f".format(it) }}")
+
+        val written = service.writeBasalProfile(wanted)
+        if (written) {
+            uiInteraction.addNotificationValidFor(
+                Notification.PROFILE_SET_OK, rh.gs(app.aaps.core.ui.R.string.profile_set_ok), Notification.INFO, 60
+            )
+            return result.success(true).enacted(true).comment(rh.gs(app.aaps.core.ui.R.string.ok))
+        }
+
+        uiInteraction.addNotification(
+            Notification.FAILED_UPDATE_PROFILE, rh.gs(R.string.ypso_profile_write_failed), Notification.URGENT
+        )
+        return result.success(false).enacted(false).comment(rh.gs(R.string.ypso_profile_write_failed))
+    }
+
+    /**
+     * The 24 hourly rates the pump would hold for [profile], each rounded to the step the pump can
+     * actually store at that rate — 0.01 U/h below 1, 0.02 to 2, 0.1 to 15, 0.5 above.
+     *
+     * One function so the write and [isThisProfileSet] cannot disagree: if they rounded differently,
+     * a freshly written profile would read as not set.
+     */
+    private fun hourlyRatesFor(profile: Profile): List<Double> =
+        (0 until HOURS_IN_DAY).map { hour ->
+            PumpType.YPSOPUMP.determineCorrectBasalSize(profile.getBasalTimeFromMidnight(hour * 60 * 60))
+        }
+
+    private companion object {
+
+        /** The pump stores one basal rate per hour. */
+        const val HOURS_IN_DAY = 24
+
+        /** Half the pump's finest basal step, for comparing rates read back against rates asked for. */
+        const val BASAL_RATE_EPSILON = 0.005
+    }
 
     /**
      * Delivers a standard bolus. **Under saline test — see SALINE_TEST_PROCEDURE.md phase 2.**

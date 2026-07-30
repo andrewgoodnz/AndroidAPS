@@ -31,6 +31,8 @@ import app.aaps.pump.ypso.keys.YpsoBooleanKey
 import app.aaps.pump.ypso.keys.YpsoIntKey
 import app.aaps.pump.ypso.keys.YpsoIntNonKey
 import app.aaps.pump.ypso.keys.YpsoStringKey
+import com.pump.common.BasalBlock
+import com.pump.common.BasalProfile
 import com.pump.common.PumpConnectionState
 import com.pump.common.PumpHistoryEvent
 import com.ypsopump.sdk.YpsoEventTypes
@@ -577,6 +579,36 @@ class YpsoService : DaggerService() {
             rxBus.send(EventYpsoPumpDataChanged())
             result
         }
+    }
+
+    /**
+     * Overwrites the pump's active basal program with 24 hourly rates.
+     *
+     * Rates must already be rounded to the pump's step — [app.aaps.pump.ypso.YpsoPlugin] owns that,
+     * because the step table lives in AAPS's `PumpType`.
+     *
+     * On success the cached rates are replaced so `baseBasalRate` and `isThisProfileSet` reflect what
+     * the pump now holds rather than what it held before.
+     */
+    fun writeBasalProfile(hourlyRates: List<Double>): Boolean = awaitResult("writeBasalProfile", false) {
+        val profile = BasalProfile(
+            profileId = ypsoPump.activeProfileId.takeIf { it >= 0 } ?: 0,
+            name = "AAPS",
+            blocks = hourlyRates.map { BasalBlock(durationMinutes = 60, basalRate = it) }
+        )
+        val written = pumpManager.writeBasalProfile(profile)
+        aapsLogger.info(LTag.PUMP, "writeBasalProfile: confirmed=$written")
+
+        if (written) {
+            ypsoPump.basalProfileRates = hourlyRates
+        } else {
+            // What the pump holds is no longer known to match anything cached. Drop the cache so
+            // baseBasalRate reports 0.0 (honestly "not known") instead of a stale profile, and so
+            // isThisProfileSet cannot claim agreement.
+            ypsoPump.basalProfileRates = emptyList()
+        }
+        rxBus.send(EventYpsoPumpDataChanged())
+        written
     }
 
     /** The pump's own speed index: `0` = 3 U/min, `1` = 12 U/min, `2` = 33.3 U/min. */

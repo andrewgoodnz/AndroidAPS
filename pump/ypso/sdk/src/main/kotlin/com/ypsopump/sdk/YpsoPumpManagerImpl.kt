@@ -139,6 +139,16 @@ class YpsoPumpManagerImpl private constructor(
         /** Breathing room between writing a temporary basal and reading byte 10 back. */
         private const val TBR_SETTLE_MS = 700L
 
+        /** Hourly slots in a basal program. */
+        private const val BASAL_SLOTS = 24
+
+        /**
+         * Tolerance for the basal read-back diff, half of the pump's finest 0.01 U/h step. Compared
+         * in `Double` deliberately — §4d — because a widened `Float` would report a mismatch on a
+         * correct profile for ever.
+         */
+        private const val BASAL_RATE_EPSILON = 0.005
+
         /** Re-reads while waiting for the pump to rewrite the TBR entry from type 9 to type 10. */
         private const val TBR_END_LOOKUP_ATTEMPTS = 3
 
@@ -1155,6 +1165,73 @@ class YpsoPumpManagerImpl private constructor(
             .filter { it.sequence > afterSequence && it.entryType in types }
             .maxByOrNull { it.sequence }
 
+    // ==================== BASAL PROFILE WRITE ====================
+
+    /**
+     * Overwrites the pump's active basal program with 24 hourly rates, then reads all 24 back.
+     *
+     * **The most destructive write in the driver**, so it does three things before claiming success:
+     *
+     * 1. **Reads and logs the program it is about to replace.** If a write goes wrong halfway there
+     *    has to be a record of what was there, and the pump offers no undo. The log line is the only
+     *    copy.
+     * 2. Writes the 24 slots, stopping at the first failure — a half-written program is the worst
+     *    outcome, so it is reported rather than papered over.
+     * 3. **Reads all 24 back and diffs them.** Success means the pump's program matches what was
+     *    asked for, slot by slot; anything else names the slots that differ.
+     *
+     * Rates must arrive rounded to the pump's step. The caller owns that, because the step varies
+     * with the rate and the table lives in AAPS's `PumpType`.
+     */
+    override suspend fun writeBasalProfile(profile: BasalProfile): Boolean = withConnection {
+        val wanted = profile.blocks.map { it.basalRate }
+        if (wanted.size != BASAL_SLOTS) {
+            log("writeBasalProfile refused: need $BASAL_SLOTS hourly blocks, got ${wanted.size}")
+            return@withConnection false
+        }
+
+        val program = suspendReadActiveProgram()
+        if (program == null) {
+            log("writeBasalProfile refused: could not read which program is active, so there is no safe target")
+            return@withConnection false
+        }
+
+        // The only copy of what is about to be overwritten.
+        val existing = suspendReadBasalProfile(program)
+        if (existing == null) {
+            log("writeBasalProfile refused: could not read the existing program $program, so it could not be recorded before being replaced")
+            return@withConnection false
+        }
+        log("BASAL PROGRAM $program BEFORE OVERWRITE (restore from this if needed): ${existing.map { "%.2f".format(it) }}")
+        log("BASAL PROGRAM $program being written:                                  ${wanted.map { "%.2f".format(it) }}")
+
+        if (!suspendWriteBasalProfile(program, wanted)) {
+            log("writeBasalProfile: the write failed part-way. Reading back what the pump now holds")
+            suspendReadBasalProfile(program)?.let {
+                log("BASAL PROGRAM $program AFTER A FAILED WRITE: ${it.map { "%.2f".format(it) }}")
+            }
+            return@withConnection false
+        }
+
+        val readBack = suspendReadBasalProfile(program)
+        if (readBack == null) {
+            log("writeBasalProfile: the program did not read back, so what the pump now holds is UNKNOWN — read it on the pump")
+            return@withConnection false
+        }
+
+        val mismatches = wanted.indices.filter { abs(readBack[it] - wanted[it]) > BASAL_RATE_EPSILON }
+        if (mismatches.isNotEmpty()) {
+            log(
+                "writeBasalProfile FAILED the read-back diff at ${mismatches.size} of $BASAL_SLOTS slots: " +
+                    mismatches.joinToString { "h$it wanted ${wanted[it]} got ${readBack[it]}" }
+            )
+            return@withConnection false
+        }
+
+        log("Basal program $program written and confirmed: all $BASAL_SLOTS slots read back as asked")
+        true
+    }
+
     // ==================== DELIVERY — NOT IMPLEMENTED ====================
     //
     // Nothing below touches the pump. These exist only to satisfy the PumpManager contract;
@@ -1169,11 +1246,6 @@ class YpsoPumpManagerImpl private constructor(
         extendedAmount: Double,
         durationMinutes: Int
     ): BolusDeliveryResult = refuseDelivery("deliverMultiwaveBolus($immediateAmount, $extendedAmount, $durationMinutes)")
-
-    override suspend fun writeBasalProfile(profile: BasalProfile): Boolean {
-        log("REFUSED writeBasalProfile(${profile.name}) — $NOT_IMPLEMENTED")
-        return false
-    }
 
     override suspend fun setActiveProfile(profileId: Int): Boolean {
         log("REFUSED setActiveProfile($profileId) — $NOT_IMPLEMENTED")
@@ -1234,6 +1306,15 @@ class YpsoPumpManagerImpl private constructor(
 
     private suspend fun suspendCancelTbr(): Boolean =
         suspendCancellableCoroutine { cont -> bleManager.cancelTbr { cont.resume(it) } }
+
+    private suspend fun suspendReadActiveProgram(): Char? =
+        suspendCancellableCoroutine { cont -> bleManager.readActiveProgram { cont.resume(it) } }
+
+    private suspend fun suspendReadBasalProfile(program: Char): List<Double>? =
+        suspendCancellableCoroutine { cont -> bleManager.readBasalProfile(program) { cont.resume(it) } }
+
+    private suspend fun suspendWriteBasalProfile(program: Char, rates: List<Double>): Boolean =
+        suspendCancellableCoroutine { cont -> bleManager.writeBasalProfile(program, rates) { cont.resume(it) } }
 
     // ==================== INTERNAL ====================
 
