@@ -541,8 +541,13 @@ class YpsoService : DaggerService() {
             errorMessage = rh.gs(R.string.ypso_tbr_cancel_failed)
         )
 
+        // The id AAPS holds for the temporary basal it believes is running. The pump rewrites one
+        // entry in place rather than appending an end record, so this *is* the entry to look for
+        // after the cancel — and nothing about the log's ordering can be used to find it instead.
+        val expectedSequence = pumpSync.expectedPumpState().temporaryBasal?.pumpId
+
         return awaitResult("cancelTempBasal", failed) {
-            val result = pumpManager.cancelTbrConfirmed()
+            val result = pumpManager.cancelTbrConfirmed(expectedSequence)
             aapsLogger.info(
                 LTag.PUMP,
                 "cancelTempBasal: confirmed=${result.confirmed}" + (result.errorMessage?.let { ", $it" } ?: "")

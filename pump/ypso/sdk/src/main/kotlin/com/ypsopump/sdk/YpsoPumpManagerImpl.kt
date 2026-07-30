@@ -124,6 +124,14 @@ class YpsoPumpManagerImpl private constructor(
         /** How many of the newest event-log entries to search for the command just issued. */
         private const val HISTORY_SEARCH_ENTRIES = 5
 
+        /**
+         * A deeper window for temporary basals, because a TBR's entry is not appended when the TBR
+         * *ends* — it is the one written when the TBR started, possibly hours earlier, and anything
+         * the pump logged meanwhile sits on top of it. A 9-hour TBR was found at index 3; one more
+         * event and a 5-entry window would have missed it entirely. Each entry costs ~195 ms.
+         */
+        private const val TBR_SEARCH_ENTRIES = 12
+
         /** Re-reads of the log before giving up on finding the entry. */
         private const val BOLUS_HISTORY_ATTEMPTS = 3
 
@@ -1065,12 +1073,7 @@ class YpsoPumpManagerImpl private constructor(
      * Reports success when the pump already had none running: the caller's intent — no temporary
      * basal — is satisfied, and failing would make AAPS retry something already true.
      */
-    suspend fun cancelTbrConfirmed(): ConfirmedTbr = withConnection {
-        // The running TBR's entry is *already* the newest one, and the pump will rewrite it in place
-        // rather than appending an end record (see findTbrEndRecord). So the search has to include
-        // the current newest, not start above it.
-        val baselineSequence = newestEventSequence()
-
+    suspend fun cancelTbrConfirmed(expectedSequence: Long? = null): ConfirmedTbr = withConnection {
         if (!suspendCancelTbr()) {
             return@withConnection tbrFailure(
                 SystemStatusData.TBR_PERCENT_NONE, 0, "The pump refused the temporary basal cancel"
@@ -1094,7 +1097,7 @@ class YpsoPumpManagerImpl private constructor(
             )
         }
 
-        val record = baselineSequence?.let { findTbrEndRecord(it) }
+        val record = findTbrEndRecord(expectedSequence)
         log(
             "TBR cancel confirmed by read-back: byte 10 is back to ${status.tbrPercent}" +
                 (record?.let { ", logged as seq=${it.sequence} type=${it.entryType}" }
@@ -1137,22 +1140,37 @@ class YpsoPumpManagerImpl private constructor(
      * `type=10 v1=150 v2=2` after a cancel two minutes later.
      *
      * So a temporary basal has **one** sequence number covering both its start and its end, and
-     * searching for an entry *newer* than the start finds nothing — which left the AAPS record open
-     * and AAPS believing a temporary basal was running after the pump had stopped it. Hence `>=`
-     * rather than `>`, and hence retries: the rewrite can lag the cancel.
+     * searching for an entry *newer* than the start finds nothing.
+     *
+     * ⚠ **There is no usable sequence lower bound here at all**, which cost a second round to learn.
+     * An earlier version filtered on `sequence >= newestEventSequence()`, reasoning that a running
+     * TBR's entry is the newest one. That holds when the cancel follows the set by a minute; it
+     * fails as soon as the pump logs anything else in between. A 0% TBR cancelled after nine hours
+     * had three newer entries — two basal-slot changes and a daily total — so its own entry,
+     * `seq=160374`, sat *below* the baseline and was filtered out. The cancel was confirmed, the
+     * entry was sitting there at index 3, and the driver still reported "no end entry found" and
+     * closed the AAPS record under a timestamp id.
+     *
+     * So [expectedSequence] — the id AAPS already holds for the temporary basal it believes is
+     * running — is the identity, and this only has to go and find it. Without one (an app restart
+     * loses it) the newest TBR-typed entry in the window is the best guess available; attributing
+     * the stop to a stale sequence is a far smaller problem than not recording it.
      *
      * Returns whatever TBR entry it finds, even one still reading type 9. Whether the pump stopped
      * is decided by **byte 10**, not by this; the log is only being asked for the identity.
      */
-    private suspend fun findTbrEndRecord(atOrAfterSequence: Long): HistoryEntry? {
+    private suspend fun findTbrEndRecord(expectedSequence: Long?): HistoryEntry? {
         var latest: HistoryEntry? = null
         repeat(TBR_END_LOOKUP_ATTEMPTS) { attempt ->
-            latest = suspendReadHistoryEvents(HISTORY_SEARCH_ENTRIES)
-                .filter { it.sequence >= atOrAfterSequence && it.entryType in TBR_ENTRY_TYPES }
+            val entries = suspendReadHistoryEvents(TBR_SEARCH_ENTRIES)
+            latest = entries
+                .filter { it.entryType in TBR_ENTRY_TYPES }
+                .filter { expectedSequence == null || it.sequence == expectedSequence }
                 .maxByOrNull { it.sequence }
                 ?: latest
 
-            if (latest?.entryType != null && latest?.entryType != EventType.BASAL_PROFILE_TEMP_RUNNING) {
+            // Type 9 means the pump has not rewritten the entry yet; the rewrite can lag the cancel.
+            if (latest != null && latest?.entryType != EventType.BASAL_PROFILE_TEMP_RUNNING) {
                 return latest
             }
             if (attempt < TBR_END_LOOKUP_ATTEMPTS - 1) delay(TBR_END_LOOKUP_RETRY_MS)
