@@ -93,6 +93,31 @@ class SystemStatusDataTest {
         assertThat(status.isTbrRunning).isFalse()
     }
 
+    /**
+     * After an occlusion alarm the pump reported a reservoir of raw -1, which the old decode turned
+     * into **-0.01 U**. `reservoirLevel` feeds AAPS's low-reservoir handling, so a small negative
+     * number reads as "empty" when the truth is "no cartridge to measure".
+     */
+    @Test
+    fun `a reservoir of -1 means unknown, not a negative amount`() {
+        val noCartridge = stopped.copyOf().also {
+            it[1] = 0xFF.toByte(); it[2] = 0xFF.toByte(); it[3] = 0xFF.toByte(); it[4] = 0xFF.toByte()
+        }
+
+        val status = SystemStatusData.parse(noCartridge)!!
+
+        assertThat(status.reservoirKnown).isFalse()
+        assertThat(status.insulinRemaining).isAtLeast(0f)
+    }
+
+    @Test
+    fun `a real reservoir reading is flagged as known`() {
+        assertThat(SystemStatusData.parse(stopped)!!.reservoirKnown).isTrue()
+        // An empty-but-measured cartridge is still a known reading.
+        val empty = stopped.copyOf().also { it[1] = 0; it[2] = 0; it[3] = 0; it[4] = 0 }
+        assertThat(SystemStatusData.parse(empty)!!.reservoirKnown).isTrue()
+    }
+
     /** A short read must decode to nothing rather than to plausible-looking rubbish. */
     @Test
     fun `a truncated payload returns null`() {

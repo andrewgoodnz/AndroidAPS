@@ -62,6 +62,12 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
          */
         private const val GATT_INVALID_ATTRIBUTE_LENGTH = 13
 
+        /** Confirmed by the pump accepting 13 + 2 CRC where a bare 13 was refused. */
+        private const val BOLUS_PAYLOAD_BYTES = 13
+
+        /** Which arrangement of those 13 bytes to send. See [buildBolusPayload]. */
+        private val BOLUS_PAYLOAD_LAYOUT = BolusPayloadLayout.UPSTREAM
+
         /** Salt used by vicktor's SDK, verified against firmware V05.02.03. */
         val AUTH_SALT_SDK = byteArrayOf(
             0x4F, 0xC2.toByte(), 0x45, 0x4D, 0x9B.toByte(),
@@ -77,6 +83,31 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
             0x5B, 0xD7.toByte(), 0x10, 0x66, 0x01,
             0xF2.toByte(), 0x4F, 0x3C, 0x8F.toByte(), 0x6B
         )
+    }
+
+    /**
+     * Candidate arrangements of the 13-byte bolus payload.
+     *
+     * The length is settled; only the arrangement is open, and hardware has ruled one out already.
+     */
+    private enum class BolusPayloadLayout {
+
+        /**
+         * `total(4) + ~total(4) + duration(2) + ~duration(2) + type(1)`.
+         *
+         * Matches how every other safety-critical value this pump accepts is framed — the value
+         * beside its own bitwise complement.
+         */
+        GLB_PAIRS,
+
+        /**
+         * `total(4) + duration(4) + immediate(4) + type(1)`.
+         *
+         * **Ruled out on hardware, 2026-07-30.** The pump accepted the write and then did nothing:
+         * the bolus status stayed all zeros and the reservoir did not move. Kept so the record of
+         * what was tried lives with the code.
+         */
+        UPSTREAM
     }
 
     /** Which salt [computeAuthPassword] mixes in. Defaults to the SDK's. */
@@ -769,7 +800,8 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
             }
 
             log(
-                "Status: ${status.deliveryModeName}, Insulin: ${status.insulinRemaining}U, " +
+                "Status: ${status.deliveryModeName}, " +
+                    "Insulin: ${if (status.reservoirKnown) "${status.insulinRemaining}U" else "unknown (no cartridge)"}, " +
                     "Battery: ${status.batteryBars}/${SystemStatusData.BATTERY_BARS_MAX} bars " +
                     "(${status.batteryPercent}%), Rate: ${status.currentBasalRate}U/h" +
                     if (status.isTbrRunning) {
@@ -800,16 +832,60 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
         val immediateScaled = Math.round(immediateUnits * 100).coerceIn(0, totalScaled)
         val bolusType: Byte = if (durationMinutes == 0) 1 else 2
 
-        val payload = ByteBuffer.allocate(13)
-            .order(ByteOrder.LITTLE_ENDIAN)
-            .putInt(totalScaled)
-            .putInt(durationMinutes)
-            .putInt(immediateScaled)
-            .put(bolusType)
-            .array()
+        val payload = buildBolusPayload(totalScaled, durationMinutes, immediateScaled, bolusType)
 
-        log("Starting bolus: ${"%.2f".format(totalUnits)}U (scaled=$totalScaled), duration=${durationMinutes}min, type=$bolusType")
+        log(
+            "Starting bolus: ${"%.2f".format(totalUnits)}U (scaled=$totalScaled), " +
+                "duration=${durationMinutes}min, type=$bolusType, layout=$BOLUS_PAYLOAD_LAYOUT"
+        )
         sendBolusCommand(payload, callback)
+    }
+
+    /**
+     * Builds the 13-byte bolus payload.
+     *
+     * **The length of 13 is confirmed** — the pump accepted a 15-byte write (13 + CRC) where a
+     * 13-byte bare write had been refused with `GATT_INVALID_ATTRIBUTE_LENGTH`. What was *not*
+     * right is the arrangement inside it: with upstream's layout the pump accepted the write and
+     * then did nothing at all — `CHAR_BOLUS_STATUS` kept reporting `status=0 injected=0 total=0`
+     * and the reservoir did not move. A command it cannot validate is one it discards silently.
+     *
+     * [BolusPayloadLayout.GLB_PAIRS] is the current hypothesis, and it is not a guess about the
+     * length but about where this firmware puts its integrity checks. Everything safety-critical
+     * this driver has seen written carries its own bitwise complement beside it: settings indices
+     * and values (§4b), history indices, and the TBR command, which sends
+     * `percent, ~percent, minutes, ~minutes`. 13 bytes happens to be exactly
+     * `total(4) + ~total(4) + duration(2) + ~duration(2) + type(1)`, so upstream's layout was
+     * sending zeros where the pump wanted `~total`.
+     *
+     * Kept switchable because this is the one thing here that hardware still has to settle, and
+     * changing it should be a one-line edit rather than a rewrite. **Do not add automatic
+     * layout-trying**: unlike the envelope, a wrong layout that the pump *accepts* can deliver a
+     * dose, so each candidate needs its own saline test with the echoed-total check armed.
+     */
+    private fun buildBolusPayload(
+        totalScaled: Int,
+        durationMinutes: Int,
+        immediateScaled: Int,
+        bolusType: Byte
+    ): ByteArray = ByteBuffer.allocate(BOLUS_PAYLOAD_BYTES).order(ByteOrder.LITTLE_ENDIAN).run {
+        when (BOLUS_PAYLOAD_LAYOUT) {
+            BolusPayloadLayout.GLB_PAIRS  -> {
+                putInt(totalScaled)
+                putInt(totalScaled.inv())
+                putShort(durationMinutes.toShort())
+                putShort(durationMinutes.inv().toShort())
+                put(bolusType)
+            }
+
+            BolusPayloadLayout.UPSTREAM   -> {
+                putInt(totalScaled)
+                putInt(durationMinutes)
+                putInt(immediateScaled)
+                put(bolusType)
+            }
+        }
+        array()
     }
 
     /**

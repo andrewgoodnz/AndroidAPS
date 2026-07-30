@@ -765,7 +765,9 @@ class YpsoPumpManagerImpl private constructor(
         // wrongly telling AAPS that basal is running is the error that actually hurts.
         _pumpStatus.value = (_pumpStatus.value ?: PumpStatus()).copy(
             batteryPercent = status.batteryPercent,
-            reservoirUnits = status.insulinRemaining.toDouble(),
+            // Null rather than a number when the pump has no cartridge to measure: a reservoir of
+            // -0.01 U reads as "empty" to anything acting on it, which is a different claim.
+            reservoirUnits = if (status.reservoirKnown) status.insulinRemaining.toDouble() else null,
             deliveryModeName = status.deliveryModeName,
             isDelivering = DeliveryMode.isDeliveringOrNull(status.deliveryMode) == true,
             activeBasalRate = status.currentBasalRate,

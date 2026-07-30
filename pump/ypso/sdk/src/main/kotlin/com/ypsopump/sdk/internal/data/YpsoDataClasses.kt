@@ -39,7 +39,8 @@ internal data class SystemStatusData(
     val batteryBars: Int,
     val currentBasalRate: Double,
     val tbrPercent: Int,
-    val tbrRemainingMinutes: Int
+    val tbrRemainingMinutes: Int,
+    val reservoirKnown: Boolean = true
 ) {
 
     val isTbrRunning: Boolean get() = tbrPercent != TBR_PERCENT_NONE
@@ -48,6 +49,16 @@ internal data class SystemStatusData(
 
         /** The pump reports 100% when no temporary basal is active. */
         const val TBR_PERCENT_NONE = 100
+
+        /**
+         * The pump writes -1 into the reservoir field when it has no cartridge to measure — the
+         * same "unset" convention as an unprogrammed basal slot (§4c).
+         *
+         * Observed after an occlusion alarm, where it surfaced as a reservoir of **-0.01 U**. That
+         * is worse than useless: `reservoirLevel` feeds AAPS's low-reservoir handling, and a small
+         * negative number reads as "empty" rather than "don't know".
+         */
+        const val RESERVOIR_UNKNOWN_RAW = -1
 
         /** The pump's battery gauge has four bars; byte 5 carries a bar count, not a percent. */
         const val BATTERY_BARS_MAX = 4
@@ -71,6 +82,7 @@ internal data class SystemStatusData(
             fun le32(at: Int) = ByteBuffer.wrap(payload, at, 4).order(ByteOrder.LITTLE_ENDIAN).int
 
             val mode = payload[0].toInt() and 0xFF
+            val reservoirRaw = le32(1)
             // Byte 5 is a bar count, verified against a pump displaying "2 of 4 bars" for a raw
             // value of 2. Upstream passed it through as a percentage, turning a half-charged
             // battery into a 2% reading — and AAPS acts on pump battery level.
@@ -78,7 +90,8 @@ internal data class SystemStatusData(
             return SystemStatusData(
                 deliveryMode = mode,
                 deliveryModeName = DeliveryMode.nameFor(mode),
-                insulinRemaining = le32(1) / 100f,
+                insulinRemaining = if (reservoirRaw == RESERVOIR_UNKNOWN_RAW) 0f else reservoirRaw / 100f,
+                reservoirKnown = reservoirRaw != RESERVOIR_UNKNOWN_RAW,
                 batteryPercent = (bars.coerceIn(0, BATTERY_BARS_MAX) * 100) / BATTERY_BARS_MAX,
                 batteryBars = bars,
                 currentBasalRate = le32(6) / 100.0,
