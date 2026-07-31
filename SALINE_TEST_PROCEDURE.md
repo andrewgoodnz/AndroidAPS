@@ -9,6 +9,7 @@ As of 2026-07-31, **all four phases have passed on hardware.** What is left:
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
+| 0 | **Switch history sync on, with someone watching** | ⚠ Built but never enabled. The first sync after enabling should import **nothing** — it only records where to start. If treatments appear, the baseline is wrong and that is phantom IOB. Then bolus **on the pump** and confirm it arrives in AAPS once, at the right amount, and is not duplicated on the next poll | `PORTING_NOTES` §8.5 |
 | 1 | **Decide the alarm poll interval** | Not a test — a decision. An occlusion took **27 minutes** to reach AAPS, because the driver polls every 20 min when idle. See `PORTING_NOTES` §8.2 | — |
 | 2 | **The delivery-mode byte in every state** | Mapped for 2 values out of 256. **Now load-bearing:** a confirmed `STOPPED` writes a 0% suspend record into AAPS, and an unidentified mode deliberately writes nothing. Read byte 0 during a bolus, during priming, and after an alarm stops the pump | `PORTING_NOTES` §8.3, §8.6 |
 | 2a | **Stop the pump from its own buttons** | New behaviour, untested: AAPS should raise an urgent "not delivering" notification and open a 0% `PUMP_SUSPEND` temporary basal so basal IOB stops accruing. Restart it and the record must close | `PORTING_NOTES` §8.6 |

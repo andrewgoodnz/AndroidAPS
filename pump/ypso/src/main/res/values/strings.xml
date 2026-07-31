@@ -68,6 +68,7 @@
     <string name="ypso_profile_write_failed">Basal profile NOT confirmed — check the 24 rates on the pump before relying on it</string>
     <string name="ypso_pump_alert">YpsoPump: %1$s</string>
     <string name="ypso_pump_suspended">YpsoPump is not delivering insulin (%1$s). Basal has stopped.</string>
+    <string name="ypso_history_gap">%1$d YpsoPump history entries were never read, so any treatments in them are missing from AAPS. IOB may be understated.</string>
     <string name="ypso_clock_drifted">The YpsoPump\'s clock is %1$d minutes away from the phone\'s. Events the pump logs will carry the wrong time. Set it from the YPSO tab.</string>
     <string name="ypso_clock_dst_failed">The phone\'s time changed but the YpsoPump\'s clock could not be corrected. The pump\'s clock is now wrong, and events it logs will carry the wrong time. Set it from the YPSO tab.</string>
     <string name="ypso_bolus_over_pump_max">Bolus of %1$.2f U exceeds the pump maximum of %2$.2f U</string>
@@ -81,7 +82,7 @@
     <string name="ypso_history_read_count_title">History entries to read</string>
     <string name="ypso_history_read_count_summary">How many recent entries to pull from each pump log</string>
     <string name="ypso_sync_history_title">Write history to AAPS treatments</string>
-    <string name="ypso_sync_history_summary">Off until the pump\'s history slot indices are confirmed stable on hardware. Enabling this too early can duplicate or hide boluses and so corrupt IOB.</string>
+    <string name="ypso_sync_history_summary">Brings boluses and temp basals given on the pump itself into AAPS. Without it, a bolus from the pump\'s own menu is invisible and AAPS may dose on top of it. The first sync after enabling imports nothing — it records where to start.</string>
     <string name="ypso_legacy_auth_salt_title">Use legacy auth salt</string>
     <string name="ypso_legacy_auth_salt_summary">Try this if the pump accepts the auth write but then refuses to answer reads</string>
 

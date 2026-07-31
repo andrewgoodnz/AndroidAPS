@@ -1377,17 +1377,48 @@ Mapping this is cheap — put the pump in each state and read byte 0 — and it 
     during a delivery command is unknown, and the driver holds its connection rather than releasing
     it between commands.
 
-### 8.5 Remaining before `YpsoSyncHistoryToAaps` goes on
+### 8.5 History sync — built, and still switched off
 
-Still off, and still its own gate, because getting it wrong corrupts IOB silently rather than
-visibly. Ordering, epoch, `pumpId` and the event mapping are settled (§5); what remains:
+**A bolus given on the pump's own menu reached AAPS nowhere.** Nothing read history automatically:
+`loadHistory` ran only when the user pressed the button. So a manual bolus was invisible to the loop,
+IOB was under-stated, and AAPS would dose on top of insulin already delivered — the stacking
+direction. That was the largest gap left before insulin, and it is now implemented in
+`YpsoService.syncHistoryToAaps`, running on every status read when the preference is on.
 
-1. **`sincePosition` filtering** — how already-seen entries are skipped. Sort by sequence, never by
-   timestamp (§5's type-12 trap). Depends on item 9 above: if sequences wrap at the cap, a
-   monotonic `sincePosition` is not sound.
-2. **Delivery and history disagree on timestamps.** Delivery records at the phone's time
-   (deliberately — §5); a history sync would record at the pump's. The `pumpId` is the same either
-   way so they reconcile to one record, but decide which timestamp wins first.
+**What made it tractable was a mistaken assumption falling away.** `syncBolusWithPumpId` had been
+treated as fragile; its contract is an **upsert keyed on `pumpId`** — *"If exists, amount, type (if
+provided) and timestamp is updated"*. Re-reading an entry is therefore harmless, and the watermark is
+an optimisation rather than a correctness requirement. Two other things settled it: events and alerts
+share **one** monotonic sequence counter (§5), so a single watermark covers both; and `pumpId` is
+already the pump's sequence rather than the slot index, which is what lets a bolus recorded at
+delivery and the same bolus seen later resolve to one record.
+
+**Shaped on Medtrum's `syncRecords`** — a persisted sequence watermark, read forward from it, advance
+it, and treat a hole as a safety event. Dana does the same with a timestamp watermark and a
+one-minute overlap, which only works because the sync is idempotent.
+
+Three rules, each for a reason that cost something to learn:
+
+| Rule | Why |
+|---|---|
+| **No watermark means take a baseline, not import everything** | Switching this on would otherwise turn the pump's recent history into treatments carrying IOB, including boluses from before AAPS was installed. The alert count already works this way (§4g) |
+| **Entries the driver recorded itself are excluded** | They are in the database at the *phone's* timestamp (§5). Because the sync upserts, re-syncing one would move the treatment onto **pump** time — quietly undoing the fix for a bug that put boluses 12 hours into the future |
+| **A gap is announced, not stepped over** | If the oldest entry read is above the watermark, entries between them existed and were never seen. The watermark still advances, or the same window is re-read for ever, but the user is told treatments are missing rather than left to infer it from IOB that does not add up |
+
+The decision logic is pure — `HistoryReadResult.freshEvents` and `missedSince` — and pinned by nine
+tests, because it is the last gate before pump history becomes insulin on board. Note that
+`freshEvents` **re-sorts by sequence**: `readHistoryWithDump` hands its events over sorted by
+timestamp, and a clock change makes those go backwards.
+
+**⚠ Still off, and switching it on is its own gate.** The first sync after enabling is the moment a
+baseline bug would surface as phantom IOB, so it wants a human watching. Two things also remain
+unmeasured:
+
+1. **What happens at the log cap.** The event count reads 3000 and looks capped. If sequences wrap or
+   restart there, a monotonic watermark stops being sound.
+2. **Cost under a real loop.** ~195 ms per entry, and one basal profile write appends 24. Reading a
+   50-entry window on every connection is ~10 s, which is fine now and far too slow for a loop
+   issuing SMBs every five minutes.
 
 The TBR reconstruction problem that looked like a third blocker is **resolved** — the entry's
 timestamp is the start and survives the rewrite, so a type-10 entry describes a complete temporary

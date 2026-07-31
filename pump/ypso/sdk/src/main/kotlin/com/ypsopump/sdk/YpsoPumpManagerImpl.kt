@@ -605,8 +605,53 @@ class YpsoPumpManagerImpl private constructor(
      */
     data class HistoryReadResult(
         val events: List<PumpHistoryEvent>,
-        val rawDump: List<String>
-    )
+        val rawDump: List<String>,
+        /**
+         * Every sequence number this read covered, **including entries that mapped to nothing**.
+         *
+         * A watermark cannot be taken from [events] alone. Clock changes, daily totals and
+         * unrecognised types are deliberately dropped by the mapper, so the highest *mapped* sequence
+         * can sit well below the highest sequence that actually exists — and a watermark set from it
+         * would re-read the same entries for ever. The lowest value here is equally load-bearing: if
+         * it is above the caller's watermark, entries were missed between the two and the caller has
+         * a gap it needs to know about rather than silently step over.
+         */
+        val sequencesRead: List<Long>
+    ) {
+
+        val newestSequence: Long? get() = sequencesRead.maxOrNull()
+        val oldestSequence: Long? get() = sequencesRead.minOrNull()
+
+        /**
+         * The events a caller holding [watermark] has not seen, oldest first.
+         *
+         * Pure, and separated from the service so the rule that decides **what becomes a treatment**
+         * can be tested. Ordered by sequence rather than timestamp deliberately: a clock change makes
+         * timestamps go backwards (§5), and sequence is the only ordering this pump guarantees.
+         *
+         * [alreadyRecorded] are sequences the driver put into `PumpSync` itself, at the phone's
+         * timestamp. Re-syncing one would upsert on the same `pumpId` and move the treatment to the
+         * pump's time, which is worse evidence — so they are excluded rather than merely deduplicated.
+         */
+        fun freshEvents(watermark: Long, alreadyRecorded: Set<Long> = emptySet()): List<PumpHistoryEvent> =
+            events
+                .filter { it.position > watermark && it.position !in alreadyRecorded }
+                .sortedBy { it.position }
+
+        /**
+         * How many entries existed between [watermark] and the oldest entry actually read, and were
+         * therefore never seen. Zero when the read reaches back far enough to be contiguous.
+         *
+         * A non-zero answer means treatments are missing, not that the read was merely short: the
+         * pump keeps one sequence counter across both logs, so any gap in it is a gap in what AAPS
+         * knows. A single basal profile write appends 24 entries, so a small read window can open one
+         * quickly.
+         */
+        fun missedSince(watermark: Long): Long {
+            val oldest = oldestSequence ?: return 0
+            return (oldest - watermark - 1).coerceAtLeast(0)
+        }
+    }
 
     /**
      * Reads the pump's event and alert logs, returning both the mapped events and a raw dump.
@@ -633,7 +678,8 @@ class YpsoPumpManagerImpl private constructor(
             rawDump = all.map { e ->
                 "idx=${e.index} seq=${e.sequence} ts=${e.timestamp} type=${e.entryType}(${e.entryTypeName}) " +
                     "v1=${e.value1} v2=${e.value2} v3=${e.value3}"
-            }
+            },
+            sequencesRead = all.map { it.sequence }
         )
     }
 

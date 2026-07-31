@@ -32,7 +32,9 @@ import app.aaps.pump.ypso.events.EventYpsoPumpDeviceChanged
 import app.aaps.pump.ypso.keys.YpsoBooleanKey
 import app.aaps.pump.ypso.keys.YpsoIntKey
 import app.aaps.pump.ypso.keys.YpsoIntNonKey
+import app.aaps.pump.ypso.keys.YpsoLongNonKey
 import app.aaps.pump.ypso.keys.YpsoStringKey
+import app.aaps.pump.ypso.keys.YpsoStringNonKey
 import com.pump.common.BasalBlock
 import com.pump.common.BasalProfile
 import com.pump.common.OperatingMode
@@ -443,8 +445,106 @@ class YpsoService : DaggerService() {
             aapsLogger.debug(LTag.PUMP, "Basal profile ${profile.name}: ${ypsoPump.basalProfileRates}")
         } ?: aapsLogger.warn(LTag.PUMP, "Basal profile read returned nothing")
 
+        syncHistoryToAaps()
+
         rxBus.send(EventYpsoPumpDataChanged())
         true
+    }
+
+    /**
+     * Brings anything the pump did on its own into AAPS — above all, a bolus given from the pump's
+     * own menu, which nothing else here would ever see.
+     *
+     * Until this ran, `loadHistory` was only called when the user pressed a button, so a manual bolus
+     * was invisible to the loop: IOB under-stated, and AAPS dosing on top of insulin already given.
+     * That is the stacking direction, and it was the largest gap left before insulin.
+     *
+     * **Shaped on Medtrum's `syncRecords`**, which is the closest analogue in the codebase — a
+     * persisted sequence watermark, read forward from it, advance it, and treat a hole as a safety
+     * event rather than a log line. Two things make it workable here, both established on hardware:
+     * events and alerts share one monotonic sequence counter, so a single watermark covers both; and
+     * `syncBolusWithPumpId` is an **upsert keyed on `pumpId`**, so re-reading an entry is harmless
+     * and the watermark is an optimisation rather than a correctness requirement.
+     *
+     * Three rules, each for a reason that cost something to learn:
+     *
+     * 1. **A missing watermark means take a baseline, not import everything.** Switching this on
+     *    would otherwise turn the pump's recent history into new treatments carrying IOB — boluses
+     *    from hours ago, possibly from before AAPS was installed. The alert count already works this
+     *    way (§4g) for exactly the same reason.
+     * 2. **Entries this driver recorded itself are skipped.** They are already in the database at the
+     *    *phone's* timestamp, which is deliberate (§5) and better evidence than the pump's entry —
+     *    whose time is only as good as the pump's clock. Because the sync upserts, re-syncing one
+     *    would silently move the treatment to pump time, quietly undoing the fix for a bug that put
+     *    boluses 12 hours into the future.
+     * 3. **A gap is announced, not stepped over.** If the oldest entry read is still above the
+     *    watermark, entries in between existed and were never seen — the pump was busy while AAPS was
+     *    away, or a profile write pushed 24 entries in at once. The watermark still advances, because
+     *    not advancing would re-read the same window for ever, but the user is told that treatments
+     *    are missing rather than left to infer it from IOB that does not add up.
+     */
+    private suspend fun syncHistoryToAaps() {
+        if (!preferences.get(YpsoBooleanKey.YpsoSyncHistoryToAaps)) return
+
+        val result = pumpManager.readHistoryWithDump(preferences.get(YpsoIntKey.YpsoHistoryReadCount))
+        val newest = result.newestSequence
+        if (newest == null) {
+            aapsLogger.warn(LTag.PUMP, "History sync: the pump returned no entries at all; nothing to do")
+            return
+        }
+
+        val watermark = preferences.get(YpsoLongNonKey.LastSyncedSequence)
+        if (watermark < 0) {
+            preferences.put(YpsoLongNonKey.LastSyncedSequence, newest)
+            aapsLogger.info(
+                LTag.PUMP,
+                "History sync: no watermark yet, so taking sequence $newest as the baseline and importing nothing. " +
+                    "Anything the pump does from here is synced."
+            )
+            return
+        }
+
+        val missed = result.missedSince(watermark)
+        if (missed > 0) {
+            aapsLogger.error(
+                LTag.PUMP,
+                "History sync: $missed entr(ies) between $watermark and ${result.oldestSequence} were never read and are lost. " +
+                    "Read window is ${result.sequencesRead.size} entries — raise YpsoHistoryReadCount if this repeats."
+            )
+            uiInteraction.addNotification(
+                Notification.PUMP_SYNC_ERROR, rh.gs(R.string.ypso_history_gap, missed.toInt()), Notification.URGENT
+            )
+        }
+
+        val fresh = result.freshEvents(watermark, selfRecordedSequences())
+
+        fresh.forEach { event ->
+            aapsLogger.info(LTag.PUMP, "History sync: importing ${event::class.simpleName} seq=${event.position}")
+            syncToAaps(event)
+        }
+
+        preferences.put(YpsoLongNonKey.LastSyncedSequence, newest)
+        aapsLogger.info(
+            LTag.PUMP,
+            "History sync: imported ${fresh.size} event(s) above $watermark; watermark now $newest"
+        )
+    }
+
+    /**
+     * Sequence numbers this driver recorded itself, so [syncHistoryToAaps] leaves them alone.
+     *
+     * Bounded and persisted: only the newest [SELF_RECORDED_KEPT] matter, because the watermark moves
+     * past everything older on the next sync anyway.
+     */
+    private fun selfRecordedSequences(): Set<Long> =
+        preferences.get(YpsoStringNonKey.SelfRecordedSequences)
+            .split(',')
+            .mapNotNull { it.trim().toLongOrNull() }
+            .toSet()
+
+    private fun rememberSelfRecorded(sequence: Long) {
+        val kept = (selfRecordedSequences() + sequence).sorted().takeLast(SELF_RECORDED_KEPT)
+        preferences.put(YpsoStringNonKey.SelfRecordedSequences, kept.joinToString(","))
     }
 
     /**
@@ -659,6 +759,7 @@ class YpsoService : DaggerService() {
             return
         }
 
+        rememberSelfRecorded(sequence)
         aapsLogger.info(
             LTag.PUMP,
             "Settled temporaryId=$temporaryId to ${result.deliveredUnits}U under pumpId=$sequence (the pump's own sequence)"
@@ -724,6 +825,7 @@ class YpsoService : DaggerService() {
                         pumpType = PumpType.YPSOPUMP,
                         pumpSerial = pumpSerial()
                     )
+                    rememberSelfRecorded(sequence)
                     aapsLogger.info(LTag.PUMP, "Recorded TBR ${result.percentage}% under pumpId=$sequence, new=$synced")
                 }
             }
@@ -970,5 +1072,11 @@ class YpsoService : DaggerService() {
          * than something wore. The clock write itself treats anything within 90 seconds as in sync.
          */
         private const val CLOCK_DRIFT_WARN_MINUTES = 30L
+
+        /**
+         * How many self-recorded sequence numbers to remember. The watermark moves past anything
+         * older on the next sync, so a short tail is all that can ever be consulted.
+         */
+        private const val SELF_RECORDED_KEPT = 20
     }
 }
