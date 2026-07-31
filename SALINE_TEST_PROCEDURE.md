@@ -14,7 +14,8 @@ As of 2026-07-31, **all four phases have passed on hardware.** What is left:
 | 2a | **Stop the pump from its own buttons** | New behaviour, untested: AAPS should raise an urgent "not delivering" notification and open a 0% `PUMP_SUSPEND` temporary basal so basal IOB stops accruing. Restart it and the record must close | `PORTING_NOTES` §8.6 |
 | 2b | **Change the phone's timezone** | New behaviour, untested: the driver should queue a clock sync and the pump's clock should follow. Previously nothing corrected it | `PORTING_NOTES` §8.6 |
 | 2c | **Change the pump's bolus increment** | AAPS hard-codes 0.1 U and cannot read the pump's setting. Ask for something off the new grid and see whether it is refused or silently rounded | `PORTING_NOTES` §8.6 |
-| 3 | **Reconnect mid-bolus** | Pull BLE range during delivery. The bolus is confirmed from history, so it *should* resolve on reconnect | — |
+| 3 | **Reconnect mid-bolus** | Pull BLE range during a 2 U bolus. The pump owns the bolus and finishes it regardless. **New, untested:** a provisional record now goes in at the requested amount *before* sending, so IOB should be right even if the connection dies — and it should settle to the delivered amount once the log can be read. Expect `success=false` with the treatment still present | `PORTING_NOTES` §4g |
+| 3a | **Kill AAPS mid-bolus** | Force-stop the app during delivery. The provisional record must survive and keep counting. This is the case that decides whether `PumpSyncStorage` is needed | `PORTING_NOTES` §4g |
 | 4 | **A bolus while a TBR runs** | Never tried together; both are identified by sequence | — |
 | 5 | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
 | 6 | **Restore a profile you care about** | A write you cannot reverse is not finished. Untested only in the sense that nothing has needed it | 4g |

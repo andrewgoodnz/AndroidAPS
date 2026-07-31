@@ -531,6 +531,11 @@ class YpsoService : DaggerService() {
 
         return awaitResult("deliverBolus", failed) {
             pumpManager.bolusSpeedUnitsPerMinute = configuredBolusSpeedUnitsPerMinute()
+
+            // ⚠ Recorded BEFORE the pump is told, at the amount requested. See [openPendingBolus].
+            val temporaryId = dateUtil.now()
+            openPendingBolus(detailedBolusInfo, insulin, temporaryId)
+
             val result = pumpManager.deliverBolusConfirmed(insulin)
             aapsLogger.info(
                 LTag.PUMP,
@@ -542,47 +547,121 @@ class YpsoService : DaggerService() {
                 ypsoPump.lastBolusAmount = result.deliveredUnits
                 ypsoPump.lastBolusTime = dateUtil.now()
             }
-            recordBolus(detailedBolusInfo, result)
+            settlePendingBolus(detailedBolusInfo, result, temporaryId)
 
             rxBus.send(EventYpsoPumpDataChanged())
             result
         }
     }
 
-    private fun recordBolus(detailedBolusInfo: DetailedBolusInfo, result: YpsoPumpManagerImpl.ConfirmedBolus) {
-        val sequence = result.pumpSequence
-        if (sequence == null || result.deliveredUnits <= 0.0) {
-            aapsLogger.warn(
-                LTag.PUMP,
-                "Not recording a treatment: " +
-                    if (sequence == null) "the pump's log did not confirm this bolus, so it has no stable id"
-                    else "the pump delivered nothing"
-            )
-            return
-        }
-
-        // The **phone's** clock, not the pump's entry timestamp.
-        //
-        // Using the pump's put a bolus 12 hours into the future and so out of every window AAPS
-        // cares about: the treatment existed but showed nowhere and contributed no IOB, while the
-        // dialog reported success because the *amount* had been confirmed. The pump counts its
-        // clock in local terms and the decoder read it as UTC (see PORTING_NOTES §5), and beyond
-        // that bug, a treatment time that depends on the pump's clock being right is a bad trade
-        // for something the phone knows exactly.
-        //
-        // Dedupe is unaffected: `syncBolusWithPumpId` matches on `pumpId`, so a later history sync
-        // of this same bolus still resolves to one record.
-        val synced = pumpSync.syncBolusWithPumpId(
+    /**
+     * Records the bolus **before the pump is told about it**, at the amount requested.
+     *
+     * ⚠ This looks like the one thing this driver refuses to do — claiming something the pump has not
+     * confirmed — and the distinction is worth being precise about, because the two are different
+     * claims whose safe directions are opposite:
+     *
+     * - **Reporting success** is a statement about the pump. Over-claiming tells the user insulin
+     *   went in when it did not, so it must never exceed what has been confirmed. That rule is
+     *   unchanged: `PumpEnactResult.success` still comes only from the pump's own log.
+     * - **Recording IOB** is a safety estimate. Over-estimating makes AAPS dose *less*.
+     *   Under-estimating causes stacking, which is the hypo direction. So it must err high.
+     *
+     * The reason it has to happen first is that **this pump owns the bolus once it has been told**.
+     * Delivery continues whether or not the phone is still there. Everything between the write and
+     * the confirmation — a dropped connection, a killed app, a flat phone — is a window in which
+     * insulin goes in; and until now AAPS held no record at all across that window, on every single
+     * bolus.
+     *
+     * `PumpSync`'s contract is explicit that this is the intended failure mode: *"If
+     * syncBolusWithTempId is not called afterwards record remains valid and is calculated towards
+     * iob"*. An unreconciled record survives as an over-estimate rather than vanishing.
+     *
+     * The temporary id is the phone's clock at the moment of sending, which is unique per bolus and
+     * is what [settlePendingBolus] matches on.
+     */
+    private fun openPendingBolus(detailedBolusInfo: DetailedBolusInfo, requested: Double, temporaryId: Long) {
+        val created = pumpSync.addBolusWithTempId(
             timestamp = dateUtil.now(),
-            amount = result.deliveredUnits,
+            amount = requested,
+            temporaryId = temporaryId,
             type = detailedBolusInfo.bolusType,
-            pumpId = sequence,
             pumpType = PumpType.YPSOPUMP,
             pumpSerial = pumpSerial()
         )
         aapsLogger.info(
             LTag.PUMP,
-            "Recorded ${result.deliveredUnits}U under pumpId=$sequence (the pump's own sequence), new=$synced"
+            "Provisionally recorded ${requested}U under temporaryId=$temporaryId before sending, so the bolus " +
+                "counts towards IOB even if this connection does not survive it. new=$created"
+        )
+    }
+
+    /**
+     * Replaces the provisional record with what the pump actually did.
+     *
+     * Updates the amount to the delivered figure and promotes the identity from the temporary id to
+     * the pump's own **sequence number** — the same id `readHistory` reports, so this bolus and a
+     * later history sync of it resolve to one record rather than two.
+     *
+     * **A bolus the pump never logged is deliberately left alone.** The provisional record stands, at
+     * the requested amount, and AAPS goes on counting it. That is the honest position: the command
+     * went out, the pump owns it, and this driver could not find out how much went in. Deleting the
+     * record would assert that nothing was delivered, which is the one thing we do not know.
+     *
+     * The timestamp stays the **phone's**, never the pump's entry time. Using the pump's put a bolus
+     * 12 hours into the future and so out of every window AAPS cares about — the treatment existed,
+     * showed nowhere and contributed no IOB, while the dialog reported success because the *amount*
+     * had been confirmed (`PORTING_NOTES` §5). Dedupe does not need it: matching is on `pumpId`.
+     */
+    private fun settlePendingBolus(
+        detailedBolusInfo: DetailedBolusInfo,
+        result: YpsoPumpManagerImpl.ConfirmedBolus,
+        temporaryId: Long
+    ) {
+        val sequence = result.pumpSequence
+        if (sequence == null) {
+            aapsLogger.warn(
+                LTag.PUMP,
+                "The pump's log did not confirm this bolus, so the provisional ${result.requestedUnits}U record under " +
+                    "temporaryId=$temporaryId stands and keeps counting towards IOB. It cannot be corrected without " +
+                    "knowing what the pump did — check the pump."
+            )
+            return
+        }
+
+        val synced = pumpSync.syncBolusWithTempId(
+            timestamp = dateUtil.now(),
+            amount = result.deliveredUnits,
+            temporaryId = temporaryId,
+            type = detailedBolusInfo.bolusType,
+            pumpId = sequence,
+            pumpType = PumpType.YPSOPUMP,
+            pumpSerial = pumpSerial()
+        )
+
+        if (!synced) {
+            // The provisional record could not be found to update — an app restart between sending
+            // and confirming would do it. Fall back to recording under the pump's id directly, or
+            // the confirmed amount would be lost entirely.
+            val fallback = pumpSync.syncBolusWithPumpId(
+                timestamp = dateUtil.now(),
+                amount = result.deliveredUnits,
+                type = detailedBolusInfo.bolusType,
+                pumpId = sequence,
+                pumpType = PumpType.YPSOPUMP,
+                pumpSerial = pumpSerial()
+            )
+            aapsLogger.warn(
+                LTag.PUMP,
+                "No provisional record for temporaryId=$temporaryId to settle; recorded ${result.deliveredUnits}U " +
+                    "under pumpId=$sequence instead, new=$fallback"
+            )
+            return
+        }
+
+        aapsLogger.info(
+            LTag.PUMP,
+            "Settled temporaryId=$temporaryId to ${result.deliveredUnits}U under pumpId=$sequence (the pump's own sequence)"
         )
     }
 

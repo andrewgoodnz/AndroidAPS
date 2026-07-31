@@ -58,6 +58,25 @@ reports success only when the clock reads back agreeing with the phone's.
 rule after Andy Rozman's dummy connector returned `success=true` for boluses; anything above a
 driver that trusts a delivery result will act on it.
 
+### ⚠ …but that rule is about *reporting*, not about *recording IOB*
+
+These are two different claims and their safe directions are **opposite**. Getting them confused
+produces a driver that is scrupulous about one and dangerous about the other.
+
+| | What it is | Safe direction |
+|---|---|---|
+| `PumpEnactResult.success`, the dialog, the log | a statement **about the pump** | never exceed what the pump confirmed |
+| The treatment record AAPS counts as IOB | a **safety estimate** | err **high** |
+
+Over-stating IOB makes AAPS dose *less*. Under-stating it causes stacking, which is the hypo
+direction. So a bolus whose outcome is unknown must still be **recorded in full** while being
+**reported as failed** — `success = false` with a full-amount treatment record is coherent, and it is
+what should happen when a bolus is sent and the connection then dies.
+
+This matters here because **the pump owns the bolus once it has been told**: delivery continues
+whether or not the phone is still there. See §4g's temporary-id record, which is how the window
+between sending and confirming stops being a window in which AAPS knows nothing.
+
 **Remove refusals one at a time, each with its own saline test.** Never in a batch. The
 procedures are in `SALINE_TEST_PROCEDURE.md`, one phase per refusal, each naming the read-back
 or history entry that confirms it.
@@ -569,6 +588,48 @@ Recorded 1.5U under pumpId=160369, new=true
 ```
 
 with the treatment then visible on the AAPS home screen at the right time and IOB reading 1.50 U.
+
+#### ⚠⚠ The window between sending and confirming, and how AAPS is built to cover it
+
+**This pump owns the bolus once it has been told.** The command carries the whole amount and delivery
+continues to completion whether or not the phone is still connected — dropping BLE does not stop it.
+So the driver's job is not to supervise a bolus; it is to be able to find out afterwards what
+happened.
+
+The original design got the ordering wrong. It sent the bolus, waited, read the log, and recorded the
+treatment **only then**. Between the write landing and the confirmation returning, AAPS held **no
+record at all** — and that window opens on every single bolus. A dropped connection, a killed app or
+a flat battery inside it means insulin went in and AAPS never learned of it. Under-counted IOB is the
+stacking direction.
+
+**AAPS has a mechanism built for exactly this**, and the machinery is already in the app — the
+`PumpSyncStorageTBR=[]` line in our own logs is `:pump:common`'s `PumpSyncStorage` starting up unused:
+
+1. `addBolusWithTempId(…)` **before** sending, at the amount *requested*, under a temporary id. From
+   that instant it counts towards IOB.
+2. `syncBolusWithTempId(…)` once the outcome is known, with the *actual* amount and the pump's real
+   `pumpId`. The record is updated in place — amount corrected, identity promoted.
+3. `PumpSyncStorage` persists pending entries across an app restart, for drivers that need it.
+
+The interface contract states the intended failure mode outright: *"If `syncBolusWithTempId` is not
+called afterwards record remains valid and is calculated towards iob."* **An unreconciled record
+survives as an over-estimate rather than vanishing.**
+
+Implemented as `openPendingBolus` / `settlePendingBolus`. The confirmation logic of §4f is untouched —
+this adds the missing first half rather than replacing the second. Three details worth keeping:
+
+- **A bolus the pump never logged is left alone**, at the requested amount, still counting. Deleting
+  it would assert that nothing was delivered, which is the one thing not known.
+- **If the provisional record cannot be found to settle** — an app restart in the middle would do it —
+  the confirmed amount is written under the pump's sequence instead, rather than being lost.
+- **The reported result is unchanged.** `success` still comes only from the pump's own log, so
+  `success = false` alongside a full-amount IOB record is the correct outcome for an interrupted
+  bolus. See §0 on why those two directions are opposite.
+
+**Still open, and the other half of the same problem:** a bolus given **on the pump itself** never
+reaches AAPS at all, because nothing reads history automatically — `loadHistory` runs only when the
+user presses the button, and `YpsoSyncHistoryToAaps` is off. Same identity scheme, same reconciliation
+(§8.5); until it is solved, a manual bolus is invisible to the loop.
 
 Three rules, each chosen for a reason:
 
