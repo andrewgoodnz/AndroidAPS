@@ -67,9 +67,9 @@ import kotlin.math.abs
  * calls into pump drivers from its own thread and expects a synchronous answer. Everything below
  * that line stays suspending.
  *
- * **This build can set the clock, deliver a standard bolus and set a temporary basal.** There is
- * still no basal-profile entry point on this service at all — an absence of method, not a flag to
- * check. It gets added on its own, behind its own saline test.
+ * **This build can set the clock, deliver a standard bolus, set a temporary basal and overwrite the
+ * 24-slot basal profile** — every one of them verified on saline behind its own hardware test. The
+ * extended and combined bolus are the only writes still refused, below this service.
  *
  * Every write here is confirmed against the pump before it is reported as done, and each records
  * into `PumpSync` under the pump's own sequence number so that a later history sync of the same
@@ -603,14 +603,16 @@ class YpsoService : DaggerService() {
     // ==================== WRITES ====================
 
     /**
-     * Sets the pump's clock from the phone's — the only write this build performs.
+     * Sets the pump's clock from the phone's.
      *
-     * It is deliberately the first one: no insulin can move, so a wrong wire format costs a
-     * refused GATT write rather than a dose. The result is whatever reading the clock back said,
-     * never what the write callback said — see `YpsoPumpManagerImpl.syncDateTime`.
+     * It was deliberately the **first** write this driver ever made: no insulin can move, so a wrong
+     * wire format cost a refused GATT write rather than a dose. It remains the cheapest regression
+     * test for the write path. The result is whatever reading the clock back said, never what the
+     * write callback said — see `YpsoPumpManagerImpl.syncDateTime`.
      *
-     * Every other write (bolus, temporary basal, basal profile) is still refused below the
-     * service, and each one is its own saline test before it is unblocked.
+     * Also called unattended now, on a timezone or DST change and whenever the pump's clock has
+     * drifted past 10 s (§8.6), which is safe for the same reason: it refuses unless it can read the
+     * clock first.
      */
     fun syncPumpTime(): Boolean = awaitResult("syncPumpTime", false) {
         rxBus.send(EventPumpStatusChanged(rh.gs(R.string.ypso_setting_pump_clock)))

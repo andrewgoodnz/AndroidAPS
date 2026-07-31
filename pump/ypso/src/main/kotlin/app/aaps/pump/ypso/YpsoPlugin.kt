@@ -60,14 +60,14 @@ import kotlin.math.abs
  * AAPS pump driver for the YpsoPump, running against an unlocked plaintext research pump.
  *
  * Shaped on `MedtrumPlugin`: the plugin binds [YpsoService] and forwards to it; the service owns
- * the connection. See [YpsoService] for why there is no delivery path in this build.
+ * the connection.
  *
- * **Saline test build.** Three things reach the pump: the clock via [YpsoSyncTimeCommand], a
- * **standard bolus** via [deliverTreatment], and a **temporary basal** via [setTempBasalPercent] /
- * [setTempBasalAbsolute] / [cancelTempBasal]. The extended bolus and the basal profile write still
- * return a failed [PumpEnactResult] without contacting the pump, and are overridden individually
- * rather than left to a default so that "does nothing" is visible at each call site and enabling
- * one has to be a deliberate act with its own hardware test.
+ * **Four things reach the pump**, each verified on saline behind its own hardware test: the clock via
+ * [YpsoSyncTimeCommand], a **standard bolus** via [deliverTreatment], a **temporary basal** via
+ * [setTempBasalPercent] / [setTempBasalAbsolute] / [cancelTempBasal], and the **24-slot basal
+ * profile** via [setNewBasalProfile]. Only the **extended and combined bolus** still return a failed
+ * [PumpEnactResult] without contacting the pump; they are overridden individually rather than left to
+ * a default, so "does nothing" is visible at the call site and enabling one has to be deliberate.
  *
  * Nothing here reports success on the strength of a write. The bolus reports the amount the **pump**
  * says it delivered, and the temporary basal reports what byte 10 of the pump's status reads back —
@@ -494,7 +494,7 @@ class YpsoPlugin @Inject constructor(
     override fun loadTDDs(): PumpEnactResult = notImplemented("loadTDDs")
 
     private fun notImplemented(what: String): PumpEnactResult {
-        aapsLogger.warn(LTag.PUMP, "REFUSED $what: this is a read-only build")
+        aapsLogger.warn(LTag.PUMP, "REFUSED $what: not implemented for this pump")
         return pumpEnactResultProvider.get()
             .success(false)
             .enacted(false)

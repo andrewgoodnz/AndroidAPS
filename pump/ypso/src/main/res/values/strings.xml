@@ -3,11 +3,11 @@
 
     <string name="ypso_pump">YpsoPump</string>
     <string name="ypso_pump_shortname">YPSO</string>
-    <string name="ypso_pump_description">Pump integration for Ypsomed YpsoPump (plaintext research pump, read-only)</string>
+    <string name="ypso_pump_description">Pump integration for Ypsomed YpsoPump (plaintext research pump)</string>
     <string name="ypso_pump_setting">YpsoPump settings</string>
 
-    <string name="ypso_read_only_build">This driver does not deliver insulin</string>
-    <string name="ypso_read_only_banner">SALINE TEST BUILD — bolus, temp basal and basal profile write are all enabled. Basal profile write is UNTESTED.</string>
+    <string name="ypso_read_only_build">Saline test build</string>
+    <string name="ypso_read_only_banner">SALINE TEST BUILD — bolus, temp basal and basal profile write are enabled and verified on saline. Not for use with insulin.</string>
 
     <string name="ypso_pairing_title">Pair YpsoPump</string>
     <string name="ypso_pairing_summary">Scan for your pump and bond to it. Confirm the code shown on the pump.</string>
@@ -55,7 +55,7 @@
     <string name="ypso_requested_by_user">Requested by user</string>
 
     <string name="ypso_set_clock_confirm_title">Set the pump\'s clock?</string>
-    <string name="ypso_set_clock_confirm_message">This writes the phone\'s date and time to the pump. It is the only write this driver makes and it cannot deliver insulin.\n\nThe pump\'s clock is read back afterwards, and the result below reflects what the pump actually reports — not whether the write was accepted.</string>
+    <string name="ypso_set_clock_confirm_message">This writes the phone\'s date and time to the pump.\n\nThe pump\'s clock is read back afterwards, and the result below reflects what the pump actually reports — not whether the write was accepted. The driver also does this by itself after a timezone change, or if the pump\'s clock drifts.</string>
     <string name="ypso_clock_result_title">Pump clock</string>
     <string name="ypso_clock_set_ok">Pump clock set, and confirmed by reading it back from the pump.</string>
     <string name="ypso_clock_set_failed">Pump clock NOT confirmed. Check the clock on the pump itself and read the log before trying again.</string>
@@ -68,7 +68,6 @@
     <string name="ypso_profile_write_failed">Basal profile NOT confirmed — check the 24 rates on the pump before relying on it</string>
     <string name="ypso_pump_alert">YpsoPump: %1$s</string>
     <string name="ypso_pump_suspended">YpsoPump is not delivering insulin (%1$s). Basal has stopped.</string>
-    <string name="ypso_history_gap">%1$d YpsoPump history entries were never read, so any treatments in them are missing from AAPS. IOB may be understated.</string>
     <string name="ypso_clock_drifted">The YpsoPump\'s clock is %1$d seconds out and could not be corrected. Events the pump logs will carry the wrong time. Set it from the YPSO tab.</string>
     <string name="ypso_clock_corrected">YpsoPump clock corrected (%1$d s out)</string>
     <string name="ypso_clock_implausible">The YpsoPump\'s clock is %1$d hours from the phone\'s. That is too far to correct automatically — check the time on both the pump and the phone.</string>

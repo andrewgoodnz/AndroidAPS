@@ -2,21 +2,18 @@
 
 Driver for an **unlocked plaintext research YpsoPump** on current AndroidAPS (3.4.2.4).
 
-**Status after session 2: the read path is verified on hardware.** The driver bonds, connects,
-authenticates in plaintext with no key exchange, and reads reservoir, battery, delivery state,
-active program, the 24-slot basal profile, the active temporary basal and the event and alert
-history — every value cross-checked against the pump's own display or against actions performed
-on the pump minutes earlier.
+**Status, 2026-08-01: all four delivery phases are verified on hardware.** The driver bonds,
+connects, authenticates in plaintext with no key exchange, reads every value it needs, and **writes**
+— the pump clock (§4e), a standard bolus with abort (§4f), a temporary basal with cancel (§4h), and
+the 24-slot basal profile (§4i). Each was gated behind its own saline test and each is confirmed by
+reading the pump back, never by the write callback.
 
-**Session 3: the write path is open. [verified] on hardware, 2026-07-30.** Setting the pump's
-clock (§4e) is implemented, and it worked: with the pump's clock deliberately wound back 14
-months, the driver wrote the phone's date and time, read them back, and the pump's own display
-and its own history log both agree. That is the first write this driver has ever made that
-changed the pump's state.
+Deliveries reach `PumpSync` under the pump's own sequence number, pump alarms reach AAPS as urgent
+notifications (§4g, §8.2), and history sync is **built but switched off** (§8.5).
 
-Everything that could move insulin is **still refused**: there is no code path from AAPS to a
-delivery command. Phase 2 of `SALINE_TEST_PROCEDURE.md` (standard bolus, on saline) is the next
-gate and has no code yet.
+⚠ **This driver can now move insulin.** What stops it doing so is the cartridge, not the code. Every
+test to date has been on **saline, off-body, cannula to air**, and §8.1 lists what must still be true
+before that changes.
 
 Test pump: **YpsoPump_10074292**, MAC `EC:2A:F0:01:22:34`, firmware V05.02.03 — the unit whose
 settings are in the decrypted Lotus export. (Serial 10178681 is a *different*, standard pump
@@ -29,22 +26,24 @@ still inference from the sources.
 
 ## 0. Read this first — safety posture
 
-This build delivers no insulin. That is enforced in three independent places, deliberately, so
-no single edit can undo it:
+**This section used to say the build could not deliver insulin, enforced in three independent
+places.** That was true through session 2 and is comprehensively false now: `YpsoService` exposes
+bolus, temporary basal and basal-profile entry points, and `YpsoPumpManagerImpl` carries them out.
+The refusals were removed one at a time, each behind its own hardware test, which is what §8.1
+records. It is left stated plainly here because a stale safety claim is worse than none — anyone
+reading top-down would otherwise take a delivering driver for an inert one.
+
+**What still is true:**
 
 1. **The SDK has no encryption or key-exchange code at all.** vicktor's `crypto/` and
    `keyexchange/` packages were not vendored. There is no `PumpCryptor` to leave null and no
-   relay client to accidentally call. Plaintext is a property of what exists, not a setting.
-2. **`YpsoService` exposes no delivery method.** No bolus, TBR or basal-write entry point is
-   declared on it. This is an absence of method, not a flag that could be flipped. The one
-   write it does expose is `syncPumpTime`, which sets the clock (§4e).
-3. **`YpsoPumpManagerImpl` refuses delivery without touching BLE.** The `PumpManager` interface
-   requires `deliverStandardBolus`, `setTbr`, `writeBasalProfile` and friends, so they exist —
-   and each logs `REFUSED` and returns failure before reaching the pump.
-
-`YpsoPlugin` overrides every delivering `Pump` method individually rather than relying on a
-shared default, so "this does nothing" is visible at each call site and re-enabling one has to
-be a deliberate act.
+   relay client to accidentally call. Plaintext is a property of what exists, not a setting — so
+   this driver only works against an unlocked research pump, and cannot talk to a standard one.
+2. **The extended and combined bolus are still refused**, in `YpsoPumpManagerImpl`, before
+   touching BLE (§8.4). `YpsoPlugin` overrides them individually rather than relying on a shared
+   default, so "this does nothing" stays visible at the call site.
+3. **`YpsoSyncHistoryToAaps` is off**, so nothing the pump did on its own reaches AAPS's treatment
+   records yet (§8.5).
 
 **A successful GATT write proves nothing on this pump.** It does not NAK a bad write — the
 wrong auth password produced a perfectly successful write and only failed on the *next read*
@@ -633,13 +632,18 @@ user presses the button, and `YpsoSyncHistoryToAaps` is off. Same identity schem
 
 Three rules, each chosen for a reason:
 
-- **Unconfirmed bolus → not recorded.** No log entry means no stable identity, and an invented one
-  is worse than a missing record because nothing could reconcile it afterwards.
+- ~~**Unconfirmed bolus → not recorded.**~~ **Reversed.** This said an invented record was worse
+  than a missing one. It is the other way round: the pump owns the bolus once told, so a missing
+  record under-states IOB and AAPS doses on top of insulin already given. An unconfirmed bolus is now
+  recorded **in full** and reported as failed — see the temporary-id record below, and §0 on why
+  those two directions are opposite.
 - **Partial delivery → recorded** for what actually went in. This is the case where *not* recording
   corrupts IOB.
-- **Timestamp comes from the phone, not the pump.** See the epoch trap in §5. Even with that fixed,
-  making a treatment's time depend on the pump's clock being right is a poor trade when the phone
-  knows it exactly, and dedupe does not need it — `syncBolusWithPumpId` matches on `pumpId`.
+- **Timestamp comes from the phone at the moment of delivery.** See the epoch trap in §5. ⚠ It does
+  not stay that way: once history sync is on, `syncBolusWithPumpId` upserts on `pumpId` and **updates
+  the timestamp**, so the pump's entry time wins on the next poll. That is deliberate (§8.5) — one
+  authority rather than two — and it is why the pump's clock is now actively held within 10 s (§8.6)
+  rather than merely watched.
 
 **The amount stays a `Double` end to end.** `BolusDeliveryResult.deliveredUnits` is a `Float`, and
 widening 1.82f gives 1.8200000524520874 — §4d's trap, on a figure that becomes a treatment record.
@@ -1307,9 +1311,10 @@ things bound the harm and none of them is this driver: the pump alarms locally a
 is normally near it, and AAPS's own pump-unreachable alert will not help because the pump *is*
 reachable — it is simply not being asked.
 
-**This is a decision, not a defect, and it has not been made.** Shortening the poll costs battery and
-BLE airtime on a pump that is otherwise contacted only when needed. Deciding it wants a view on how
-long a stopped pump may go unannounced, which is a therapy question rather than a protocol one.
+**⚠ This was written up as a decision the user had to make. It was not one — see §8.7.** Of every
+AAPS pump driver, only Insight holds a persistent connection; command-queue-driven connect and
+disconnect is the norm, and this driver is behaving normally. The pump alarms locally and loudly.
+Nothing here needs changing, and presenting it as an open question was overstatement.
 
 Two caveats that bound what this feature can ever catch:
 
@@ -1350,9 +1355,10 @@ Mapping this is cheap — put the pump in each state and read byte 0 — and it 
    condition that broke `findTbrEndRecord` (§4h) — which is now fixed, but the *forward* case, a TBR
    set while a bolus's entry is the newest, has not been exercised.
 2. **BLE loss mid-command.** Pull the pump out of range during a bolus, a TBR write and a profile
-   write. The bolus is confirmed from history so it *should* resolve on reconnect; the profile write
-   stops at the first failed slot and reads back to show how far it got, which has never been seen
-   happen. A half-written basal program is the worst outcome the driver can produce.
+   write. Since §8.8 the bolus case is actively handled — a provisional record goes in before sending
+   and `ReconnectManager` chases the link back — but none of that has run on hardware. The profile
+   write stops at the first failed slot and reads back to show how far it got, which has never been
+   seen happen. A half-written basal program is the worst outcome the driver can produce.
 3. **A temporary basal crossing an hour boundary.** Inherent, not a bug (§4h), but it has never been
    watched happen and the size of the discontinuity is unmeasured.
 4. **The pump stopped from its own buttons.** Does AAPS notice, and how fast? The latency question is
@@ -1426,7 +1432,7 @@ basal (§4h).
 
 ### Unit tests
 
-`:pump:ypso:sdk` now has a test source set, with **40 tests** covering the decodes the hardware
+`:pump:ypso:sdk` now has a test source set, with **59 tests** covering the decodes the hardware
 findings live in: the CRC and GLB formats (§4a–4c), the full 18-byte status payload against both
 captured samples (§4), the 17-byte history entry and its 2000 epoch (§5), the clock decode and its
 plausibility guard (§4e), and the history mapping — including that `position` is the sequence
