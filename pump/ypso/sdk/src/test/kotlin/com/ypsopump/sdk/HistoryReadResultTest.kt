@@ -52,14 +52,18 @@ class HistoryReadResultTest {
     }
 
     /**
-     * ⚠ A bolus this driver delivered is already recorded at the **phone's** timestamp, which is
-     * deliberate (§5) and better evidence than the pump's entry — the pump's time is only as good as
-     * its clock. `syncBolusWithPumpId` upserts on `pumpId` and *updates the timestamp*, so re-syncing
-     * one would silently move the treatment onto pump time, undoing the fix for a bug that put
-     * boluses 12 hours into the future.
+     * `alreadyRecorded` still exists as a parameter but is no longer used by the driver.
+     *
+     * It backed a skip list that kept boluses AAPS delivered from being re-synced, so they would
+     * keep the *phone's* timestamp rather than the pump's. That was dropped: a sync is a sync — it
+     * upserts on `pumpId`, the amount comes from the same log entry either way, and only the
+     * timestamp moved. The skip defended half the problem (a manual bolus has no source but the
+     * pump) and left two classes of record with different provenance. Keeping the pump's clock
+     * within ten seconds defends both. The parameter is kept because the exclusion is still the
+     * correct behaviour for any caller that does hold better evidence.
      */
     @Test
-    fun `entries the driver recorded itself are excluded, not merely deduplicated`() {
+    fun `an explicitly excluded sequence is left out`() {
         val fresh = result(listOf(bolus(101), bolus(102), bolus(103)))
             .freshEvents(watermark = 100, alreadyRecorded = setOf(102L))
 

@@ -19,14 +19,4 @@ enum class YpsoStringNonKey(
     SerialNumber("ypso_serial_number", ""),
     FirmwareVersion("ypso_firmware_version", ""),
 
-    /**
-     * Pump sequence numbers this driver recorded itself, newest last, comma separated and bounded.
-     *
-     * History sync skips these. A bolus AAPS delivered is already in the database at the **phone's**
-     * timestamp, which is deliberate (see §5) and better evidence than the pump's entry, whose time
-     * is only as good as the pump's clock. Re-syncing it would upsert on the same `pumpId` and
-     * silently move the treatment to pump time — quietly undoing a decision made after a clock bug
-     * put boluses 12 hours into the future.
-     */
-    SelfRecordedSequences("ypso_self_recorded_sequences", ""),
 }

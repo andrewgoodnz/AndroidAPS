@@ -69,7 +69,9 @@
     <string name="ypso_pump_alert">YpsoPump: %1$s</string>
     <string name="ypso_pump_suspended">YpsoPump is not delivering insulin (%1$s). Basal has stopped.</string>
     <string name="ypso_history_gap">%1$d YpsoPump history entries were never read, so any treatments in them are missing from AAPS. IOB may be understated.</string>
-    <string name="ypso_clock_drifted">The YpsoPump\'s clock is %1$d minutes away from the phone\'s. Events the pump logs will carry the wrong time. Set it from the YPSO tab.</string>
+    <string name="ypso_clock_drifted">The YpsoPump\'s clock is %1$d seconds out and could not be corrected. Events the pump logs will carry the wrong time. Set it from the YPSO tab.</string>
+    <string name="ypso_clock_corrected">YpsoPump clock corrected (%1$d s out)</string>
+    <string name="ypso_clock_implausible">The YpsoPump\'s clock is %1$d hours from the phone\'s. That is too far to correct automatically — check the time on both the pump and the phone.</string>
     <string name="ypso_clock_dst_failed">The phone\'s time changed but the YpsoPump\'s clock could not be corrected. The pump\'s clock is now wrong, and events it logs will carry the wrong time. Set it from the YPSO tab.</string>
     <string name="ypso_bolus_over_pump_max">Bolus of %1$.2f U exceeds the pump maximum of %2$.2f U</string>
 

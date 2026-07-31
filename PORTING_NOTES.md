@@ -1402,7 +1402,7 @@ Three rules, each for a reason that cost something to learn:
 | Rule | Why |
 |---|---|
 | **No watermark means take a baseline, not import everything** | Switching this on would otherwise turn the pump's recent history into treatments carrying IOB, including boluses from before AAPS was installed. The alert count already works this way (§4g) |
-| **Entries the driver recorded itself are excluded** | They are in the database at the *phone's* timestamp (§5). Because the sync upserts, re-syncing one would move the treatment onto **pump** time — quietly undoing the fix for a bug that put boluses 12 hours into the future |
+| **~~Entries the driver recorded itself are excluded~~** | **Dropped.** A sync *is* a sync: it upserts on `pumpId`, the amount comes from the same log entry either way, and the only field that moved was the timestamp. Keeping a skip list defended half a problem — manual boluses have no source but the pump — and created two classes of record with different provenance. The clock is the thing worth defending, so it is now corrected to within 10 s instead (§8.6) |
 | **A gap is announced, not stepped over** | If the oldest entry read is above the watermark, entries between them existed and were never seen. The watermark still advances, or the same window is re-read for ever, but the user is told treatments are missing rather than left to infer it from IOB that does not add up |
 
 The decision logic is pure — `HistoryReadResult.freshEvents` and `missedSince` — and pinned by nine
@@ -1498,15 +1498,29 @@ raises a notification saying the pump's clock is now wrong, rather than leaving 
 `canHandleDST()` stays **false** — it must, because the pump genuinely cannot — so AAPS's own DST
 safeguard is untouched.
 
-### ⚠ [fixed] Clock drift was measured on every poll and never mentioned
+### ⚠ [fixed] Clock drift was measured on every poll and never acted on
 
-The skew is read every status poll and shown on the YPSO tab, but nobody watches a tab. Omnipod,
-Insight and Medtronic each raise a notification when the pump's clock is out. Now so does this one,
-above 30 minutes — far beyond any crystal drift, so crossing it means something happened rather than
-something wore.
+The skew is read every status poll and shown on the YPSO tab, but nobody watches a tab.
 
-Deliveries are recorded at the phone's time, so drift does not corrupt IOB. What it corrupts is the
-pump's own log, and therefore any history sync and any attempt to reconcile the two.
+The first fix here raised a **notification above 30 minutes**, and that was wrong twice over. Wrong
+mechanism: there is a proven write that refuses unless it can read the clock back first (§4e), so the
+answer to a wrong clock is to *fix* it, not to complain. And wrong number, once history sync (§8.5)
+makes the pump's timestamps into treatment times — a slow clock makes a bolus look older than it is,
+its IOB decays from too early, AAPS reads less insulin on board than there is, and doses again. Drift
+is a **dosing** problem measured in seconds, not a cosmetic one measured in half-hours.
+
+Medtronic has the convention: `if (timeDiff > 20) … set time on pump`, and refuse over 24 h because
+that is not drift. This now does the same at **10 seconds**, which is comfortably clear of the
+measurement noise — the pump's clock reads to one second and a BLE round trip costs a fraction of one.
+
+Two guards. A difference beyond **24 hours** is not corrected at all: that is a phone with no network
+since a reset, or a pump whose clock went with its battery, and silently writing a year-wrong time is
+not a correction. And corrections are **rate-limited to one an hour**, because each one appends two
+entries (type 12 and 13) to the pump's 3000-entry log; needing the limit means the crystal is failing,
+so hitting it is logged as a fault rather than absorbed.
+
+It runs at the end of every `readPumpStatus`, so in practice: every status read AAPS asks for, and at
+worst every **20 minutes** when idle (§8.2).
 
 ### ⚠ Still open: `YpsomedCapabilities` promises three things the driver refuses
 

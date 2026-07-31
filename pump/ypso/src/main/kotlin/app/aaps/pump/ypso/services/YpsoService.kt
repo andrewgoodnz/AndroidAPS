@@ -170,7 +170,6 @@ class YpsoService : DaggerService() {
         scope.launch {
             pumpManager.pumpClockSkewMs.collect { skew ->
                 ypsoPump.pumpClockSkewMs = skew
-                warnIfClockHasDrifted(skew)
                 rxBus.send(EventYpsoPumpDataChanged())
             }
         }
@@ -206,35 +205,77 @@ class YpsoService : DaggerService() {
     }
 
     /**
-     * Says so when the pump's clock has drifted away from the phone's.
+     * Keeps the pump's clock on the phone's, correcting it rather than complaining about it.
      *
-     * The skew is read on every status poll and shown on the YPSO tab, but nobody watches a tab. The
-     * other drivers that can see the pump's clock all raise a notification instead — Omnipod, Insight
-     * and Medtronic each have one — and this driver has more reason to than most: the pump keeps
-     * **local wall-clock seconds with no time zone** (`PORTING_NOTES` §5), so its clock is the sole
-     * authority on when anything in its log happened.
+     * ⚠ **The pump's clock is the sole authority on when anything in its log happened**, and with
+     * history sync on (§8.5) those timestamps become treatment times in AAPS. A slow clock makes a
+     * bolus look older than it is, so its IOB decays from too early, so AAPS reads less insulin on
+     * board than there is — the stacking direction. Drift is therefore a dosing problem, not a
+     * cosmetic one, and the interval that matters is **seconds**.
      *
-     * Deliveries are recorded at the *phone's* time, so IOB is unaffected by drift. What drift does
-     * corrupt is the pump's own log — and therefore any history sync, and any attempt to reconcile
-     * what AAPS believes against what the pump did.
+     * An earlier version of this raised a notification above half an hour. That was the wrong
+     * mechanism as well as the wrong number: there is a proven write here that refuses unless it can
+     * read the clock back first (§4e), so the answer to a wrong clock is to fix it. Medtronic does
+     * exactly this — `if (timeDiff > 20) … set time on pump` — and it is the convention worth
+     * following.
      *
-     * [DateUtil] is not consulted for the threshold: half an hour is well beyond anything a crystal
-     * does in a day, so crossing it means something happened — a manual change on the pump, a battery
-     * swap that reset the clock, or a DST correction that failed.
+     * Two guards:
+     *
+     * - **A difference beyond [CLOCK_IMPLAUSIBLE_HOURS] is not drift**, it is something wrong: a
+     *   phone with no network since a factory reset, or a pump whose clock was lost with its
+     *   battery. Silently writing a year-wrong time into a pump is not a correction. Medtronic
+     *   refuses over 24 h for the same reason; this says so and leaves it to a human.
+     * - **Rate-limited**, because every clock write appends two entries (type 12 and 13) to the
+     *   pump's own log, and that log is capped at 3000. Correcting on every poll would churn it.
+     *   Needing the limit at all means the crystal is failing, so hitting it is logged as a fault.
      */
-    private fun warnIfClockHasDrifted(skewMs: Long?) {
-        if (skewMs == null) return
-        val minutes = abs(skewMs) / 60_000L
-        if (minutes < CLOCK_DRIFT_WARN_MINUTES) {
-            rxBus.send(EventDismissNotification(Notification.INSIGHT_DATE_TIME_UPDATED))
+    private suspend fun correctClockIfDrifted() {
+        val skewMs = ypsoPump.pumpClockSkewMs ?: return
+        val skewSeconds = abs(skewMs) / 1000L
+        if (skewSeconds < CLOCK_RESYNC_THRESHOLD_SECONDS) return
+
+        if (skewSeconds > CLOCK_IMPLAUSIBLE_HOURS * 3600L) {
+            aapsLogger.error(
+                LTag.PUMP,
+                "Pump clock is ${skewSeconds / 3600} h from the phone's. That is not drift, and this driver will not " +
+                    "write a correction that large unattended. Check both clocks."
+            )
+            uiInteraction.addNotification(
+                Notification.INSIGHT_DATE_TIME_UPDATED,
+                rh.gs(R.string.ypso_clock_implausible, skewSeconds / 3600),
+                Notification.URGENT
+            )
             return
         }
-        aapsLogger.warn(LTag.PUMP, "Pump clock is $minutes min from the phone's; the pump's own log timestamps are wrong by that much")
-        uiInteraction.addNotification(
-            Notification.INSIGHT_DATE_TIME_UPDATED,
-            rh.gs(R.string.ypso_clock_drifted, minutes),
-            Notification.NORMAL
-        )
+
+        val sinceLast = dateUtil.now() - preferences.get(YpsoLongNonKey.LastClockCorrection)
+        if (sinceLast < T.hours(CLOCK_RESYNC_MIN_INTERVAL_HOURS).msecs()) {
+            aapsLogger.error(
+                LTag.PUMP,
+                "Pump clock has drifted ${skewSeconds}s again within ${sinceLast / 60_000} min of the last correction. " +
+                    "Not correcting yet — this rate of drift means the pump's clock is not keeping time."
+            )
+            return
+        }
+
+        aapsLogger.info(LTag.PUMP, "Pump clock is ${skewSeconds}s from the phone's; correcting it")
+        if (pumpManager.syncDateTime()) {
+            preferences.put(YpsoLongNonKey.LastClockCorrection, dateUtil.now())
+            rxBus.send(EventDismissNotification(Notification.INSIGHT_DATE_TIME_UPDATED))
+            uiInteraction.addNotificationValidFor(
+                Notification.INSIGHT_DATE_TIME_UPDATED,
+                rh.gs(R.string.ypso_clock_corrected, skewSeconds),
+                Notification.INFO,
+                60
+            )
+        } else {
+            aapsLogger.error(LTag.PUMP, "Pump clock correction FAILED; its log timestamps remain ${skewSeconds}s out")
+            uiInteraction.addNotification(
+                Notification.INSIGHT_DATE_TIME_UPDATED,
+                rh.gs(R.string.ypso_clock_drifted, skewSeconds),
+                Notification.NORMAL
+            )
+        }
     }
 
     /**
@@ -445,6 +486,7 @@ class YpsoService : DaggerService() {
             aapsLogger.debug(LTag.PUMP, "Basal profile ${profile.name}: ${ypsoPump.basalProfileRates}")
         } ?: aapsLogger.warn(LTag.PUMP, "Basal profile read returned nothing")
 
+        correctClockIfDrifted()
         syncHistoryToAaps()
 
         rxBus.send(EventYpsoPumpDataChanged())
@@ -516,7 +558,7 @@ class YpsoService : DaggerService() {
             )
         }
 
-        val fresh = result.freshEvents(watermark, selfRecordedSequences())
+        val fresh = result.freshEvents(watermark)
 
         fresh.forEach { event ->
             aapsLogger.info(LTag.PUMP, "History sync: importing ${event::class.simpleName} seq=${event.position}")
@@ -530,22 +572,6 @@ class YpsoService : DaggerService() {
         )
     }
 
-    /**
-     * Sequence numbers this driver recorded itself, so [syncHistoryToAaps] leaves them alone.
-     *
-     * Bounded and persisted: only the newest [SELF_RECORDED_KEPT] matter, because the watermark moves
-     * past everything older on the next sync anyway.
-     */
-    private fun selfRecordedSequences(): Set<Long> =
-        preferences.get(YpsoStringNonKey.SelfRecordedSequences)
-            .split(',')
-            .mapNotNull { it.trim().toLongOrNull() }
-            .toSet()
-
-    private fun rememberSelfRecorded(sequence: Long) {
-        val kept = (selfRecordedSequences() + sequence).sorted().takeLast(SELF_RECORDED_KEPT)
-        preferences.put(YpsoStringNonKey.SelfRecordedSequences, kept.joinToString(","))
-    }
 
     /**
      * Reads the pump's event and alert logs.
@@ -759,7 +785,6 @@ class YpsoService : DaggerService() {
             return
         }
 
-        rememberSelfRecorded(sequence)
         aapsLogger.info(
             LTag.PUMP,
             "Settled temporaryId=$temporaryId to ${result.deliveredUnits}U under pumpId=$sequence (the pump's own sequence)"
@@ -825,7 +850,6 @@ class YpsoService : DaggerService() {
                         pumpType = PumpType.YPSOPUMP,
                         pumpSerial = pumpSerial()
                     )
-                    rememberSelfRecorded(sequence)
                     aapsLogger.info(LTag.PUMP, "Recorded TBR ${result.percentage}% under pumpId=$sequence, new=$synced")
                 }
             }
@@ -1071,12 +1095,18 @@ class YpsoService : DaggerService() {
          * Well beyond any plausible crystal drift, so crossing it means something happened rather
          * than something wore. The clock write itself treats anything within 90 seconds as in sync.
          */
-        private const val CLOCK_DRIFT_WARN_MINUTES = 30L
-
         /**
-         * How many self-recorded sequence numbers to remember. The watermark moves past anything
-         * older on the next sync, so a short tail is all that can ever be consulted.
+         * Drift above this is corrected on the next status read. The pump's clock reads to one
+         * second and a BLE round trip costs a fraction of one, so the measurement is good to a
+         * second or two; ten is comfortably clear of that noise and tight enough that a treatment
+         * timestamp is never meaningfully wrong. Medtronic uses twenty.
          */
-        private const val SELF_RECORDED_KEPT = 20
+        private const val CLOCK_RESYNC_THRESHOLD_SECONDS = 10L
+
+        /** Beyond this the difference is not drift, and a human should look before anything is written. */
+        private const val CLOCK_IMPLAUSIBLE_HOURS = 24L
+
+        /** Each correction costs two entries in the pump's 3000-entry log, so they are bounded. */
+        private const val CLOCK_RESYNC_MIN_INTERVAL_HOURS = 1L
     }
 }
