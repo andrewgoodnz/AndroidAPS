@@ -10,12 +10,13 @@ As of 2026-07-31, **all four phases have passed on hardware.** What is left:
 | # | Test | Why it matters | Where |
 |---|---|---|---|
 | 0 | **Switch history sync on, with someone watching** | ⚠ Built but never enabled. The first sync after enabling should import **nothing** — it only records where to start. If treatments appear, the baseline is wrong and that is phantom IOB. Then bolus **on the pump** and confirm it arrives in AAPS once, at the right amount, and is not duplicated on the next poll | `PORTING_NOTES` §8.5 |
-| 1 | **Decide the alarm poll interval** | Not a test — a decision. An occlusion took **27 minutes** to reach AAPS, because the driver polls every 20 min when idle. See `PORTING_NOTES` §8.2 | — |
+| 1 | ~~Decide the alarm poll interval~~ | **Withdrawn.** An occlusion took 27 min to reach AAPS, and that is simply how AAPS drives pumps — of every driver, only Insight holds a persistent connection. The pump alarms locally and loudly. See §8.7 | — |
 | 2 | **The delivery-mode byte in every state** | Mapped for 2 values out of 256. **Now load-bearing:** a confirmed `STOPPED` writes a 0% suspend record into AAPS, and an unidentified mode deliberately writes nothing. Read byte 0 during a bolus, during priming, and after an alarm stops the pump | `PORTING_NOTES` §8.3, §8.6 |
 | 2a | **Stop the pump from its own buttons** | New behaviour, untested: AAPS should raise an urgent "not delivering" notification and open a 0% `PUMP_SUSPEND` temporary basal so basal IOB stops accruing. Restart it and the record must close | `PORTING_NOTES` §8.6 |
 | 2b | **Change the phone's timezone** | New behaviour, untested: the driver should queue a clock sync and the pump's clock should follow. Previously nothing corrected it | `PORTING_NOTES` §8.6 |
 | 2c | **Change the pump's bolus increment** | AAPS hard-codes 0.1 U and cannot read the pump's setting. Ask for something off the new grid and see whether it is refused or silently rounded | `PORTING_NOTES` §8.6 |
-| 3 | **Reconnect mid-bolus** | Pull BLE range during a 2 U bolus. The pump owns the bolus and finishes it regardless. **New, untested:** a provisional record now goes in at the requested amount *before* sending, so IOB should be right even if the connection dies — and it should settle to the delivered amount once the log can be read. Expect `success=false` with the treatment still present | `PORTING_NOTES` §4g |
+| 2d | **Press Read history and read the setting probe** | New: indices 2–13 have never been read by anything. Look for the **bolus increment** among them — AAPS hard-codes 0.1 U and cannot currently read what the pump is set to. Pure read, nothing written | `PORTING_NOTES` §8.8 |
+| 3 | **Reconnect mid-bolus** | Pull BLE range during a 2 U bolus. The pump owns the bolus and finishes it regardless. **New, untested:** a provisional record now goes in at the requested amount *before* sending, so IOB should be right even if the connection dies; and `ReconnectManager` now chases the link back with a 5 s → 300 s backoff, armed for the bolus only. Expect a reconnect within seconds, the record settling to the delivered amount, and `success=false` with the treatment still present | `PORTING_NOTES` §4g |
 | 3a | **Kill AAPS mid-bolus** | Force-stop the app during delivery. The provisional record must survive and keep counting. This is the case that decides whether `PumpSyncStorage` is needed | `PORTING_NOTES` §4g |
 | 4 | **A bolus while a TBR runs** | Never tried together; both are identified by sequence | — |
 | 5 | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
@@ -42,16 +43,11 @@ profile unprompted the moment it wakes; it did so twice on 2026-07-31 and both t
 unexplained pump-side change. Turn it off before any basal test, or a read-back diff cannot
 distinguish a driver bug from the other app.
 
-**Before `YpsoSyncHistoryToAaps` goes on** (`PORTING_NOTES` §8): decide how `sincePosition` skips
-already-seen entries, and decide whether a bolus is recorded at the phone's time or the pump's — the
-two paths currently differ, though they reconcile to one record because the `pumpId` matches.
-
 ---
 
-**Phases 1–3 have passed on hardware; phase 4 is coded but untested.** Each phase was written up
-before its code so that its confirmation check was decided while nobody was under pressure to accept
-a weaker one — which turned out to matter, because three of the phases initially "passed" against a
-check that could not fail.
+**All four phases have passed on hardware.** Each was written up before its code, so that its
+confirmation check was decided while nobody was under pressure to accept a weaker one — which turned
+out to matter, because three of them initially "passed" against a check that could not fail.
 
 ---
 

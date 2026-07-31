@@ -22,6 +22,7 @@ import com.pump.common.PumpManager
 import com.pump.common.PumpStatus
 import com.ypsopump.sdk.internal.ble.DataEvent
 import com.ypsopump.sdk.internal.ble.YpsoBleManager
+import com.ypsopump.sdk.internal.connection.ReconnectManager
 import com.ypsopump.sdk.internal.data.BolusStatusData
 import com.ypsopump.sdk.internal.data.HistoryEntry
 import com.ypsopump.sdk.internal.data.PumpClockData
@@ -148,6 +149,12 @@ class YpsoPumpManagerImpl private constructor(
         /** Breathing room between writing a temporary basal and reading byte 10 back. */
         private const val TBR_SETTLE_MS = 700L
 
+        /**
+         * The settings indices between the active-program selector (1) and basal program A (14).
+         * Never read by anything; see [probeUnknownSettings].
+         */
+        private val UNKNOWN_SETTINGS_RANGE = 2..13
+
         /** Hourly slots in a basal program. */
         private const val BASAL_SLOTS = 24
 
@@ -197,6 +204,25 @@ class YpsoPumpManagerImpl private constructor(
     private val scope = CoroutineScope(Dispatchers.Main + job)
 
     private val bleManager = YpsoBleManager(context)
+
+    /**
+     * Reconnects a link that dropped on its own, and **only** one that dropped on its own.
+     *
+     * Armed for the duration of a bolus and nothing else. That is the window where a lost link
+     * genuinely costs something: the pump goes on delivering without the phone, and the amount it
+     * actually gave is sitting in its event log waiting to be read (§4g). Everywhere else AAPS drives
+     * the connection from its command queue and disconnects deliberately whenever the queue empties,
+     * many times an hour — reconnecting after that would fight the queue and hold the link open for
+     * ever.
+     */
+    private val reconnectManager = ReconnectManager(
+        scope = scope,
+        onReconnect = {
+            runCatching { pairedMac?.let { establishSession(it) } }
+                .onFailure { log("Reconnect attempt failed: ${it.message}") }
+        },
+        onStatusUpdate = { log(it) }
+    )
     private var bluetoothAdapter: BluetoothAdapter? = null
 
     private val eventProcessor = PumpEventProcessor()
@@ -314,6 +340,7 @@ class YpsoPumpManagerImpl private constructor(
                 _connectionState.value = PumpConnectionState.Disconnected
                 emitEvent(PumpEvent.ConnectionLost("BLE disconnect $reason"))
             }
+            reconnectManager.onDisconnect()
         }
 
         scope.launch {
@@ -368,6 +395,7 @@ class YpsoPumpManagerImpl private constructor(
         pumpMutex.withLock {
             if (isConnected) {
                 _connectionState.value = PumpConnectionState.Ready
+                reconnectManager.onConnected()
                 return
             }
             try {
@@ -381,6 +409,8 @@ class YpsoPumpManagerImpl private constructor(
     }
 
     override suspend fun disconnect() {
+        // AAPS asked for this one, so a dropped link is not unexpected until something arms it again.
+        reconnectManager.disable()
         pumpMutex.withLock {
             log("Disconnecting")
             suspendDisconnect()
@@ -684,6 +714,32 @@ class YpsoPumpManagerImpl private constructor(
     }
 
     /**
+     * Reads the settings indices nobody has ever looked at, and logs what they hold.
+     *
+     * `SettingsIndex` knows three things: index 1 is the active program, 14–37 are basal program A
+     * and 38–61 are program B. **Indices 2–13 have never been read** — not by this driver and not by
+     * the SDK it came from — so twelve of the pump's settings are simply unmapped.
+     *
+     * That matters more than it sounds. `PumpType.YPSOPUMP` hard-codes a 0.1 U bolus increment, but
+     * the pump logs a `5 Bolus Step Changed` event, so the increment is configurable on the pump and
+     * AAPS is rounding to a grid it has assumed. If a user sets 0.05 or 1.0, AAPS rounds wrong. The
+     * increment is plausibly one of these twelve, and so are the bolus and basal caps behind event
+     * types 33 and 34.
+     *
+     * Read-only and diagnostic: it writes an index and reads a value, which is the same round trip
+     * every basal profile read already performs thousands of times. Nothing is written.
+     */
+    suspend fun probeUnknownSettings(): Map<Int, Int?> = withConnection {
+        (UNKNOWN_SETTINGS_RANGE).associateWith { index ->
+            val value = suspendCancellableCoroutine<Int?> { cont ->
+                bleManager.readSetting(index) { cont.resume(it) }
+            }
+            log("Setting probe: index $index = ${value ?: "unreadable"}")
+            value
+        }
+    }
+
+    /**
      * @param sincePosition ignored — the pump is addressed by slot, so the caller filters what it
      *   has already seen. Kept because it is part of the [PumpManager] contract.
      */
@@ -830,6 +886,11 @@ class YpsoPumpManagerImpl private constructor(
         }
         log("Bolus $amount U requested. Newest event sequence before sending: $baselineSequence")
 
+        // From here until the outcome is known, a dropped link is worth chasing: the pump will finish
+        // the bolus without us and the amount it gave is in its event log. Disarmed in the `finally`
+        // below so an idle disconnect never triggers a reconnect.
+        reconnectManager.enable()
+
         if (!suspendStartBolus(amount)) {
             _bolusProgress.value = BolusProgress(0.0, amount, finished = true, cancelled = false)
             return@withConnection bolusFailure(amount, "The pump refused the bolus command")
@@ -889,6 +950,7 @@ class YpsoPumpManagerImpl private constructor(
 
         // The authoritative record: what the pump wrote into its own event log.
         val record = findBolusRecord(baselineSequence)
+        reconnectManager.disable()
         val outcome = bolusOutcome(amount, record, progressSeen, mismatch)
         _bolusProgress.value = BolusProgress(
             outcome.deliveredUnits,

@@ -1577,6 +1577,71 @@ and see what it does.
 
 ---
 
+## 8.7 ⚠ An audit of this driver's own over-engineering
+
+Prompted by the pump's owner, 2026-08-01, after eighteen months of using it: *"the pump is solid.
+This is an example of you over engineering."* They were right, and the pattern is worth recording
+because it will otherwise repeat.
+
+**What was cut, and why it should not have been built:**
+
+| Built | On what evidence | Verdict |
+|---|---|---|
+| Clock correction **rate-limited to one an hour** | One measurement: ~0 s drift over 9 hours | Defended a failing crystal nobody has seen. **Removed** — a correction firing often enough to matter is itself the finding, and the log line says so without machinery to anticipate it |
+| `SUSPEND_TBR_MINUTES = 4800` (80 hours) | Copied wholesale from Medtrum | Medtrum polls near-continuously; this driver polls three times an hour. **Now 60 minutes** — three poll intervals, and a record orphaned by a crash expires in an hour rather than three days |
+| History gap → **urgent notification** | Never happened | Read window is 50 entries against a 24-entry worst case. **Now a log line** |
+| Clock drift → notification above 30 min | Reasoning, not measurement | Built and replaced inside one session. Pure churn |
+| Skip list for self-recorded sequences | Reasoning about an upsert I had not read carefully | **Removed** (§8.5). The contract said it upserts on `pumpId`; a sync is a sync |
+| *"Decide the alarm poll interval"* framed as a blocker | An assumption AAPS polls harder than it does | Overstated. **Of every AAPS pump driver, only Insight holds a persistent connection.** Command-queue-driven connect/disconnect is the norm, and the pump alarms locally and loudly |
+
+**The pattern.** Every genuine bug in this driver has been in *this code* or in an AAPS-side
+assumption: the epoch decode, the TBR lookup baseline, the type-19 confirmation, the missing suspend
+record, the ordering of the bolus record. **The pump has behaved identically every single time** —
+same envelopes, same sequence semantics, same in-place rewrites, no NAKs, no surprises beyond the
+first reading of each attribute. Yet these notes are dense with ⚠ markers aimed at the pump.
+
+The markers earned against *the pump* are few and specific: it does not NAK a bad payload, its
+conventions are per-attribute, and it rewrites log entries in place. Everything else that looks like
+pump misbehaviour in this file was this driver misreading it.
+
+**The rule going forward: measure before defending.** A guard against a failure mode nobody has
+observed is a guess wearing the costume of caution — the same mistake as `tbrPercentRange = 0..200`
+(§4h), which blocked the very experiment that would have settled it.
+
+## 8.8 What the vendored SDK left behind
+
+The upstream SDK is at `reference/reference/ypso-sdk`. Three things in it were never brought across,
+beyond `crypto/` and `keyexchange/` which are excluded deliberately (§0).
+
+**`ReconnectManager` — now vendored.** Exponential backoff 5 s → 10 → 20 → 40 → 80 → 160 → 300,
+reset on connect. This was the real omission: a dropped link previously did nothing until AAPS
+happened to issue its next command.
+
+⚠ **It is armed only for the duration of a bolus.** AAPS calls `disconnect()` every time its command
+queue empties, many times an hour — that is the normal idle state. Reconnecting after it would fight
+the queue and hold the link open permanently. A bolus is the one window where a lost link costs
+something, because the pump finishes delivery without the phone and the amount actually given is
+sitting in its event log (§4g).
+
+**`PollManager` — not vendored, and deliberately.** A 60-second poll loop holding a
+`PARTIAL_WAKE_LOCK` per cycle. It is the SDK's own answer to the polling question and 20× more
+frequent than AAPS's idle cadence, but it fights AAPS's connection model and costs battery for a
+latency that §8.7 concludes was never the problem it was made out to be.
+
+**A third history log nobody has read.** `YpsoPumpUuids.System` — COUNT/INDEX/VALUE on a completely
+different UUID family, wired up in `YpsoBleManager.readHistorySystem()` and called by nothing.
+Contents unknown.
+
+**And a correction to §8.6.** It said the pump's bolus increment "is a pump setting the driver cannot
+read — no settings index for it is known." True but misleading. `SettingsIndex` knows index 1 and the
+two 24-slot profile ranges; **indices 2–13 have never been read** — not here and not in the upstream
+SDK. Twelve settings sit there unmapped, and the bolus increment is plausibly one of them, as are the
+caps behind event types 33 and 34. `probeUnknownSettings()` now reads them and logs the values, hung
+off the **Read history** button because it is a diagnostic and twelve extra round trips (~2.5 s)
+should not land on every status poll. It is a read; nothing is written.
+
+---
+
 ## 9. Build environment gotchas
 
 Carried forward from session 1, all still true:

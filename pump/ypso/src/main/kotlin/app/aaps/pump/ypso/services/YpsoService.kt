@@ -225,9 +225,11 @@ class YpsoService : DaggerService() {
      *   phone with no network since a factory reset, or a pump whose clock was lost with its
      *   battery. Silently writing a year-wrong time into a pump is not a correction. Medtronic
      *   refuses over 24 h for the same reason; this says so and leaves it to a human.
-     * - **Rate-limited**, because every clock write appends two entries (type 12 and 13) to the
-     *   pump's own log, and that log is capped at 3000. Correcting on every poll would churn it.
-     *   Needing the limit at all means the crystal is failing, so hitting it is logged as a fault.
+     * **Not rate-limited.** An earlier version was, on the reasoning that each correction appends two
+     * entries (type 12 and 13) to the pump's 3000-entry log. That defended a failing crystal nobody
+     * has observed: the one measurement of this pump is ~0 s of drift over 9 hours. A correction that
+     * fires often enough to churn the log is itself the finding, and it will be visible in the log
+     * line above without machinery built to anticipate it.
      */
     private suspend fun correctClockIfDrifted() {
         val skewMs = ypsoPump.pumpClockSkewMs ?: return
@@ -248,19 +250,8 @@ class YpsoService : DaggerService() {
             return
         }
 
-        val sinceLast = dateUtil.now() - preferences.get(YpsoLongNonKey.LastClockCorrection)
-        if (sinceLast < T.hours(CLOCK_RESYNC_MIN_INTERVAL_HOURS).msecs()) {
-            aapsLogger.error(
-                LTag.PUMP,
-                "Pump clock has drifted ${skewSeconds}s again within ${sinceLast / 60_000} min of the last correction. " +
-                    "Not correcting yet — this rate of drift means the pump's clock is not keeping time."
-            )
-            return
-        }
-
         aapsLogger.info(LTag.PUMP, "Pump clock is ${skewSeconds}s from the phone's; correcting it")
         if (pumpManager.syncDateTime()) {
-            preferences.put(YpsoLongNonKey.LastClockCorrection, dateUtil.now())
             rxBus.send(EventDismissNotification(Notification.INSIGHT_DATE_TIME_UPDATED))
             uiInteraction.addNotificationValidFor(
                 Notification.INSIGHT_DATE_TIME_UPDATED,
@@ -294,17 +285,15 @@ class YpsoService : DaggerService() {
      * is a `PUMP_SUSPEND` temporary basal, which is the type reserved for a pump stopping of its own
      * accord rather than AAPS asking for zero.
      *
-     * [SUSPEND_TBR_MINUTES] is long and distinctive on purpose: it is how the record is recognised as
-     * this driver's own on resume, so a real temporary basal is never mistaken for one of these and
-     * closed by accident. It is re-asserted on every poll while the pump stays stopped, so it cannot
-     * quietly expire underneath a pump that is still not delivering.
+     * [SUSPEND_TBR_MINUTES] is distinctive on purpose: it is how the record is recognised as this
+     * driver's own on resume, so a real temporary basal is never mistaken for one and closed by
+     * accident. It is re-asserted on every poll while the pump stays stopped.
      *
      * ⚠ **An unrecognised delivery mode does not open this record**, and that distinction is the
      * whole reason [PumpStatus.operatingMode] is a three-valued thing rather than `isDelivering`.
      * Only two of 256 byte-0 values have ever been identified (§8.3), and nobody has looked at what
      * the pump reports *during a bolus*. If that turns out to be a third value, treating unknown as
-     * stopped would open a suspend record on every single bolus — and if the app died mid-bolus, that
-     * record would sit open for [SUSPEND_TBR_MINUTES] telling AAPS basal was off for days.
+     * stopped would open a spurious suspend record on every single bolus.
      *
      * `isSuspended()` still reports true for an unknown mode, so the **loop** stays conservative and
      * refuses to act. That costs nothing and reverses instantly. Writing a therapy record is a claim
@@ -548,13 +537,13 @@ class YpsoService : DaggerService() {
 
         val missed = result.missedSince(watermark)
         if (missed > 0) {
+            // A log line rather than a notification: this has never happened, and the read window is
+            // 50 entries against a 24-entry worst case (a full basal profile write). If it starts
+            // happening the log says so and the window can be raised.
             aapsLogger.error(
                 LTag.PUMP,
                 "History sync: $missed entr(ies) between $watermark and ${result.oldestSequence} were never read and are lost. " +
                     "Read window is ${result.sequencesRead.size} entries — raise YpsoHistoryReadCount if this repeats."
-            )
-            uiInteraction.addNotification(
-                Notification.PUMP_SYNC_ERROR, rh.gs(R.string.ypso_history_gap, missed.toInt()), Notification.URGENT
             )
         }
 
@@ -582,6 +571,13 @@ class YpsoService : DaggerService() {
      */
     fun loadHistory(): Boolean = awaitResult("loadHistory", false) {
         val count = preferences.get(YpsoIntKey.YpsoHistoryReadCount)
+
+        // Indices 2-13 have never been read by anything (see probeUnknownSettings). Attached to this
+        // button rather than the status poll because it is a diagnostic, and 12 extra round trips is
+        // ~2.5s that should not land on every connection.
+        pumpManager.probeUnknownSettings().forEach { (index, value) ->
+            aapsLogger.info(LTag.PUMP, "[setting probe] index $index = ${value ?: "unreadable"}")
+        }
 
         val result = pumpManager.readHistoryWithDump(count)
         ypsoPump.lastHistoryDump = result.rawDump
@@ -1082,19 +1078,16 @@ class YpsoService : DaggerService() {
         /**
          * Length of the 0% temporary basal that stands for a stopped pump — see [syncSuspendedState].
          *
-         * Long enough that it cannot lapse between status polls, which are 20 minutes apart when the
-         * driver is idle (`PORTING_NOTES` §8.2), and distinctive enough to be recognised as this
-         * driver's own record when delivery resumes. It is re-asserted while the pump stays stopped
-         * rather than relied on to outlive the outage.
-         */
-        private const val SUSPEND_TBR_MINUTES = 4800L
-
-        /**
-         * How far the pump's clock may be from the phone's before the user is told, in minutes.
+         * Three times the 20-minute idle poll interval (§8.2): long enough that it cannot lapse
+         * between polls while the pump is still stopped, short enough that one left behind by a
+         * crash expires in an hour rather than three days. It is re-asserted on every poll, so the
+         * length is a backstop and not the mechanism.
          *
-         * Well beyond any plausible crystal drift, so crossing it means something happened rather
-         * than something wore. The clock write itself treats anything within 90 seconds as in sync.
+         * Medtrum uses 4800 minutes for the same record. That suits a driver polling
+         * near-continuously and was wrong to copy wholesale for one that polls three times an hour.
          */
+        private const val SUSPEND_TBR_MINUTES = 60L
+
         /**
          * Drift above this is corrected on the next status read. The pump's clock reads to one
          * second and a BLE round trip costs a fraction of one, so the measurement is good to a
@@ -1106,7 +1099,5 @@ class YpsoService : DaggerService() {
         /** Beyond this the difference is not drift, and a human should look before anything is written. */
         private const val CLOCK_IMPLAUSIBLE_HOURS = 24L
 
-        /** Each correction costs two entries in the pump's 3000-entry log, so they are bounded. */
-        private const val CLOCK_RESYNC_MIN_INTERVAL_HOURS = 1L
     }
 }

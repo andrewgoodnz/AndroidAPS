@@ -22,6 +22,4 @@ enum class YpsoLongNonKey(
      */
     LastSyncedSequence("ypso_last_synced_sequence", -1L),
 
-    /** When the pump's clock was last corrected, so corrections cannot churn the pump's own log. */
-    LastClockCorrection("ypso_last_clock_correction", 0L),
 }
