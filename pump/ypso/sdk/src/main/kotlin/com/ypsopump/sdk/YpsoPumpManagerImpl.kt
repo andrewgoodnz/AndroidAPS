@@ -67,10 +67,17 @@ import kotlin.math.abs
  * MD5(6 MAC bytes ‖ 10-byte salt) and writes it to `CHAR_AUTH_PASSWORD`. Nothing is stored
  * and nothing is asked of the user.
  *
- * Every delivery entry point ([deliverStandardBolus], [setTbr], [writeBasalProfile], …) still
- * fails without touching the pump. The one write this build makes is [syncDateTime], which moves
- * no insulin and exists to prove the write path — and which reports success only after reading
- * the pump's clock back.
+ * ⚠ **This class delivers insulin.** [deliverBolusConfirmed], [setTbr] and [writeBasalProfile] are
+ * implemented and verified on hardware, each behind its own saline test. This comment used to say
+ * that every delivery entry point failed without touching the pump; that was true through session 2
+ * and is comprehensively false now, and a stale claim that a driver is inert is the most dangerous
+ * kind of stale comment there is.
+ *
+ * What is still refused, before touching BLE: the **extended and combined bolus**.
+ *
+ * Every write reports success only from a subsequent read-back or history entry, never from the
+ * write callback — this pump does not NAK a bad write (§3). [syncDateTime] was the first of them and
+ * is the pattern the rest follow.
  */
 class YpsoPumpManagerImpl private constructor(
     private val context: Context
@@ -79,7 +86,11 @@ class YpsoPumpManagerImpl private constructor(
     companion object {
 
         private const val TAG = "YpsoPumpManagerImpl"
-        private const val NOT_IMPLEMENTED = "Delivery is not implemented in this build"
+        /**
+         * Named for what it applies to now, which is the extended and combined bolus and the active
+         * profile switch — not delivery in general, which this driver does.
+         */
+        private const val NOT_IMPLEMENTED = "This command is not implemented for the YpsoPump"
 
         /** Pump needs a moment after the auth write before it answers reads. */
         private const val POST_AUTH_SETTLE_MS = 300L
@@ -689,9 +700,11 @@ class YpsoPumpManagerImpl private constructor(
          * can be tested. Ordered by sequence rather than timestamp deliberately: a clock change makes
          * timestamps go backwards (§5), and sequence is the only ordering this pump guarantees.
          *
-         * [alreadyRecorded] are sequences the driver put into `PumpSync` itself, at the phone's
-         * timestamp. Re-syncing one would upsert on the same `pumpId` and move the treatment to the
-         * pump's time, which is worse evidence — so they are excluded rather than merely deduplicated.
+         * [alreadyRecorded] would exclude sequences the driver put into `PumpSync` itself. **The
+         * driver no longer passes anything here** — a sync is a sync, it upserts on `pumpId`, and the
+         * skip list defended only the timestamp, which keeping the pump's clock within ten seconds
+         * defends better (§8.5). The parameter stays because the exclusion is still correct for any
+         * caller that does hold better evidence than the pump's own entry.
          */
         fun freshEvents(watermark: Long, alreadyRecorded: Set<Long> = emptySet()): List<PumpHistoryEvent> =
             events
@@ -792,10 +805,15 @@ class YpsoPumpManagerImpl private constructor(
     override suspend fun readHistory(sincePosition: Long, maxEvents: Int): List<PumpHistoryEvent> =
         readHistoryWithDump(maxEvents).events
 
-    // ==================== SYSTEM CLOCK — THE ONLY WRITE IN THIS BUILD ====================
+    // ==================== SYSTEM CLOCK ====================
+    //
+    // This banner used to read "THE ONLY WRITE IN THIS BUILD". It has not been true since the
+    // bolus, TBR and basal-profile writes were each opened behind their own hardware test — and a
+    // stale claim that a driver cannot write is worse than no claim, because it is the one a reader
+    // skimming for safety would stop at.
 
     /**
-     * Sets the pump's clock from the phone's. This is the driver's first write of any kind.
+     * Sets the pump's clock from the phone's. This was the driver's first write of any kind.
      *
      * It is the canary for the write path precisely because nothing here can move insulin: if the
      * wire format is wrong the pump refuses the write at the ATT layer and the clock is untouched,
@@ -1449,11 +1467,12 @@ class YpsoPumpManagerImpl private constructor(
         true
     }
 
-    // ==================== DELIVERY — NOT IMPLEMENTED ====================
+    // ==================== DELIVERY — THE TWO STILL REFUSED ====================
     //
-    // Nothing below touches the pump. These exist only to satisfy the PumpManager contract;
-    // this build sets the clock, reads, and never delivers. Each of these is its own hardware
-    // gate on saline, to be opened one at a time — never as a batch.
+    // The standard bolus, temporary basal and basal profile write are implemented and verified;
+    // they are above, not here. What is left below is the extended and combined bolus, which
+    // refuse before touching BLE. Each remaining one is its own hardware gate on saline, to be
+    // opened one at a time — never as a batch.
 
     override suspend fun deliverExtendedBolus(amount: Double, durationMinutes: Int): BolusDeliveryResult =
         refuseDelivery("deliverExtendedBolus($amount, $durationMinutes)")

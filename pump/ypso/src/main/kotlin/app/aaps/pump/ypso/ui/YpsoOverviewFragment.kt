@@ -33,9 +33,14 @@ import kotlin.math.abs
  * same reason, and the pump-clock row is deliberately a skew rather than a timestamp — both
  * clocks keep running, so the offset stays true while a captured reading does not.
  *
- * "Set pump clock" is the one control here that writes to the pump, and the only write in the
- * driver. It is confirmation-gated, and what it reports back is the pump's own clock read
- * afterwards, not the result of the write.
+ * "Set pump clock" is the one control here that writes to the pump — not the only write in the
+ * driver, which has delivered boluses, temporary basals and basal profiles since this was written,
+ * but the only one reachable from this tab. It is confirmation-gated, and what it reports back is
+ * the pump's own clock read afterwards, not the result of the write.
+ *
+ * The delivery-mode row shows the driver's *reading* of byte 0. The raw byte and the whole status
+ * payload go to the log instead (`[ypso-state]`), because the states that would identify the 254
+ * unmapped values are the ones where nobody is looking at a screen — see `PORTING_NOTES` §8.3.
  */
 class YpsoOverviewFragment : DaggerFragment() {
 

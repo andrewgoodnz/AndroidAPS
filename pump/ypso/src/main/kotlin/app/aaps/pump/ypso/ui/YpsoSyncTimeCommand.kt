@@ -8,9 +8,11 @@ import app.aaps.core.interfaces.queue.CustomCommand
  * A custom command rather than the queue's own `UPDATE_TIME`, because `CommandUpdateTime`
  * dispatches on `pump is Medtrum` and so would never reach this driver.
  *
- * User-triggered by design as well. This is the only write the driver makes, and until the write
- * path has been proven on hardware nothing should be issuing it on a schedule or as a side effect
- * of a loop iteration.
+ * ⚠ **No longer only user-triggered**, and this comment used to say it was. The write path has been
+ * proven on hardware since, so the driver now queues a clock sync by itself on a timezone or DST
+ * change and whenever the pump's clock has drifted past ten seconds (`PORTING_NOTES` §8.6). That is
+ * safe for the reason §4e gives and for no other: the write refuses unless it can read the clock
+ * first, and reports success only from the read-back.
  */
 class YpsoSyncTimeCommand : CustomCommand {
 

@@ -562,16 +562,19 @@ class YpsoService : DaggerService() {
      *    would otherwise turn the pump's recent history into new treatments carrying IOB — boluses
      *    from hours ago, possibly from before AAPS was installed. The alert count already works this
      *    way (§4g) for exactly the same reason.
-     * 2. **Entries this driver recorded itself are skipped.** They are already in the database at the
-     *    *phone's* timestamp, which is deliberate (§5) and better evidence than the pump's entry —
-     *    whose time is only as good as the pump's clock. Because the sync upserts, re-syncing one
-     *    would silently move the treatment to pump time, quietly undoing the fix for a bug that put
-     *    boluses 12 hours into the future.
+     * 2. ~~**Entries this driver recorded itself are skipped.**~~ **Dropped, and this comment used to
+     *    claim it.** The skip list existed so a bolus AAPS delivered would keep the *phone's*
+     *    timestamp rather than the pump's. A sync is a sync: it upserts on `pumpId`, the amount comes
+     *    from the same log entry either way, and the only field that moved was the timestamp. It
+     *    defended half a problem — a manual bolus has no source but the pump — and left two classes
+     *    of record with different provenance. The clock is the thing worth defending, and it is now
+     *    corrected to within 10 s instead (§8.6).
      * 3. **A gap is announced, not stepped over.** If the oldest entry read is still above the
      *    watermark, entries in between existed and were never seen — the pump was busy while AAPS was
      *    away, or a profile write pushed 24 entries in at once. The watermark still advances, because
      *    not advancing would re-read the same window for ever, but the user is told that treatments
-     *    are missing rather than left to infer it from IOB that does not add up.
+     *    are missing rather than left to infer it from IOB that does not add up. ⚠ That check was
+     *    measured across both logs at once and could not fire; it is per window now (§8.5).
      */
     private suspend fun syncHistoryToAaps() {
         if (!preferences.get(YpsoBooleanKey.YpsoSyncHistoryToAaps)) return

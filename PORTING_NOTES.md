@@ -2,11 +2,12 @@
 
 Driver for an **unlocked plaintext research YpsoPump** on current AndroidAPS (3.4.2.4).
 
-**Status, 2026-08-01: all four delivery phases are verified on hardware.** The driver bonds,
-connects, authenticates in plaintext with no key exchange, reads every value it needs, and **writes**
-— the pump clock (§4e), a standard bolus with abort (§4f), a temporary basal with cancel (§4h), and
-the 24-slot basal profile (§4i). Each was gated behind its own saline test and each is confirmed by
-reading the pump back, never by the write callback.
+**Status, 2026-08-01: all four delivery phases are verified on hardware, and the remaining work is
+observation rather than capability.** The driver bonds, connects, authenticates in plaintext with no
+key exchange, reads every value it needs, and **writes** — the pump clock (§4e), a standard bolus
+with abort (§4f), a temporary basal with cancel (§4h), and the 24-slot basal profile (§4i). Each was
+gated behind its own saline test and each is confirmed by reading the pump back, never by the write
+callback.
 
 Deliveries reach `PumpSync` under the pump's own sequence number, pump alarms reach AAPS as urgent
 notifications (§4g, §8.2), and history sync is **built but switched off** (§8.5).
@@ -14,6 +15,13 @@ notifications (§4g, §8.2), and history sync is **built but switched off** (§8
 ⚠ **This driver can now move insulin.** What stops it doing so is the cartridge, not the code. Every
 test to date has been on **saline, off-body, cannula to air**, and §8.1 lists what must still be true
 before that changes.
+
+**What stands between here and an insulin trial is that the pump has states nobody has looked at.**
+Byte 0 of the system status is identified for two values out of 256 (§8.3), and an unidentified one
+makes AAPS hold the loop off while still counting basal insulin it is not receiving. That is now
+*instrumented* — every status read logs the raw byte and the whole payload, and a bolus logs its own
+— but instrumented is not observed. `SALINE_TEST_PROCEDURE.md` Phases 5, 6 and 7 are the procedures,
+and all three are unrun.
 
 Test pump: **YpsoPump_10074292**, MAC `EC:2A:F0:01:22:34`, firmware V05.02.03 — the unit whose
 settings are in the decrypted Lotus export. (Serial 10178681 is a *different*, standard pump
@@ -44,6 +52,10 @@ reading top-down would otherwise take a delivering driver for an inert one.
    default, so "this does nothing" stays visible at the call site.
 3. **`YpsoSyncHistoryToAaps` is off**, so nothing the pump did on its own reaches AAPS's treatment
    records yet (§8.5).
+4. **Nothing added this session can move insulin.** The delivery-mode instrumentation is reads and
+   log lines only. The one read it added to the delivery path — a system-status read during a bolus
+   — is deliberately kept out of the status pipeline, so that looking at an unidentified state
+   cannot cause the driver to act on it (§8.3).
 
 **A successful GATT write proves nothing on this pump.** It does not NAK a bad write — the
 wrong auth password produced a perfectly successful write and only failed on the *next read*
@@ -1336,6 +1348,14 @@ makes AAPS report the pump suspended.** That is the deliberate direction — cla
 not happening is the error that harms — but it means any state the pump enters that we have not seen
 presents to AAPS as a suspended pump, which stops the loop acting.
 
+**⚠ Read that together with §8.6, because the two point opposite ways and both are deliberate.**
+An unmapped byte 0 makes `isSuspended()` true, which holds the loop off; and it makes
+`operatingMode` `UNKNOWN`, which deliberately writes **no** suspend record. So a pump sitting in an
+unmapped state while genuinely stopped gets both at once: AAPS will not act, *and* it goes on
+counting basal insulin that is not being delivered. Neither half is wrong on its own. Only
+identifying the byte resolves the pair, which is why this is the last item before an insulin trial
+rather than a tidy-up.
+
 What is known to still read `10`: a temporary basal running (checked repeatedly). What has **never
 been looked at**:
 
@@ -1345,8 +1365,43 @@ been looked at**:
 | during priming / a cartridge change | the pump is genuinely not delivering; does it say so, or does it say something new? |
 | after an alarm has stopped the pump | **the most important one.** If an alarm stops delivery and byte 0 goes to a third value, this is where AAPS should learn insulin has stopped — and it may be a better channel than the alert log |
 | paused | upstream lists a `PAUSED = 7`; unobserved on V05 |
+| reservoir empty mid-delivery | never seen; the reservoir field is known to read `-1` after an occlusion alarm |
 
-Mapping this is cheap — put the pump in each state and read byte 0 — and it may make §8.2 moot.
+#### ✅ It is now observable — 2026-08-01
+
+Mapping this is cheap, and the reason it had not been done is that the number could not be *read* at
+the moment the pump was in the state. Every status read now logs one greppable line:
+
+```
+[ypso-state] byte0=10 name='Running' mode=STARTED delivering=true suspendRecord=none rate=1.2U/h tbr=none reservoir=51.3 raw=[0A 2B …]
+```
+
+Three things about it are deliberate:
+
+- **The raw byte and the whole payload, not just the decode.** In a state nobody has seen, the
+  fields *around* byte 0 are what say whether anything else moved with it. `SystemStatusData` now
+  carries the payload hex through the decode for the same reason `PumpClockData` carries its wire
+  bytes: a decode is only as good as the bytes under it.
+- **In logcat, under tag `PUMP`, not only on the YPSO tab.** The states that would identify these
+  values — an alarm sounding, a cartridge half-changed, a bolus running — are exactly the states in
+  which the phone is not the thing being watched.
+- **Pump bytes and AAPS's own records on one line.** `suspendRecord=` is sampled after
+  `syncSuspendedState` has run, so the line says what the poll settled on. That is what makes
+  §8.6's prediction checkable rather than arguable.
+
+**A bolus needed its own path.** Nothing else in AAPS reads the system status while a bolus runs —
+the command queue is blocked behind the delivery call for its whole duration, so pressing Refresh
+cannot reach it. The bolus wait loop therefore takes one reading itself, on the first 500 ms poll
+that confirms `DELIVERING`, and logs `probe=during-bolus`.
+
+⚠ **That reading deliberately does not feed `updateStatusFromSystem`.** If byte 0 does turn out to
+be a third value mid-bolus, letting it through would run `syncSuspendedState` on it and open a
+spurious suspend record on *every bolus* — the exact harm §8.6 predicted, caused by the act of
+looking for it. The question has to be answerable without the answer being acted on.
+
+`SALINE_TEST_PROCEDURE.md` **Phase 5** is the procedure, with a results table that stays blank until
+each reading has the pump's own display recorded beside it. **Nothing below has been observed yet**
+— the instrument exists, the observations do not.
 
 ### 8.4 Other unmapped states, in rough order of how much they could cost
 
@@ -1411,28 +1466,56 @@ Three rules, each for a reason that cost something to learn:
 | **~~Entries the driver recorded itself are excluded~~** | **Dropped.** A sync *is* a sync: it upserts on `pumpId`, the amount comes from the same log entry either way, and the only field that moved was the timestamp. Keeping a skip list defended half a problem — manual boluses have no source but the pump — and created two classes of record with different provenance. The clock is the thing worth defending, so it is now corrected to within 10 s instead (§8.6) |
 | **A gap is announced, not stepped over** | If the oldest entry read is above the watermark, entries between them existed and were never seen. The watermark still advances, or the same window is re-read for ever, but the user is told treatments are missing rather than left to infer it from IOB that does not add up |
 
-The decision logic is pure — `HistoryReadResult.freshEvents` and `missedSince` — and pinned by nine
-tests, because it is the last gate before pump history becomes insulin on board. Note that
+#### ⚠⚠ [fixed] The gap warning could not fire, for any input
+
+2026-08-01, found by reading the code rather than by running it. The rule above was right and the
+number it was handed was not.
+
+`missedSince` took the oldest sequence across **both** logs. The two do share one counter — that is
+true, and it is why a single watermark covers them — but they are read as **two separate windows**
+of 50 entries each, and they fill at rates that are nothing like each other. This pump has logged 50
+events in an afternoon and 50 alerts since **2025**. So the union's oldest entry was always an
+ancient alert, always far below any watermark, and `oldest - watermark - 1` always clamped to zero:
+
+```kotlin
+oldestSequence           // ≈ 150000, an alert from 2025
+watermark                // ≈ 160500
+(150000 - 160500 - 1).coerceAtLeast(0)   // → 0, always
+```
+
+Including in the one case it exists for — a burst of events overflowing the 50-entry event window
+while the alert window sits three years back. **The check reported "no gap" in exactly the situation
+that produces missing treatments.**
+
+Measured per window now, and reported as the worse of the two, because each window is separately
+what could overflow. A log with nothing above the watermark contributes no gap, or every poll would
+announce one. Four tests pin it, including the case the old arithmetic could not see.
+
+**This is the third confirmation in these notes that could not fail** — after the type-19 bolus echo
+that restated the request (§4f) and the epoch "verified" by a check that passed for any epoch
+(§5). All three read as working right up until the day they were needed. The pattern is not the
+pump: it is a check whose *inputs* were never examined as carefully as its logic.
+
+The decision logic is pure — `HistoryReadResult.freshEvents` and `missedSince` — and pinned by
+thirteen tests, because it is the last gate before pump history becomes insulin on board. Note that
 `freshEvents` **re-sorts by sequence**: `readHistoryWithDump` hands its events over sorted by
 timestamp, and a clock change makes those go backwards.
 
-**⚠ Still off, and switching it on is its own gate.** The first sync after enabling is the moment a
-baseline bug would surface as phantom IOB, so it wants a human watching. Two things also remain
-unmeasured:
+**⚠ Still off, and switching it on is its own gate**, now written up as
+`SALINE_TEST_PROCEDURE.md` **Phase 7**. Where the blockers stand:
 
-1. **What happens at the log cap.** The event count reads 3000 and looks capped. If sequences wrap or
-   restart there, a monotonic watermark stops being sound.
-2. **Cost under a real loop.** ~195 ms per entry, and one basal profile write appends 24. Reading a
-   50-entry window on every connection is ~10 s, which is fine now and far too slow for a loop
-   issuing SMBs every five minutes.
-
-The TBR reconstruction problem that looked like a third blocker is **resolved** — the entry's
-timestamp is the start and survives the rewrite, so a type-10 entry describes a complete temporary
-basal (§4h).
+| Blocker | Status |
+|---|---|
+| The gap warning is inert | ✅ **Cleared 2026-08-01.** It was measured across the union of both logs and could not fire; measured per window now, with tests |
+| TBR reconstruction | ✅ **Cleared.** The entry's timestamp is the start and survives the rewrite, so a type-10 entry describes a complete temporary basal (§4h) |
+| First enable must import nothing | ⏳ **Still open — and the reason a human has to watch.** It is the moment a baseline bug surfaces as phantom IOB. Phase 7a |
+| A manual bolus arrives once, at the right time | ⏳ **Still open.** Phase 7b and 7c. 7c is what the dropped skip list used to defend: the timestamp moving from the phone's to the pump's is expected, and how far it moves measures whether the 10 s clock correction is working |
+| What happens at the log cap | ⏳ **Still open, and not testable on demand.** The event count reads 3000 and looks capped. If sequences wrap or restart there, a monotonic watermark stops being sound |
+| Cost under a real loop | ⏳ **Still open, measurable in Phase 7d.** ~195 ms per entry, and one basal profile write appends 24. A 50-entry window on every connection is ~10 s — fine now, far too slow for a loop issuing SMBs every five minutes |
 
 ### Unit tests
 
-`:pump:ypso:sdk` now has a test source set, with **59 tests** covering the decodes the hardware
+`:pump:ypso:sdk` now has a test source set, with **65 tests** covering the decodes the hardware
 findings live in: the CRC and GLB formats (§4a–4c), the full 18-byte status payload against both
 captured samples (§4), the 17-byte history entry and its 2000 epoch (§5), the clock decode and its
 plausibility guard (§4e), and the history mapping — including that `position` is the sequence
@@ -1476,15 +1559,45 @@ Now implemented in `YpsoService.syncSuspendedState`, with two things the pattern
 - **It is re-asserted on every poll** while the pump stays stopped, rather than relied on to outlive
   the outage.
 
+#### ⚠⚠ [fixed] …except it was not re-asserted on every poll, because a `StateFlow` conflates
+
+2026-08-01. The claim above was written and was false the whole time, and the reason is worth having
+because it will catch the next flow-driven thing too.
+
+`syncSuspendedState` hung off `pumpManager.pumpStatus`, which is a `StateFlow`. **A `StateFlow` does
+not emit a value equal to the one it already holds.** A stopped pump answers byte-for-byte
+identically poll after poll — same mode, no rate, no TBR, and a reservoir that cannot move because
+nothing is being delivered. So the collector fired **once**, on the transition into stopped, and
+then never again for as long as the pump stayed stopped.
+
+That matters because §8.7 shortened the record to **60 minutes** on purpose, so one orphaned by a
+crash expires in an hour rather than three days. Expiry and re-assertion are two halves of one
+design, and only one half was present. A pump stopped for longer than an hour would have had its
+suspend record expire with nothing to replace it, and **AAPS would have gone back to counting basal
+IOB for a stopped pump** — which is the exact bug this whole section exists to fix, arriving
+through a different door about fifty lines below where it was fixed the first time.
+
+The manager now also exposes `statusReads`, a `SharedFlow` that emits once per system-status read
+regardless of whether anything changed, and everything that must happen *per poll* hangs off that.
+The `StateFlow` keeps its proper job: holding the current value for the UI, where conflation is what
+you want.
+
+Phase 6b in `SALINE_TEST_PROCEDURE.md` is the check: an hour of `suspendRecord=open` with not one
+`none` in between, and a second record opening around the 60-minute mark.
+
 **And one thing the pattern does not require, but this pump does.** `isDelivering` is false both for
 "confirmed stopped" and for "delivery mode never identified" — right for gating the loop, where the
 safe answer to *don't know* is *don't act*, but wrong for writing a record. Only two byte-0 values out
 of 256 are known (§8.3) and nobody has yet looked at what the pump reports **during a bolus**. If that
 is a third value, treating unknown as stopped would open a suspend record on every bolus — and an app
-killed mid-bolus would leave one open for 80 hours, telling AAPS basal was off for days.
+killed mid-bolus would leave one open for its full hour, telling AAPS basal was off when it was not.
 
 So `PumpStatus.operatingMode` is now populated as a genuine three-valued state and only `STOPPED`
 opens the record. `UNKNOWN` logs loudly and writes nothing. The loop stays held off either way.
+
+**The bolus question is now answerable** — see §8.3. The wait loop takes one system-status reading
+per bolus and logs it without letting it reach this method, so looking cannot cause the thing being
+looked for.
 
 ### ⚠ [fixed] Nothing corrected the pump's clock after a DST or timezone change
 
