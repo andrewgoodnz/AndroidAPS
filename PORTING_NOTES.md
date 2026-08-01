@@ -27,8 +27,13 @@ Two rows remain, both cheap: what the pump reports with the **cartridge out or p
 next cartridge change) and with the **reservoir empty**. `SALINE_TEST_PROCEDURE.md` Phase 5 holds the
 results table.
 
-**Phase 6 is passed except 6b**, the hour of re-assertion. **Phase 7 — history sync — is unrun**, and
-it is now the largest thing left: it is the switch that turns pump history into insulin on board.
+**Phase 6 is passed.** 6b ran overnight and found the suspend record lapsing between polls in 2 of
+13 cycles — real, conservative in direction, and nearly unreachable in normal use; **fixed**, and
+worth re-confirming next time the pump is stopped for other reasons rather than spending a night on
+it (§8.6).
+
+**Phase 7 — history sync — is unrun, and is now the largest thing left**: it is the switch that turns
+pump history into insulin on board.
 
 Test pump: **YpsoPump_10074292**, MAC `EC:2A:F0:01:22:34`, firmware V05.02.03 — the unit whose
 settings are in the decrypted Lotus export. (Serial 10178681 is a *different*, standard pump

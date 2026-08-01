@@ -5,16 +5,18 @@ which records what the pump has actually been observed to do.
 
 ## ⏳ Everything still to run — read this first
 
-As of 2026-08-01, **all four delivery phases have passed, Phase 5 is answered except two rows, and
-Phase 6 is passed except 6b.** The single largest thing left is **Phase 7**, history sync — the
-switch that turns pump history into insulin on board. It should have a session to itself.
+As of 2026-08-02, **all four delivery phases have passed, Phase 5 is answered except two rows, and
+Phase 6 has passed all six steps** — 6b found a real defect overnight, which is fixed and wants
+re-confirming opportunistically rather than on purpose. The single largest thing left is **Phase 7**,
+history sync — the switch that turns pump history into insulin on board. It should have a session to
+itself.
 
 **Still to run, most valuable first:**
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
 | A | **Phase 7 — switch history sync on, with someone watching** | ⚠ Built, never enabled. The first sync must import **nothing** — it only records where to start. If treatments appear, the baseline is wrong and that is phantom IOB | **Phase 7**, §8.5 |
-| B | **Phase 6b — the re-assertion hour** | Leave the pump stopped for over an hour and confirm every poll still reads `suspendRecord=open`, with a fresh record at each 60-minute expiry. Needs an idle pump and no attention, not more of yours | **Phase 6b**, §8.6 |
+| B | **Phase 6b re-confirm — the renewal fix** | ⚠ **Do not test this by checking that every poll reads `suspendRecord=open`** — that check passed across a run containing two real gaps. Compare consecutive record start times: with the fix, `renewed the 0% basal` should appear every ~40 min and no two starts should be more than ~40 min apart. **Opportunistic** — fold it into the next time the pump is stopped for other reasons; the exposure does not justify a dedicated night | **Phase 6b**, §8.6 |
 | C | **Phase 5c — cartridge out and priming** | The last two delivery-mode states never read. **Free at your next cartridge change** if you press Refresh while the cartridge is out and again while priming | **Phase 5c**, §8.3 |
 | D | **Phase 5e — reservoir empty mid-delivery** | Never seen. The pump does alert (`104 Cartridge Empty`, 37 in the log), but what byte 0 reads at that moment is unknown | **Phase 5e**, §8.3 |
 | E | **Reconnect mid-bolus** | Pull BLE range during a 2 U bolus. The pump finishes regardless; what is untested is whether AAPS's *record* settles. A provisional record goes in before sending and `ReconnectManager` chases the link back, armed for the bolus only | §4g |
@@ -1033,8 +1035,15 @@ direction, and it is the one §4h already cost a session to.
 
 ### Phase 6 is passed when
 
-6a–6d and 6f all confirm, with 6b showing an unbroken hour of `suspendRecord=open`, and 6e's
-observation recorded whatever it turned out to be.
+6a–6d and 6f all confirm, 6b shows **no two consecutive record start times more than ~40 minutes
+apart**, and 6e's observation is recorded whatever it turned out to be.
+
+⚠ **6b's criterion used to read "an unbroken hour of `suspendRecord=open`" and that was wrong** — it
+passed across a 13h40 run containing two twenty-minute gaps, because the record is renewed before the
+line is written. A phase is only passed by a check that could have failed.
+
+**Status: all six confirmed** on 2026-08-01/02. 6b failed first, was fixed the next morning, and its
+re-confirm is opportunistic (see the to-run table at the top).
 
 ---
 
