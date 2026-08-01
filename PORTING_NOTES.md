@@ -16,12 +16,19 @@ notifications (§4g, §8.2), and history sync is **built but switched off** (§8
 test to date has been on **saline, off-body, cannula to air**, and §8.1 lists what must still be true
 before that changes.
 
-**What stands between here and an insulin trial is that the pump has states nobody has looked at.**
-Byte 0 of the system status is identified for two values out of 256 (§8.3), and an unidentified one
-makes AAPS hold the loop off while still counting basal insulin it is not receiving. That is now
-*instrumented* — every status read logs the raw byte and the whole payload, and a bolus logs its own
-— but instrumented is not observed. `SALINE_TEST_PROCEDURE.md` Phases 5, 6 and 7 are the procedures,
-and all three are unrun.
+**The states nobody had looked at have now been looked at, and none of them was new.** Byte 0 of the
+system status was identified for two values out of 256 and still is — because every state reachable
+on hardware came back as one of those two. During a bolus it reads `10`; while alarming, after an
+alarm, and stopped by hand it reads `3`; and there is no pause state on this pump at all (§8.3).
+That was the last unknown standing between this driver and an insulin trial, and it turned out to be
+nothing.
+
+Two rows remain, both cheap: what the pump reports with the **cartridge out or priming** (free at the
+next cartridge change) and with the **reservoir empty**. `SALINE_TEST_PROCEDURE.md` Phase 5 holds the
+results table.
+
+**Phase 6 is passed except 6b**, the hour of re-assertion. **Phase 7 — history sync — is unrun**, and
+it is now the largest thing left: it is the switch that turns pump history into insulin on board.
 
 Test pump: **YpsoPump_10074292**, MAC `EC:2A:F0:01:22:34`, firmware V05.02.03 — the unit whose
 settings are in the decrypted Lotus export. (Serial 10178681 is a *different*, standard pump
@@ -1343,6 +1350,21 @@ Two caveats that bound what this feature can ever catch:
   alert check. So a path that observes the count can still fail to announce what it saw. Harmless
   today because it does not move the baseline either, but it is a second entrance to the same room.
 
+#### ✅ [verified] The delivery-mode byte does **not** supersede this channel — 2026-08-01
+
+§8.3 raised the possibility that if an alarm stop showed up in byte 0, that would be a better channel
+than the alert log and might make this section moot. It is a better channel — it is immediate and
+needs no count — but it does **not** replace the alert log, and the reason is worth stating:
+
+**Alarming and stopped-after-acknowledging are byte-identical.** Eight status reads across an
+occlusion, four with the alarm sounding and four after it was acknowledged, produced the same
+eighteen bytes. So byte 0 says *the pump has stopped* and never says *why*. The alert log is the only
+thing that distinguishes an occlusion from a user pressing stop.
+
+The two are complements, and the driver already reads both: the delivery-mode byte stops basal IOB
+accruing within one poll, and the alert log tells the user what happened. Neither on its own is
+enough.
+
 ### 8.3 ⚠ The delivery-mode byte is mapped for two values out of 256
 
 Byte 0 of the system status is confirmed for exactly two states, both checked against the pump's own
@@ -1565,8 +1587,9 @@ none of them was, was a pump problem.
 4. **The pump stopped from its own buttons.** Does AAPS notice, and how fast? The latency question is
    now **measured** — a 20-minute idle poll interval, and 27 minutes from occlusion to notification
    (§8.2) — but a *stop* is a different signal from an *alert*: it should show as delivery-mode 3,
-   and whether that reaches `isSuspended()` promptly has never been watched. **Procedure written:**
-   `SALINE_TEST_PROCEDURE.md` Phase 6.
+   and whether that reaches `isSuspended()` promptly is now **watched and confirmed**: a button stop
+   showed `mode=STOPPED` on the first poll after it, opened the suspend record, and closed it on
+   restart (Phase 6a/6c, 2026-08-01). An *alarm* stop does the same thing and reports the same byte.
 5. **Reservoir `-1`.** Coded for (`reservoirKnown`), never observed. Likewise an unprogrammed basal
    slot reading `-1` → `0.0`, which would make `isThisProfileSet` false permanently (§4i).
    **Procedure written:** Phase 5c reaches it by removing the cartridge, and 5e by running one dry.
@@ -1735,17 +1758,20 @@ Phase 6b in `SALINE_TEST_PROCEDURE.md` is the check: an hour of `suspendRecord=o
 
 **And one thing the pattern does not require, but this pump does.** `isDelivering` is false both for
 "confirmed stopped" and for "delivery mode never identified" — right for gating the loop, where the
-safe answer to *don't know* is *don't act*, but wrong for writing a record. Only two byte-0 values out
-of 256 are known (§8.3) and nobody has yet looked at what the pump reports **during a bolus**. If that
-is a third value, treating unknown as stopped would open a suspend record on every bolus — and an app
-killed mid-bolus would leave one open for its full hour, telling AAPS basal was off when it was not.
+safe answer to *don't know* is *don't act*, but wrong for writing a record. Only two byte-0 values
+out of 256 are known (§8.3), so treating unknown as stopped would write a therapy record on the
+strength of a byte nobody had identified.
 
-So `PumpStatus.operatingMode` is now populated as a genuine three-valued state and only `STOPPED`
-opens the record. `UNKNOWN` logs loudly and writes nothing. The loop stays held off either way.
+The sharpest version of that worry was **the bolus**: if the pump reported a third value while
+delivering, unknown-as-stopped would open a suspend record on every bolus, and an app killed
+mid-bolus would leave one open for its full hour telling AAPS basal was off when it was not.
+**That has now been checked and the answer is no** — byte 0 reads `10` throughout a bolus, the same
+as an idle running pump (§8.3, verified 2026-08-01).
 
-**The bolus question is now answerable** — see §8.3. The wait loop takes one system-status reading
-per bolus and logs it without letting it reach this method, so looking cannot cause the thing being
-looked for.
+The guard stays anyway, and deliberately. It was never really about the bolus; it is about the 253
+values still unidentified, and the cartridge-out and reservoir-empty states are two of them that
+have yet to be read. `PumpStatus.operatingMode` is a genuine three-valued state, only `STOPPED`
+opens the record, `UNKNOWN` logs loudly and writes nothing, and the loop stays held off either way.
 
 ### ⚠ [fixed] Nothing corrected the pump's clock after a DST or timezone change
 

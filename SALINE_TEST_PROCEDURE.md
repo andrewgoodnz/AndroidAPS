@@ -5,26 +5,37 @@ which records what the pump has actually been observed to do.
 
 ## ⏳ Everything still to run — read this first
 
-As of 2026-08-01, **all four delivery phases have passed on hardware.** What is left is written up
-in full as **Phases 5, 6 and 7** at the bottom of this file — mapping the pump states nobody has
-looked at, watching the suspend record behave, and switching history sync on. Run them in that
-order: 6 depends on 5a, and 7 should not share a session with either.
+As of 2026-08-01, **all four delivery phases have passed, Phase 5 is answered except two rows, and
+Phase 6 is passed except 6b.** The single largest thing left is **Phase 7**, history sync — the
+switch that turns pump history into insulin on board. It should have a session to itself.
+
+**Still to run, most valuable first:**
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
-| 5 | **The delivery-mode byte in every state** | Mapped for 2 values out of 256, and **now load-bearing**: a confirmed `STOPPED` writes a 0% suspend record into AAPS and an unidentified mode deliberately writes nothing — so an unmapped state holds the loop off *and* keeps counting basal IOB. Every status read now logs `[ypso-state]` with the raw byte and payload | **Phase 5**, `PORTING_NOTES` §8.3 |
-| 6 | **The 0% suspend record** | ✅ 6a, 6c, 6d and **6f** passed 2026-08-01, plus half of 6e. **Only 6b is left** — the hour of re-assertion, which needs an idle pump and no attention | **Phase 6**, `PORTING_NOTES` §8.6 |
-| 7 | **Switch history sync on, with someone watching** | ⚠ Built but never enabled. The first sync must import **nothing** — it only records where to start. If treatments appear, the baseline is wrong and that is phantom IOB | **Phase 7**, `PORTING_NOTES` §8.5 |
-| 1 | ~~Decide the alarm poll interval~~ | **Withdrawn.** An occlusion took 27 min to reach AAPS, and that is simply how AAPS drives pumps — of every driver, only Insight holds a persistent connection. The pump alarms locally and loudly. See §8.7 | — |
-| 2b | **Change the phone's timezone** | New behaviour, untested: the driver should queue a clock sync and the pump's clock should follow. Previously nothing corrected it | `PORTING_NOTES` §8.6 |
-| 2c | **Change the pump's bolus increment** | AAPS hard-codes 0.1 U and cannot read the pump's setting. Ask for something off the new grid and see whether it is refused or silently rounded | `PORTING_NOTES` §8.6 |
-| 2d | **Press Read history and read the setting probe** | New: indices 2–13 have never been read by anything. Look for the **bolus increment** among them — AAPS hard-codes 0.1 U and cannot currently read what the pump is set to. Pure read, nothing written | `PORTING_NOTES` §8.8 |
-| 3 | **Reconnect mid-bolus** | Pull BLE range during a 2 U bolus. The pump owns the bolus and finishes it regardless. **New, untested:** a provisional record now goes in at the requested amount *before* sending, so IOB should be right even if the connection dies; and `ReconnectManager` now chases the link back with a 5 s → 300 s backoff, armed for the bolus only. Expect a reconnect within seconds, the record settling to the delivered amount, and `success=false` with the treatment still present | `PORTING_NOTES` §4g |
-| 3a | **Kill AAPS mid-bolus** | Force-stop the app during delivery. The provisional record must survive and keep counting. This is the case that decides whether `PumpSyncStorage` is needed | `PORTING_NOTES` §4g |
-| 4 | **A bolus while a TBR runs** | Never tried together; both are identified by sequence | — |
-| 5 | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
-| 6 | **Restore a profile you care about** | A write you cannot reverse is not finished. Untested only in the sense that nothing has needed it | 4g |
-| 7 | **The extended bolus** | Still refused. Out of scope until the standard bolus has soaked | — |
+| A | **Phase 7 — switch history sync on, with someone watching** | ⚠ Built, never enabled. The first sync must import **nothing** — it only records where to start. If treatments appear, the baseline is wrong and that is phantom IOB | **Phase 7**, §8.5 |
+| B | **Phase 6b — the re-assertion hour** | Leave the pump stopped for over an hour and confirm every poll still reads `suspendRecord=open`, with a fresh record at each 60-minute expiry. Needs an idle pump and no attention, not more of yours | **Phase 6b**, §8.6 |
+| C | **Phase 5c — cartridge out and priming** | The last two delivery-mode states never read. **Free at your next cartridge change** if you press Refresh while the cartridge is out and again while priming | **Phase 5c**, §8.3 |
+| D | **Phase 5e — reservoir empty mid-delivery** | Never seen. The pump does alert (`104 Cartridge Empty`, 37 in the log), but what byte 0 reads at that moment is unknown | **Phase 5e**, §8.3 |
+| E | **Reconnect mid-bolus** | Pull BLE range during a 2 U bolus. The pump finishes regardless; what is untested is whether AAPS's *record* settles. A provisional record goes in before sending and `ReconnectManager` chases the link back, armed for the bolus only | §4g |
+| F | **Kill AAPS mid-bolus** | Force-stop during delivery. The provisional record must survive and keep counting — this decides whether `PumpSyncStorage` is needed | §4g |
+| G | **Change the phone's timezone** | Untested: the driver should queue a clock sync and the pump's clock should follow | §8.6 |
+| H | **A bolus while a TBR runs** | Never tried together; both are identified by sequence | — |
+| I | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
+| J | **Restore a profile you care about** | A write you cannot reverse is not finished | Phase 4 |
+| K | **The extended bolus** | Still refused. Out of scope until the standard bolus has soaked | — |
+
+**Closed on 2026-08-01, no longer on the list:**
+
+| Was | Outcome |
+|---|---|
+| **The delivery-mode byte in every state** | ✅ **No third value exists.** `10` during a bolus, `3` while alarming / after an alarm / stopped by hand, and **no pause state on this pump at all**. Only cartridge-out and reservoir-empty remain (C and D above) |
+| **Stop the pump from its own buttons** | ✅ Urgent notification, `PUMP_SUSPEND` record opened, closed on restart (6a/6c) |
+| **A TBR cancel closing the suspend record** | ✅ Found, fixed and verified the same day (6f). It was firing **automatically on every pump stop**, not on an edge case |
+| **Change the pump's bolus increment** | ✅ **It does not bind a commanded bolus.** With the menu step at 2 U, AAPS asked for 0.3 U and got exactly that. `bolusSize = 0.1` is safe |
+| **Read the setting probe, indices 2–13** | ✅ Read. **Index 3 is the bolus increment** in centi-units, confirmed against two settings |
+| **Does a cannula-priming event exist?** | ❌ **No `type=25`, anywhere.** AAPS's site-change timer (CAGE) can never restart itself on this pump. A documented limitation now, not a silent failure waiting for Phase 7 |
+| ~~Decide the alarm poll interval~~ | **Withdrawn.** Command-queue-driven connect/disconnect is how AAPS drives every pump but Insight. See §8.7 |
 
 **✅ Passed 2026-07-31 and no longer on the list:** the bolus cancelled *on the pump* (recorded 0.58 U
 of 2.0 U requested, `success=false`, after previously recording the full amount — §4f); and the alarm
