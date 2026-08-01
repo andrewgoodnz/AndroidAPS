@@ -1756,6 +1756,54 @@ you want.
 Phase 6b in `SALINE_TEST_PROCEDURE.md` is the check: an hour of `suspendRecord=open` with not one
 `none` in between, and a second record opening around the 60-minute mark.
 
+#### ⚠⚠ [open] 6b failed — the record expires between polls, about half the time
+
+2026-08-01, an unattended run with the pump stopped. **The record is not held continuously**, and the
+way it fails is worse than failing outright.
+
+```
+record 1  opened 18:10:42   expires 19:10:42
+          poll  19:10:28  —  14 s BEFORE expiry, record still valid, nothing opened
+          record 2 opened 19:30:30            → 19 min 48 s with no record at all
+
+record 2  opened 19:30:30   expires 20:30:30
+          poll  20:30:30  —  exactly ON expiry, renewed
+          record 3 opened 20:30:30            → 0 s
+```
+
+**The mechanism is a race, and it is self-inflicted.** `syncSuspendedState` only opens a record once
+`openSuspendRecord()` returns null — that is, *after* the previous one has already expired. The
+record is opened **by a poll**, so expiry falls exactly 60 minutes later; and polls run every ~20
+minutes **from that same instant**. The third poll of each cycle therefore lands within *seconds* of
+expiry, every single time, and whether it renews is decided by a few seconds of accumulated drift:
+
+```
+cycle 1:  19m52 + 20m02 + 19m52 = 59m46   → 14 s short, missed
+cycle 2:  20m08 + 19m52 + 20m00 = 60m00   → exact, caught
+```
+
+So it works roughly half the time. **That is the dangerous kind of defect**: casual testing passes,
+and the failure appears at random in the field, for up to a full poll interval each time.
+
+**⚠ And the log cannot show it.** `syncSuspendedState` runs *before* `logDeliveryState`, so by the
+time a line is written a fresh record always exists. Every `[ypso-state]` line in the run above reads
+`suspendRecord=open`, including the ones bracketing a twenty-minute hole. The check written for this
+phase — *"a single `none` while stopped is a failure"* — **reported zero failures across the whole
+run**. The gap is only visible by arithmetic: comparing each record's start against the previous
+start plus sixty minutes. Another check that could not fail, and this one was written yesterday
+knowing that was the trap.
+
+**Recommended fix, not applied:** renew when the record has **less than ~30 minutes left** rather
+than waiting for it to expire. With a 60-minute record and a 20-minute cadence that renews on every
+second poll — a fresh record about every 40 minutes, no gap possible, and a crash-orphaned record
+still dies inside the hour §8.7 asked for. It was left unapplied because the pump was still stopped
+and under test, and editing the thing being measured invalidates the measurement.
+
+**This is the fourth variant of one bug.** Not written; written but never re-asserted; re-asserted
+but closed by an automatic cancel; and now renewed only after a gap. Each fix was correct. Each left
+a different route to the same wrong belief — *basal is being delivered* — and none of them was the
+pump.
+
 **And one thing the pattern does not require, but this pump does.** `isDelivering` is false both for
 "confirmed stopped" and for "delivery mode never identified" — right for gating the loop, where the
 safe answer to *don't know* is *don't act*, but wrong for writing a record. Only two byte-0 values

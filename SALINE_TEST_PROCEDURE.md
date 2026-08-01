@@ -874,7 +874,32 @@ stopped for longer than an hour goes back to accruing phantom basal IOB.
   Look at AAPS, not only at the pump — §4h's TBR cancel passed every pump-side check and AAPS still
   disagreed, and the UI is what caught it.
 
-### 6b. It is re-asserted across polls
+### 6b. It is re-asserted across polls ❌ **FAILED 2026-08-01**
+
+> **Result.** The record is **not** held continuously. Unattended, pump stopped, three expiry cycles
+> observed:
+>
+> ```
+> record 1  18:10:42 → expires 19:10:42.  Poll at 19:10:28, 14 s early → not renewed
+>           record 2 opened 19:30:30      → 19 min 48 s with NO record
+> record 2  19:30:30 → expires 20:30:30.  Poll at 20:30:30, exactly on time → renewed
+>           record 3 opened 20:30:30      → 0 s gap
+> ```
+>
+> **It is a race, and it works about half the time.** The record is opened *by* a poll, so expiry is
+> exactly 60 minutes later, and polls run every ~20 minutes from that same instant — so the third
+> poll of each cycle lands within seconds of expiry every time. A few seconds of drift decides it.
+>
+> **⚠ The check written for this phase reported zero failures.** `syncSuspendedState` runs before
+> `logDeliveryState`, so every line reads `suspendRecord=open` even the ones bracketing a
+> twenty-minute hole. **Do not test this by grepping for `none`.** Compare each record's `open since`
+> against the previous one plus sixty minutes; the difference is the uncovered window.
+>
+> Polling itself was flawless — 20-minute cadence all evening, no doze, no dropped connections. The
+> defect is entirely in when the record is renewed. Fix recommended in `PORTING_NOTES` §8.6 and not
+> yet applied.
+
+### 6b — the original procedure
 
 This is the check that the `StateFlow` conflation fix was for: a stopped pump reports identical
 bytes poll after poll, and the collector that writes this record used to fire only when the value
