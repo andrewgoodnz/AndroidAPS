@@ -1419,9 +1419,11 @@ each reading has the pump's own display recorded beside it. **Nothing below has 
 4. **The pump stopped from its own buttons.** Does AAPS notice, and how fast? The latency question is
    now **measured** — a 20-minute idle poll interval, and 27 minutes from occlusion to notification
    (§8.2) — but a *stop* is a different signal from an *alert*: it should show as delivery-mode 3,
-   and whether that reaches `isSuspended()` promptly has never been watched.
+   and whether that reaches `isSuspended()` promptly has never been watched. **Procedure written:**
+   `SALINE_TEST_PROCEDURE.md` Phase 6.
 5. **Reservoir `-1`.** Coded for (`reservoirKnown`), never observed. Likewise an unprogrammed basal
    slot reading `-1` → `0.0`, which would make `isThisProfileSet` false permanently (§4i).
+   **Procedure written:** Phase 5c reaches it by removing the cartridge, and 5e by running one dry.
 6. **Low battery.** Only 2-of-4 bars has ever been seen. The mapping of 0 and 1 bars, and whether the
    pump alerts, are both unknown — and AAPS acts on pump battery level.
 7. **Bolus and basal caps.** Event types 33 and 34 exist for them. Whether the pump refuses an
@@ -1727,6 +1729,23 @@ pump misbehaviour in this file was this driver misreading it.
 observed is a guess wearing the costume of caution — the same mistake as `tbrPercentRange = 0..200`
 (§4h), which blocked the very experiment that would have settled it.
 
+#### The rule applied, 2026-08-01
+
+The session after this audit was written spent itself on instruments rather than guards. Byte 0's
+254 unmapped values were not defended against; they were made **readable** (§8.3), which is the
+measurement the guard would have been a substitute for. Nothing was added to the *delivery* path
+beyond a single read whose result is deliberately not acted on.
+
+The audit's other half held up too. Both defects found this session — the suspend record that was
+never re-asserted (§8.6) and the gap warning that could not fire (§8.5) — were **in this code**, in
+AAPS-side assumptions about how a `StateFlow` and two read windows behave. The pump was not involved
+in either. That is now five for five.
+
+One thing this suggests looking at next, and it is not a guard: **checks whose inputs were never
+examined.** Three of them have now been found, all of which passed for every possible input. It
+would be worth reading the remaining confirmations with that question — not "is the logic right?"
+but "could this ever have said no?"
+
 ## 8.8 What the vendored SDK left behind
 
 The upstream SDK is at `reference/reference/ypso-sdk`. Three things in it were never brought across,
@@ -1788,8 +1807,10 @@ Carried forward from session 1, all still true:
   error. `./gradlew :app:clean` then rebuild. **This happened again this session**, right after
   the ypso module gained new classes — expect it whenever the driver's shape changes.
 
-### New this session
+### Added in session 1, still true
 
+- The SDK module's test task is **`:pump:ypso:sdk:testFullDebugUnitTest`**, not
+  `:pump:ypso:sdk:test…Debug…` — the module has three flavours and `compileDebugKotlin` is ambiguous.
 - Nordic's BLE library (`no.nordicsemi.android:ble:2.11.0`) was added to
   `gradle/libs.versions.toml` as `no-nordicsemi-android-ble`. It is the only new third-party
   dependency; dropping the key-exchange code avoided pulling in gRPC and Play Integrity.
