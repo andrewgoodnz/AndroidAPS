@@ -874,30 +874,44 @@ stopped for longer than an hour goes back to accruing phantom basal IOB.
   Look at AAPS, not only at the pump — §4h's TBR cancel passed every pump-side check and AAPS still
   disagreed, and the UI is what caught it.
 
-### 6b. It is re-asserted across polls ❌ **FAILED 2026-08-01**
+### 6b. It is re-asserted across polls ❌ **FAILED 2026-08-01 → fixed, needs a re-run**
 
-> **Result.** The record is **not** held continuously. Unattended, pump stopped, three expiry cycles
-> observed:
+> **Result over 13h40 unattended, pump stopped: 2 gaps in 13 expiry cycles**, 19m48s and 19m59s,
+> 39m47s uncovered in total (4.9%). Eleven cycles renewed within 0–4 seconds.
 >
 > ```
-> record 1  18:10:42 → expires 19:10:42.  Poll at 19:10:28, 14 s early → not renewed
->           record 2 opened 19:30:30      → 19 min 48 s with NO record
-> record 2  19:30:30 → expires 20:30:30.  Poll at 20:30:30, exactly on time → renewed
->           record 3 opened 20:30:30      → 0 s gap
+> missed:   record 21:30:34 → expiry 22:30:34.  Poll at 22:30:33 — ONE second early
+> caught:   record 22:50:33 → expiry 23:50:33.  Poll at 23:50:35 — two seconds late
 > ```
 >
-> **It is a race, and it works about half the time.** The record is opened *by* a poll, so expiry is
-> exactly 60 minutes later, and polls run every ~20 minutes from that same instant — so the third
-> poll of each cycle lands within seconds of expiry every time. A few seconds of drift decides it.
+> The record was opened *by* a poll, so expiry fell exactly 60 min later, and AAPS polls every
+> ~20 min — **60 is an exact multiple of 20**, so a poll landed within seconds of every expiry and
+> drift decided it. Fixed by renewing below 30 minutes remaining, which breaks the phase-lock.
 >
-> **⚠ The check written for this phase reported zero failures.** `syncSuspendedState` runs before
-> `logDeliveryState`, so every line reads `suspendRecord=open` even the ones bracketing a
-> twenty-minute hole. **Do not test this by grepping for `none`.** Compare each record's `open since`
-> against the previous one plus sixty minutes; the difference is the uncovered window.
+> **Severity is lower than it looks**, and lower than the first write-up claimed: a missing record
+> makes AAPS *over-state* IOB, which is the conservative direction (§0), and `isSuspended()` holds
+> the loop off throughout regardless. In normal use it is nearly unreachable — it needs the pump
+> stopped over an hour, and a site change is 15–30 min while shower/swim disconnects go through
+> AAPS's own `EMULATED_PUMP_SUSPEND`, a different record type entirely.
 >
-> Polling itself was flawless — 20-minute cadence all evening, no doze, no dropped connections. The
-> defect is entirely in when the record is renewed. Fix recommended in `PORTING_NOTES` §8.6 and not
-> yet applied.
+> **⚠⚠ The failure test below could not fail, and reported zero across a run containing two real
+> gaps.** `syncSuspendedState` runs before `logDeliveryState`, so by the time a line is written a
+> fresh record always exists — every line reads `suspendRecord=open`, including the pairs either side
+> of a twenty-minute hole.
+>
+> **Polling itself was flawless**: 61 connections, 20-minute cadence, no doze, no drops, over
+> 11h42 — total radio time 16m29s, a 2.35% duty cycle.
+
+**⚠ How to measure this — do NOT grep for `none`.** Compare each record's `open since` against the
+**previous** record's `open since` plus 60 minutes. Any interval longer than 60 min is an uncovered
+window, and it is invisible in the log lines themselves.
+
+```
+grep "recorded a 0% basal\|renewed the 0% basal" AndroidAPS.log
+```
+
+With the fix in place, renewals should now appear roughly every **40 minutes** (`renewed the 0%
+basal with ~20 min left`) and consecutive record starts should never be more than ~40 min apart.
 
 ### 6b — the original procedure
 

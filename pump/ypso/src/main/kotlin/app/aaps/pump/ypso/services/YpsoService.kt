@@ -328,7 +328,20 @@ class YpsoService : DaggerService() {
         }
 
         if (mode != OperatingMode.STARTED) {
-            if (ourSuspendRecord != null) return
+            // ⚠ Renew *before* expiry, never after. Waiting for the record to lapse and then
+            // noticing leaves a hole the width of one poll interval, and the hole is not
+            // hypothetical: an unattended run on 2026-08-01 produced two of them, 19m48s and
+            // 19m59s, in thirteen hours (§8.6).
+            //
+            // The cause is that the record is opened *by* a poll, so its expiry falls exactly
+            // SUSPEND_TBR_MINUTES later — and AAPS polls every ~20 min (its own
+            // KeepAliveWorker.STATUS_UPDATE_FREQUENCY of 15 min, evaluated by a worker that ticks
+            // every 5). 60 is an exact multiple of 20, so a poll lands within *seconds* of every
+            // expiry and whether it renews is decided by drift. One observed miss was by a single
+            // second. Renewing early breaks that phase-lock as well as leaving margin.
+            val remainingMs = ourSuspendRecord?.let { (it.timestamp + it.duration) - dateUtil.now() }
+            if (remainingMs != null && remainingMs > T.mins(SUSPEND_TBR_RENEW_BELOW_MINUTES).msecs()) return
+
             val synced = pumpSync.syncTemporaryBasalWithPumpId(
                 timestamp = dateUtil.now(),
                 rate = 0.0,
@@ -339,13 +352,24 @@ class YpsoService : DaggerService() {
                 pumpType = PumpType.YPSOPUMP,
                 pumpSerial = pumpSerial()
             )
-            aapsLogger.warn(
-                LTag.PUMP,
-                "Pump is not delivering (mode '$modeName'); recorded a 0% basal so AAPS stops counting basal IOB, new=$synced"
-            )
-            uiInteraction.addNotification(
-                Notification.PUMP_SUSPENDED, rh.gs(R.string.ypso_pump_suspended, modeName), Notification.URGENT
-            )
+
+            if (remainingMs != null) {
+                // Still the same suspension, just topped up. Not news, and not a second alarm:
+                // the user was told when it started and nothing has changed since.
+                aapsLogger.info(
+                    LTag.PUMP,
+                    "Pump still not delivering (mode '$modeName'); renewed the 0% basal with " +
+                        "${remainingMs / 60000} min left, new=$synced"
+                )
+            } else {
+                aapsLogger.warn(
+                    LTag.PUMP,
+                    "Pump is not delivering (mode '$modeName'); recorded a 0% basal so AAPS stops counting basal IOB, new=$synced"
+                )
+                uiInteraction.addNotification(
+                    Notification.PUMP_SUSPENDED, rh.gs(R.string.ypso_pump_suspended, modeName), Notification.URGENT
+                )
+            }
             return
         }
 
@@ -1185,6 +1209,22 @@ class YpsoService : DaggerService() {
          * near-continuously and was wrong to copy wholesale for one that polls three times an hour.
          */
         private const val SUSPEND_TBR_MINUTES = 60L
+
+        /**
+         * Renew the suspend record once it has less than this left, rather than waiting for it to
+         * expire.
+         *
+         * **Must comfortably exceed AAPS's status-poll interval**, which is ~20 minutes and is not
+         * this driver's to choose — `KeepAliveWorker.STATUS_UPDATE_FREQUENCY` is 15 minutes and the
+         * worker evaluating it ticks every 5. Thirty leaves a whole poll of margin, and renews on
+         * every second poll rather than every one, so the record churn stays modest.
+         *
+         * It also has to **not divide [SUSPEND_TBR_MINUTES] evenly against the poll interval**,
+         * which is the trap the first version fell into: 60 is exactly three 20-minute polls, so
+         * expiry was phase-locked to the poll schedule and a poll landed within seconds of it every
+         * single cycle.
+         */
+        private const val SUSPEND_TBR_RENEW_BELOW_MINUTES = 30L
 
         /**
          * Drift above this is corrected on the next status read. The pump's clock reads to one

@@ -1756,53 +1756,80 @@ you want.
 Phase 6b in `SALINE_TEST_PROCEDURE.md` is the check: an hour of `suspendRecord=open` with not one
 `none` in between, and a second record opening around the 60-minute mark.
 
-#### ⚠⚠ [open] 6b failed — the record expires between polls, about half the time
+#### ✅ [fixed] 6b: the record expired between polls — real, but far smaller than first written up
 
-2026-08-01, an unattended run with the pump stopped. **The record is not held continuously**, and the
-way it fails is worse than failing outright.
+2026-08-01/02, a 13h40 unattended run with the pump stopped. **The record was not held
+continuously.** Over thirteen expiry cycles:
 
-```
-record 1  opened 18:10:42   expires 19:10:42
-          poll  19:10:28  —  14 s BEFORE expiry, record still valid, nothing opened
-          record 2 opened 19:30:30            → 19 min 48 s with no record at all
+| | |
+|---|---|
+| Cycles that renewed cleanly | **11 of 13**, within 0–4 seconds of expiry |
+| Cycles that left a hole | **2 of 13** — 19m48s and 19m59s |
+| Total uncovered | **39m47s of 13h40 = 4.9%** |
 
-record 2  opened 19:30:30   expires 20:30:30
-          poll  20:30:30  —  exactly ON expiry, renewed
-          record 3 opened 20:30:30            → 0 s
-```
-
-**The mechanism is a race, and it is self-inflicted.** `syncSuspendedState` only opens a record once
-`openSuspendRecord()` returns null — that is, *after* the previous one has already expired. The
-record is opened **by a poll**, so expiry falls exactly 60 minutes later; and polls run every ~20
-minutes **from that same instant**. The third poll of each cycle therefore lands within *seconds* of
-expiry, every single time, and whether it renews is decided by a few seconds of accumulated drift:
+**The mechanism is a phase-lock, and the half of it that was this driver's fault is the constant.**
+`syncSuspendedState` opened a record only once the previous had *already expired*. The record is
+opened **by a poll**, so expiry falls exactly `SUSPEND_TBR_MINUTES` later; and AAPS polls every ~20
+minutes — its own `KeepAliveWorker.STATUS_UPDATE_FREQUENCY` of 15 minutes, evaluated by a worker
+ticking every 5. **60 is an exact multiple of 20**, so a poll landed within *seconds* of every expiry
+and a second or two of drift decided the outcome:
 
 ```
-cycle 1:  19m52 + 20m02 + 19m52 = 59m46   → 14 s short, missed
-cycle 2:  20m08 + 19m52 + 20m00 = 60m00   → exact, caught
+missed:   record 21:30:34 → expiry 22:30:34.  Poll at 22:30:33 — ONE second early
+caught:   record 22:50:33 → expiry 23:50:33.  Poll at 23:50:35 — two seconds late
 ```
 
-So it works roughly half the time. **That is the dangerous kind of defect**: casual testing passes,
-and the failure appears at random in the field, for up to a full poll interval each time.
+**Fixed** by renewing once the record has under `SUSPEND_TBR_RENEW_BELOW_MINUTES` (30) left, which
+both leaves a whole poll of margin and breaks the phase-lock. Renewal is logged at info and does
+**not** re-raise the urgent notification — the user was told when the suspension started and nothing
+has changed since.
 
-**⚠ And the log cannot show it.** `syncSuspendedState` runs *before* `logDeliveryState`, so by the
-time a line is written a fresh record always exists. Every `[ypso-state]` line in the run above reads
-`suspendRecord=open`, including the ones bracketing a twenty-minute hole. The check written for this
-phase — *"a single `none` while stopped is a failure"* — **reported zero failures across the whole
-run**. The gap is only visible by arithmetic: comparing each record's start against the previous
-start plus sixty minutes. Another check that could not fail, and this one was written yesterday
-knowing that was the trap.
+##### ⚠ The first write-up of this was wrong twice, and both errors were mine
 
-**Recommended fix, not applied:** renew when the record has **less than ~30 minutes left** rather
-than waiting for it to expire. With a 60-minute record and a 20-minute cadence that renews on every
-second poll — a fresh record about every 40 minutes, no gap possible, and a crash-orphaned record
-still dies inside the hour §8.7 asked for. It was left unapplied because the pump was still stopped
-and under test, and editing the thing being measured invalidates the measurement.
+It said *"about half the time"* and read as a ⚠⚠ safety finding. Neither survives the full dataset:
 
-**This is the fourth variant of one bug.** Not written; written but never re-asserted; re-asserted
-but closed by an automatic cancel; and now renewed only after a gap. Each fix was correct. Each left
-a different route to the same wrong belief — *basal is being delivered* — and none of them was the
-pump.
+- **Frequency.** "Half" came from a **two-sample** run — one miss, one catch. Thirteen cycles say
+  2-in-13. Reporting a ratio from two observations is not measurement.
+- **Severity, and this is the worse error.** A missing suspend record means AAPS assumes profile
+  basal *is* being delivered, so it **over-states IOB** — and §0's own table says plainly that
+  over-stating IOB makes AAPS dose *less*, which is the conservative direction; under-stating is what
+  causes stacking. `isSuspended()` also stays true off the delivery-mode byte throughout, so the loop
+  is held off regardless. The cost of a 20-minute hole is IOB over-stated by 20 minutes of basal,
+  with the loop already inhibited.
+
+**And in normal use it is close to unreachable**, which the pump's owner pointed out and the code
+confirms. It needs the pump stopped for **over an hour continuously**:
+
+| Real scenario | Reaches it? |
+|---|---|
+| Site change with the pump stopped, 15–30 min | **No** — the record never expires |
+| Shower, swim, any planned disconnect | **No** — AAPS's own Disconnect Pump writes `EMULATED_PUMP_SUSPEND` ("Initiated by AAPS as zero TBR"), a different record type this code never sees |
+| An occlusion noticed and cleared | **No** |
+| Pump left stopped >1 h unattended | Yes — and that is an alarm condition already being ignored |
+
+So this was found by constructing a fourteen-hour stopped-pump scenario that corresponds to nothing
+anyone does. **That is §8.7's pattern with these notes' own name on it**, and the correction came
+from the person who uses the pump — as it did for the bolus increment the day before. It is fixed
+because "while the pump is stopped a 0% record is open" is either an invariant or it is not, and a
+documented-but-false invariant is what somebody relies on later. Not because the exposure mattered.
+
+##### ⚠⚠ The check written for this phase could not fail
+
+`syncSuspendedState` runs *before* `logDeliveryState`, so by the time a line is written a fresh
+record always exists. Every `[ypso-state]` line across the whole run reads `suspendRecord=open`,
+including the pairs bracketing a twenty-minute hole. The stated failure test — *"a single `none`
+while stopped is a failure"* — **reported zero across 13h40 containing two real gaps.**
+
+The gap is only visible by arithmetic on consecutive record start times. **This is the fourth check
+in these notes that could not fail**, after §4f's type-19 echo, §5's epoch, and §8.5's gap warning —
+and it was written the same day as the write-up of the other three. Knowing the pattern did not
+prevent it. What eventually caught it was reasoning about *ordering* — that the log line is written
+after the thing it reports on — which is the same question in a different dress: **what would this
+check look like if the thing it watches for had happened?**
+
+**Fourth variant of one bug.** Not written; written but never re-asserted; re-asserted but closed by
+an automatic cancel; renewed only after a gap. Each fix correct, each leaving another route to the
+same wrong belief, and none of them the pump.
 
 **And one thing the pattern does not require, but this pump does.** `isDelivering` is false both for
 "confirmed stopped" and for "delivery mode never identified" — right for gating the loop, where the
