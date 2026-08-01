@@ -767,14 +767,17 @@ tubing. Then press **Read history** and read the dump.
 
 ---
 
-### 5d. Paused
+### 5d. Paused ✅ **RETIRED 2026-08-01 — there is no pause on this pump**
 
-Upstream lists `PAUSED = 7`. It has never been seen on V05, and it may not exist on this firmware
-at all.
+> **Result.** The pump's menus offer **stop only**. There is no pause or hold function, so upstream's
+> `PAUSED = 7` is not reachable on V05.02.03 and byte 0 will never carry it.
+>
+> That closes the row rather than leaving it open, which is the point of asking. It also removes one
+> of the four states §8.3 listed as unmapped: it is not unmapped, it does not exist.
 
-**How:** look for a pause or hold function in the pump's menus. If there is none, **that is the
-finding** — write it down and move on, because it retires the row rather than leaving it open. If
-there is one, engage it, Refresh, and record as above.
+Upstream lists `PAUSED = 7`. Its table has already been wrong about the one value that could be
+checked — it calls `3` a fast bolus, and on this firmware `3` is a stopped pump — so an entry in it
+is not evidence that a state exists.
 
 ---
 
@@ -814,7 +817,7 @@ display recorded beside it.** Leave a row blank rather than guessing it.
 disconnected on "Queue empty" at 17:13:32 and did not reconnect until 17:17:44, so the cartridge-out
 and priming states came and went with nothing connected. The driver only reads when AAPS connects,
 and a cartridge change is comfortably longer than the gap between commands.
-| Paused (5d) | | | | | |
+| ~~Paused (5d)~~ ✅ | — | **No pause function exists.** The pump offers stop only, so `PAUSED = 7` is unreachable on V05.02.03 | — | — | — |
 | Reservoir empty (5e) | | | | | |
 
 ### Phase 5 is finished when

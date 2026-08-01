@@ -1370,7 +1370,7 @@ been looked at**:
 | during a bolus | if byte 0 changes, AAPS flips to "suspended" mid-bolus, every bolus |
 | during priming / a cartridge change | the pump is genuinely not delivering; does it say so, or does it say something new? |
 | after an alarm has stopped the pump | **the most important one.** If an alarm stops delivery and byte 0 goes to a third value, this is where AAPS should learn insulin has stopped — and it may be a better channel than the alert log |
-| paused | upstream lists a `PAUSED = 7`; unobserved on V05 |
+| ~~paused~~ | ✅ **Retired 2026-08-01. There is no pause on this pump** — its menus offer stop only, so upstream's `PAUSED = 7` is unreachable on V05.02.03. Not an unmapped state; not a state |
 | reservoir empty mid-delivery | never seen; the reservoir field is known to read `-1` after an occlusion alarm |
 
 #### ✅ It is now observable — 2026-08-01
