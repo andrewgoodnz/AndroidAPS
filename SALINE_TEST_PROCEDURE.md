@@ -13,7 +13,7 @@ order: 6 depends on 5a, and 7 should not share a session with either.
 | # | Test | Why it matters | Where |
 |---|---|---|---|
 | 5 | **The delivery-mode byte in every state** | Mapped for 2 values out of 256, and **now load-bearing**: a confirmed `STOPPED` writes a 0% suspend record into AAPS and an unidentified mode deliberately writes nothing — so an unmapped state holds the loop off *and* keeps counting basal IOB. Every status read now logs `[ypso-state]` with the raw byte and payload | **Phase 5**, `PORTING_NOTES` §8.3 |
-| 6 | **The 0% suspend record** | New behaviour, untested: stopping the pump on its own buttons should raise an urgent notification and open a `PUMP_SUSPEND` temporary basal so basal IOB stops accruing; restarting must close it; and it must survive an hour of polling | **Phase 6**, `PORTING_NOTES` §8.6 |
+| 6 | **The 0% suspend record** | ✅ 6a, 6c, 6d and **6f** passed 2026-08-01, plus half of 6e. **Only 6b is left** — the hour of re-assertion, which needs an idle pump and no attention | **Phase 6**, `PORTING_NOTES` §8.6 |
 | 7 | **Switch history sync on, with someone watching** | ⚠ Built but never enabled. The first sync must import **nothing** — it only records where to start. If treatments appear, the baseline is wrong and that is phantom IOB | **Phase 7**, `PORTING_NOTES` §8.5 |
 | 1 | ~~Decide the alarm poll interval~~ | **Withdrawn.** An occlusion took 27 min to reach AAPS, and that is simply how AAPS drives pumps — of every driver, only Insight holds a persistent connection. The pump alarms locally and loudly. See §8.7 | — |
 | 2b | **Change the phone's timezone** | New behaviour, untested: the driver should queue a clock sync and the pump's clock should follow. Previously nothing corrected it | `PORTING_NOTES` §8.6 |
@@ -919,12 +919,38 @@ alongside the TBR or instead of it, what Treatments shows, and then what restart
 behind. Write down what you see rather than what should happen; this row exists to be observed, not
 confirmed.
 
-### 6f. A TBR cancel must not close the suspend record
+### 6f. A TBR cancel must not close the suspend record ✅ **PASSED 2026-08-01**
 
-**Added 2026-08-01 after this failed on hardware**, and it is the check for the fix. With the pump
-stopped and a suspend record open, a temporary-basal cancel closed the record — AAPS believed basal
-had resumed on a stopped pump for 52 seconds, until the next poll re-opened it. On idle polling that
-window is a full poll interval.
+> **Result.** Verified on pump 10074292 immediately after the fix was installed.
+>
+> ```
+> 17:58:01  recorded a 0% basal, new=true        suspendRecord=open since 5:58 pm
+> 17:58:23  cancelTempBasal: confirmed=true
+>           TBR cancel: the open record is this driver's own 0% suspend record … left alone
+> 17:59:54  suspendRecord=open since 5:58 pm     ← same record, 2 min and one cancel later
+> 18:00:50  Pump is delivering again … closed the 0% suspend record, new=true
+> ```
+>
+> Six readings, all `open since 5:58 pm` — the timestamp never moved. Before the fix the same
+> sequence produced 5:11 → 5:12 inside 90 seconds. The synthetic-id warning is gone too: the cancel
+> read a real entry, `seq=160593 type=10`, instead of hunting a millisecond clock reading.
+>
+> **And the opposite direction still works**, which is what says the fix discriminates rather than
+> just refusing: a real 50% TBR for 15 min was set (`seq=160650 v1=50 v2=15`) and cancelled, and
+> its record **closed** — `Recorded TBR stop under endPumpId=160650`, under the pump's own sequence,
+> with no "left alone" line.
+>
+> **⚠ The bug was worse than the write-up above says.** The cancel at 17:58:23 was **not issued by
+> the tester** — they stopped the pump and pressed Refresh, and AAPS issued `cancelTempBasal` on its
+> own 22 seconds later, exactly as it had the day before. AAPS tidies up the temporary basal
+> whenever it sees the pump suspended. So this was never a cancel-path edge case reachable only by
+> going out of your way: **it fired automatically on every pump stop**, and left AAPS counting basal
+> IOB on a stopped pump until the next poll — up to twenty minutes, unattended, with nobody
+> pressing anything.
+
+**Originally added after this failed on hardware**, and it remains the check for the fix. With the
+pump stopped and a suspend record open, a temporary-basal cancel closed the record — AAPS believed
+basal had resumed on a stopped pump for 52 seconds, until the next poll re-opened it.
 
 ⚠ **This is the only Phase 6 step with no unit test behind it.** `:pump:ypso` has no test source set
 — the service needs Android test doubles and does not have them — so this procedure *is* the

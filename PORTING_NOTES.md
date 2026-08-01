@@ -1530,6 +1530,25 @@ doubles and does not have them — so `SALINE_TEST_PROCEDURE.md` **Phase 6f** is
 including the opposite case: a real TBR cancel must still close its record. Recording that plainly
 rather than implying coverage that does not exist.
 
+**✅ [verified] 2026-08-01, both directions.** Six readings held `open since 5:58 pm` across an
+automatic cancel and two minutes of polling, then closed on restart; and a real 50% TBR cancelled
+normally, its record closed under `endPumpId=160650` — the pump's own sequence. The fix
+discriminates rather than merely refusing.
+
+**⚠⚠ And the fault was larger than described above.** The cancel that exposed it was **not issued by
+a human**. AAPS issues `cancelTempBasal` by itself whenever it sees the pump suspended — twice
+observed, 22 seconds after a stop on one occasion and 29 on the other. So this was never an edge
+case someone had to reach for: **it fired automatically on every pump stop**, closing the suspend
+record seconds after `syncSuspendedState` opened it, and leaving AAPS to count basal IOB on a
+stopped pump until the next poll. Unattended, that is a full idle poll interval — twenty minutes —
+every single time the pump stopped, including every occlusion and every cartridge change.
+
+The three variants of this bug now read as one story. The record was **not written** at all
+(fixed §8.6); then written but **never re-asserted**, because a `StateFlow` conflates; then
+re-asserted but **closed within seconds** by an automatic cancel. Each fix was correct and each
+left a different way for the same wrong belief — *basal is being delivered* — to reach AAPS. What
+none of them was, was a pump problem.
+
 ### 8.4 Other unmapped states, in rough order of how much they could cost
 
 1. **A bolus while a temporary basal runs.** Never tried together. Both are confirmed from the event
