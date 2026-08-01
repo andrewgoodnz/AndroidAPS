@@ -1507,9 +1507,28 @@ Note also `seq=1785561083912`: the driver went looking in the *pump's* log for t
 `pumpId`, which is a synthetic timestamp and can never be there. The two identifier spaces are
 mixed.
 
-**Not fixed here** — it was found mid-session and changing delivery-adjacent code while a human is
-running hardware tests is how a test session becomes a debugging session. It wants its own change
-and its own gate.
+**✅ Fixed**, after the hardware session ended rather than during it — changing delivery-adjacent
+code while a human is running tests is how a test session becomes a debugging session.
+
+`cancelTempBasal` now recognises the suspend record before it acts, and leaves it alone. The
+pump-side cancel still runs, because asking a stopped pump to drop a temporary basal is harmless and
+there may genuinely have been one programmed; what stops is the AAPS record being closed. Only the
+pump reporting `STARTED` may close it, which `syncSuspendedState` already does.
+
+**The two branches now argue opposite cases, and that is the point.** For a real temporary basal,
+leaving the record open is the harm — AAPS assumes elevated delivery that has stopped. For the
+suspend record it is exactly inverted: open means AAPS assumes *no* basal, which is true, and
+closing it invents basal nobody is delivering. Same action, opposite sign. Telling the two apart is
+what the distinctive type and duration are for, and this is the second place that has had to.
+
+The synthetic-id hunt is gone too: the suspend record's `pumpId` is no longer passed to the log
+lookup, because a millisecond clock reading was never going to be found in a log of pump sequence
+numbers.
+
+⚠ **No unit test pins this.** `:pump:ypso` has no test source set — the service needs Android test
+doubles and does not have them — so `SALINE_TEST_PROCEDURE.md` **Phase 6f** is the regression test,
+including the opposite case: a real TBR cancel must still close its record. Recording that plainly
+rather than implying coverage that does not exist.
 
 ### 8.4 Other unmapped states, in rough order of how much they could cost
 

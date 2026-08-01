@@ -919,10 +919,43 @@ alongside the TBR or instead of it, what Treatments shows, and then what restart
 behind. Write down what you see rather than what should happen; this row exists to be observed, not
 confirmed.
 
+### 6f. A TBR cancel must not close the suspend record
+
+**Added 2026-08-01 after this failed on hardware**, and it is the check for the fix. With the pump
+stopped and a suspend record open, a temporary-basal cancel closed the record — AAPS believed basal
+had resumed on a stopped pump for 52 seconds, until the next poll re-opened it. On idle polling that
+window is a full poll interval.
+
+⚠ **This is the only Phase 6 step with no unit test behind it.** `:pump:ypso` has no test source set
+— the service needs Android test doubles and does not have them — so this procedure *is* the
+regression test. Run it after any change to `cancelTempBasal` or `syncSuspendedState`.
+
+1. **Stop the pump** on its own buttons. Refresh, and confirm `suspendRecord=open since <time>`.
+2. **Cancel the temporary basal from AAPS** — the ACT tab will offer it, because AAPS sees the 0%
+   record as a running TBR. That is the whole trap: what looks cancellable is not a TBR at all.
+3. Refresh.
+
+**Confirm:**
+
+- The log says `TBR cancel: the open record is this driver's own 0% suspend record … so it is left
+  alone`.
+- **`suspendRecord=open since <the same time as step 1>`.** The timestamp must not have moved — a
+  new time means it was closed and re-opened, which is the bug wearing a disguise.
+- No `Recorded TBR stop under endPumpId=…` line.
+- No `the entry AAPS expected (seq=…) was not in the log` line. That warning was the driver hunting
+  its own synthetic timestamp id in a log of pump sequence numbers.
+
+4. **Restart the pump.** The record must close normally, exactly as in 6c.
+
+**Then check the opposite case still works**, because the fix makes the two paths asymmetric: with
+the pump **running**, set a real 50% TBR, cancel it from AAPS, and confirm the AAPS record *does*
+close (`Recorded TBR stop under endPumpId=…`). Leaving a real TBR open is the failure in that
+direction, and it is the one §4h already cost a session to.
+
 ### Phase 6 is passed when
 
-6a–6d all confirm, with 6b showing an unbroken hour of `suspendRecord=open`, and 6e's observation
-recorded whatever it turned out to be.
+6a–6d and 6f all confirm, with 6b showing an unbroken hour of `suspendRecord=open`, and 6e's
+observation recorded whatever it turned out to be.
 
 ---
 

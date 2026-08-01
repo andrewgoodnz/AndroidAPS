@@ -928,10 +928,22 @@ class YpsoService : DaggerService() {
             errorMessage = rh.gs(R.string.ypso_tbr_cancel_failed)
         )
 
+        // ⚠ The "temporary basal" AAPS believes is running may be this driver's own suspend record,
+        // and closing that one would tell AAPS basal had resumed on a pump that is stopped.
+        // Observed on hardware 2026-08-01: with the pump halted by an occlusion, a cancel closed the
+        // suspend record and AAPS went back to counting basal IOB for 52 seconds until the next poll
+        // re-opened it. On idle polling that window is a full poll interval — see PORTING_NOTES §8.6.
+        val suspendRecord = openSuspendRecord()
+
         // The id AAPS holds for the temporary basal it believes is running. The pump rewrites one
         // entry in place rather than appending an end record, so this *is* the entry to look for
         // after the cancel — and nothing about the log's ordering can be used to find it instead.
-        val expectedSequence = pumpSync.expectedPumpState().temporaryBasal?.pumpId
+        //
+        // Not when it is the suspend record, though: that record's pumpId is a synthetic timestamp
+        // this driver invented, so looking for it in the pump's log is looking for something that
+        // was never there. The same log showed the driver hunting `seq=1785561083912` — a
+        // millisecond clock reading, in a log of pump sequence numbers.
+        val expectedSequence = if (suspendRecord == null) pumpSync.expectedPumpState().temporaryBasal?.pumpId else null
 
         return awaitResult("cancelTempBasal", failed) {
             val result = pumpManager.cancelTbrConfirmed(expectedSequence)
@@ -940,7 +952,27 @@ class YpsoService : DaggerService() {
                 "cancelTempBasal: confirmed=${result.confirmed}" + (result.errorMessage?.let { ", $it" } ?: "")
             )
 
-            if (result.confirmed) {
+            if (result.confirmed && suspendRecord != null) {
+                // The pump-side cancel still ran — asking a stopped pump to drop a temporary basal
+                // is harmless, and there may genuinely have been one programmed. What must not
+                // happen is closing the AAPS record, because the record open here is not a
+                // temporary basal at all: it is this driver saying "the pump is delivering
+                // nothing". Only the pump reporting STARTED again may close it, which
+                // syncSuspendedState does on the next poll.
+                //
+                // Note the asymmetry with the branch below, which argues that leaving a record open
+                // is the outcome that harms. That is true of a *real* temporary basal, where open
+                // means AAPS assumes elevated delivery that has stopped. It is exactly inverted
+                // here: this record open means AAPS assumes no basal, which is the truth, and
+                // closing it invents basal that is not being delivered. Same action, opposite sign,
+                // and telling the two apart is the whole reason the record carries a distinctive
+                // type and duration.
+                aapsLogger.warn(
+                    LTag.PUMP,
+                    "TBR cancel: the open record is this driver's own 0% suspend record (pump is not delivering), " +
+                        "so it is left alone — closing it would tell AAPS basal had resumed on a stopped pump"
+                )
+            } else if (result.confirmed) {
                 // Byte 10 has already confirmed the pump is not running a temporary basal, so the
                 // AAPS record must be closed whatever the log says. Leaving it open is the one
                 // outcome that actually harms: AAPS would keep assuming elevated basal delivery
