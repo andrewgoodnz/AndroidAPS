@@ -1780,17 +1780,33 @@ Two ways forward, and they point in opposite directions:
   basalAmount = 0.0` and only a total, which is all this pump offers. It needs a small SDK method to
   expose the entries, since `YpsoHistoryMapper` deliberately maps type 23 to null.
 
-### ⚠ Still open: `bolusSize = 0.1` is a pump *setting*, not a constant
+### ✅ [verified] Closed: `bolusSize = 0.1` is safe — the increment is a menu setting only
 
-`PumpType.YPSOPUMP` hard-codes a 0.1 U bolus step. But the pump has an event type for
-`5 Bolus Step Changed`, so the increment is configurable on the pump itself, and this driver cannot
-read it — no settings index for it is known.
+This section used to say that `PumpType.YPSOPUMP` hard-coding a 0.1 U step was a latent mis-dosing
+risk, because the pump has a `5 Bolus Step Changed` event and the driver could not read the
+increment. Both halves have now been settled on hardware, 2026-08-01, and **the conclusion was
+wrong**:
 
-If a user's pump is set to 0.05 or 1.0 U, AAPS rounds bolus amounts to the wrong grid. The
-confirm-from-the-log discipline would catch the consequence (delivered ≠ asked ⇒ `success=false`)
-rather than silently mis-dosing, so this fails loudly rather than dangerously — but it fails.
-**Worth one hardware test:** change the pump's bolus increment, ask for something off the new grid,
-and see what it does.
+```
+pump increment set to 2 U     (index 3 = 200, §8.8)
+AAPS asked for                0.3 U
+pump delivered                type=2 v1=30 → 0.30 U, success=true
+reservoir                     154.61 → 154.30
+```
+
+0.3 U is off the 2 U grid and off the 0.5 U grid the pump had been on all along, and it was
+delivered exactly. **The increment governs what the pump's own menu offers, not what it will accept
+over BLE**, which is consistent with the wire format carrying centi-units and with the pump logging
+partials like `v1=249` at 0.01 U resolution.
+
+So AAPS's 0.1 U grid is fine, nothing needs to read index 3 for safety, and this is closed rather
+than mitigated.
+
+**It was the pump's owner who said so first** — *"the bolus increment may be a pump manual bolus
+thing only and not an AAPS restriction"* — before the test was run, and against what this file
+asserted. Worth recording alongside §8.7: the concern here was reasoned from a capability the pump
+has (a configurable step) to a consequence nobody had checked (that it binds a commanded bolus), and
+it stood for three sessions as a ⚠ item because reasoning is cheaper than a 0.3 U bolus on saline.
 
 ### Smaller gaps, none of them safety-critical
 
@@ -1919,13 +1935,13 @@ Indices 4, 5 and 6 hold large values that look like an identifier or checksum an
 across either read. They stay unmapped; guessing at them is what made upstream's delivery-mode table
 wrong.
 
-**⚠ Whether the increment constrains a *commanded* bolus is a separate question, and open.** The
-pump logs deliveries at 0.01 U resolution — `v1=249`, `v1=295`, `v1=58` were all recorded while the
-increment was 0.5 U — so the wire protocol plainly is not limited to the step. But every one of
-those was a **partial** the pump chose, not an amount anyone asked for: every deliberate bolus in
-this project has been 0.5, 2.0, 3.0 or 5.0 U, all multiples of 0.5, so the question has never been
-put. It may well be a setting for the pump's own menu only, in which case `bolusSize = 0.1` is
-harmless and the concern below dissolves. One off-grid bolus settles it.
+**✅ And it does not constrain a commanded bolus.** With index 3 reading 200 (a 2 U menu step), AAPS
+asked for **0.3 U** and the pump delivered `v1=30` → 0.30 U, `success=true`. Off the 2 U grid, off
+the 0.5 U grid it had been on all along, delivered exactly. The increment is a setting for the
+pump's own menu; the BLE command is unconstrained by it, which is consistent with the wire format
+carrying centi-units. `bolusSize = 0.1` is therefore safe and §8.6's item is closed, not mitigated.
+
+So index 3 is **mapped but not load-bearing**: worth knowing, and nothing needs to read it.
 
 ---
 
