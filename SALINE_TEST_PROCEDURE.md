@@ -5,14 +5,17 @@ which records what the pump has actually been observed to do.
 
 ## ⏳ Everything still to run — read this first
 
-As of 2026-07-31, **all four phases have passed on hardware.** What is left:
+As of 2026-08-01, **all four delivery phases have passed on hardware.** What is left is written up
+in full as **Phases 5, 6 and 7** at the bottom of this file — mapping the pump states nobody has
+looked at, watching the suspend record behave, and switching history sync on. Run them in that
+order: 6 depends on 5a, and 7 should not share a session with either.
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
-| 0 | **Switch history sync on, with someone watching** | ⚠ Built but never enabled. The first sync after enabling should import **nothing** — it only records where to start. If treatments appear, the baseline is wrong and that is phantom IOB. Then bolus **on the pump** and confirm it arrives in AAPS once, at the right amount, and is not duplicated on the next poll | `PORTING_NOTES` §8.5 |
+| 5 | **The delivery-mode byte in every state** | Mapped for 2 values out of 256, and **now load-bearing**: a confirmed `STOPPED` writes a 0% suspend record into AAPS and an unidentified mode deliberately writes nothing — so an unmapped state holds the loop off *and* keeps counting basal IOB. Every status read now logs `[ypso-state]` with the raw byte and payload | **Phase 5**, `PORTING_NOTES` §8.3 |
+| 6 | **The 0% suspend record** | New behaviour, untested: stopping the pump on its own buttons should raise an urgent notification and open a `PUMP_SUSPEND` temporary basal so basal IOB stops accruing; restarting must close it; and it must survive an hour of polling | **Phase 6**, `PORTING_NOTES` §8.6 |
+| 7 | **Switch history sync on, with someone watching** | ⚠ Built but never enabled. The first sync must import **nothing** — it only records where to start. If treatments appear, the baseline is wrong and that is phantom IOB | **Phase 7**, `PORTING_NOTES` §8.5 |
 | 1 | ~~Decide the alarm poll interval~~ | **Withdrawn.** An occlusion took 27 min to reach AAPS, and that is simply how AAPS drives pumps — of every driver, only Insight holds a persistent connection. The pump alarms locally and loudly. See §8.7 | — |
-| 2 | **The delivery-mode byte in every state** | Mapped for 2 values out of 256. **Now load-bearing:** a confirmed `STOPPED` writes a 0% suspend record into AAPS, and an unidentified mode deliberately writes nothing. Read byte 0 during a bolus, during priming, and after an alarm stops the pump | `PORTING_NOTES` §8.3, §8.6 |
-| 2a | **Stop the pump from its own buttons** | New behaviour, untested: AAPS should raise an urgent "not delivering" notification and open a 0% `PUMP_SUSPEND` temporary basal so basal IOB stops accruing. Restart it and the record must close | `PORTING_NOTES` §8.6 |
 | 2b | **Change the phone's timezone** | New behaviour, untested: the driver should queue a clock sync and the pump's clock should follow. Previously nothing corrected it | `PORTING_NOTES` §8.6 |
 | 2c | **Change the pump's bolus increment** | AAPS hard-codes 0.1 U and cannot read the pump's setting. Ask for something off the new grid and see whether it is refused or silently rounded | `PORTING_NOTES` §8.6 |
 | 2d | **Press Read history and read the setting probe** | New: indices 2–13 have never been read by anything. Look for the **bolus increment** among them — AAPS hard-codes 0.1 U and cannot currently read what the pump is set to. Pure read, nothing written | `PORTING_NOTES` §8.8 |
@@ -308,27 +311,26 @@ and the AAPS treatment record.
 
 ---
 
-## Outstanding test — the alarm notification ⏳
+## The alarm notification ✅ **PASSED 2026-07-31**
 
-**Deferred, not passed.** The alert-count path is proven (`readHistoryCount(…fcbec83b7bc5): 144`
-runs on every status read), but the branch that raises the notification has never fired, because
-the occlusion that motivated it was already inside the count before the baseline was taken. It
-cannot fire retroactively.
+> **Result.** An occlusion forced on saline was logged as `seq=160532 type=105`, the count moved
+> 144 → 145, and the whole chain ran on the next status poll — urgent AAPS notification **with
+> sound**. The `replay = 0` `SharedFlow` worry recorded here was unfounded; the service's collector
+> was subscribed in time. Details in `PORTING_NOTES` §8.2.
+>
+> ⚠ **It took 27 minutes**, because AAPS had no reason to talk to the pump in between. That is the
+> real limit and it is not a defect — see §8.7.
 
-**To run it:** with the pump running on saline, **pull the cartridge** — that should raise alert
-**103 No cartridge**, which is in the urgent set. Then press **Refresh** and expect:
+**Two things this test settled about how to run it again:**
 
-```
-Pump alert log grew from <N> to <N+1> — reading the 1 newest
-PUMP ALERT: Alert: No Cartridge (type 103, seq …)
-```
+- **Pulling the cartridge raises nothing**, and correctly so: a cartridge change through the pump's
+  menu stops the pump first, so there is no unexpected condition to report. An earlier version of
+  this section said to use it, and it cannot work.
+- **Use an occlusion** — clamp or kink the line while the pump delivers. `105 Occlusion` is in the
+  urgent set and this pump raises it reliably.
 
-plus an urgent AAPS notification **with sound**.
-
-**If it does not fire, suspect the `SharedFlow`.** `_newAlerts` has `replay = 0`, so an emission
-with no subscriber attached is silently dropped — the service's collector must be subscribed before
-`checkForNewAlerts` runs. A dropped occlusion notification is exactly the failure this feature
-exists to prevent, so it needs to be seen working before insulin.
+Phase 5b reuses the same occlusion to answer a different question: what the *delivery-mode byte*
+reads once the alarm has stopped the pump.
 
 ---
 
@@ -524,7 +526,437 @@ All 24 slots read back exactly, including a zero slot, and the original profile 
 
 ## After all four phases
 
-Still not insulin. What remains is in `PORTING_NOTES` §8: an open-loop soak on saline, deciding
-how `sincePosition` filters history entries already seen, and turning
-`YpsoSyncHistoryToAaps` on — which is its own gate, because getting it wrong corrupts IOB
-silently and persistently rather than visibly.
+Still not insulin. What remains is Phases 5–7 below: mapping the pump states nobody has looked at,
+watching the suspend record behave, and turning `YpsoSyncHistoryToAaps` on — which is its own gate,
+because getting it wrong corrupts IOB silently and persistently rather than visibly.
+
+---
+
+# Phase 5 — mapping the delivery-mode byte ⏳
+
+**Nothing is written and no new refusal is removed.** This phase only puts the pump into states
+nobody has looked at and writes down what it says. It is the last thing standing between here and
+an insulin trial, and it is cheap: the whole cost is putting the pump in a state and reading a
+number.
+
+## Why this one matters more than it sounds
+
+Byte 0 of the system status is identified for **two values out of 256** — `3` = Stopped and
+`10` = Running — both checked against the pump's own display (`PORTING_NOTES` §8.3). Everything
+else is `UNKNOWN`, and `UNKNOWN` is not neutral. It has three consequences at once:
+
+| | What an unmapped byte 0 does today |
+|---|---|
+| The loop | `isSuspended()` is true, so AAPS **will not act**. Conservative and correct |
+| The 0% suspend record | **Not written.** `UNKNOWN` deliberately writes nothing (§8.6) |
+| Basal IOB | Therefore **keeps accruing**, whether or not the pump is delivering |
+
+Read those two rows together, because they point in opposite directions and both are deliberate.
+If the pump enters an unmapped state *while stopped* — which is exactly what an alarm does — AAPS
+holds the loop off **and** goes on counting basal insulin that is not being delivered. Neither
+half is wrong on its own; the combination is only resolved by identifying the byte.
+
+So `5b` below is the important one, and it is worth doing first if you only do one.
+
+## Reading the instrument
+
+Every status read now logs one line. There are two forms and they share the string `ypso-state`:
+
+```
+[ypso-state] byte0=10 name='Running' mode=STARTED delivering=true suspendRecord=none rate=1.2U/h tbr=none reservoir=51.3 raw=[0A 2B 16 00 00 02 78 00 00 00 64 00 00 00 00 00 00 00]
+[ypso-sdk] [ypso-state] probe=during-bolus byte0=? name='?' rate=?U/h tbr=100% raw=[...]
+```
+
+The first is one per status read, under logcat tag **`PUMP`**. The second fires **once per bolus**,
+on the first poll that confirms the pump is delivering, under tag `PUMPBTCOMM`. Grep for
+`ypso-state` and you get both.
+
+```
+adb connect 192.168.1.39:5555          # the tablet's USB drops; get on Wi-Fi first
+adb logcat -v time | grep --line-buffered ypso-state | tee phase5.log
+```
+
+Start the capture **before** you touch the pump, and leave it running for the whole phase. The
+same lines are in `AndroidAPS.log` on the tablet if the capture dies, but a live terminal is the
+point: several of these states are ones where you are holding the pump and cannot look at a phone.
+
+**Byte 0 is also the first byte of `raw=[…]`.** They should always agree; if they ever do not,
+stop, because the decode has drifted from the bytes and nothing else in this phase means anything.
+
+**If no line appears at all:** check the `PUMP` log tag is enabled in AAPS (Preferences →
+Maintenance → log settings). It is on by default.
+
+**Forcing a read.** AAPS polls about every 20 minutes when idle (§8.2). Press **Refresh** on the
+YPSO tab to force one. The one state where that does not work is during a bolus — the command
+queue is blocked behind the delivery call for its whole duration, which is why the driver takes
+that reading itself.
+
+## What to record, for every state
+
+Six things, every time. Five of them are the pump's and one is AAPS's, and the point is to compare
+them without trusting the decode in between:
+
+1. **`byte0=`** — the raw number.
+2. **`raw=[…]`** — the whole payload. Copy it in full. The unread fields are the ones that matter
+   in a state nobody has seen: they say what else moved when byte 0 did.
+3. **What the pump's own display says**, in the pump's words. This is the authority. A byte value
+   is only ever mapped against a display, never against upstream's table.
+4. **`suspendRecord=`** — whether AAPS opened a 0% basal in response.
+5. **Whether the pump's alert log grew** — the count is in the log around the same lines.
+6. **The time**, so the line can be found again in the full log.
+
+**Nothing gets mapped on inference.** Upstream's table lists `PAUSED = 7` and `PRIMING = 6`; it
+also lists `3` as `BOLUS_FAST`, and on this firmware `3` is a stopped pump. That table has been
+wrong on the one value it could be checked against, so it is not evidence for the others.
+
+---
+
+### 5a. During a bolus
+
+**The question:** does byte 0 change while the pump delivers a bolus? If it does, and the new
+value is unmapped, then AAPS reports the pump suspended *during every bolus* — and §8.6 warns that
+if the driver treated unknown as stopped it would open a suspend record on every bolus too.
+
+**How:**
+
+1. Cartridge on saline, off-body, cannula to air, as always.
+2. Pump **running** (not stopped) — confirm `byte0=10` on a Refresh first.
+3. Give a **3 U** bolus from AAPS. Large enough to still be delivering when the driver takes its
+   reading, which happens on the first 500 ms poll that sees `DELIVERING`.
+4. Watch the pump's display while it runs and note what it says.
+
+**Expect** exactly one `probe=during-bolus` line per bolus.
+
+**What it would mean:**
+
+| Reading | Meaning | What follows |
+|---|---|---|
+| `byte0=10` | A bolus is not a distinct delivery mode on this firmware | Nothing to change. §8.6's worst case is closed, and this is the good outcome |
+| A third value | The pump distinguishes bolus delivery | It can be added to the *delivering* set — but only on this observation, and only with the display's own word for it recorded next to it |
+| No probe line at all | The bolus finished before the first poll saw `DELIVERING` | Repeat with 5 U. If it still does not appear, say so — the probe is on the wrong path |
+
+⚠ **The reading is logged and deliberately not acted on.** It does not feed the status, so it
+cannot open a suspend record, and it cannot change what AAPS believes mid-bolus. That is the whole
+reason it is a separate call. Do not "helpfully" widen the delivering set from this reading alone
+without the pump's display agreeing.
+
+**Also record:** whether `suspendRecord=` is still `none` on the first status read *after* the
+bolus. That is the check for the failure §8.6 predicted.
+
+---
+
+### 5b. After an alarm has stopped the pump — **the important one**
+
+**The question:** when an alarm stops delivery, does byte 0 say so? If it reads `3`, the driver
+already knows the pump is stopped through a channel far better than the alert log — immediate,
+not dependent on a count, and it opens the suspend record automatically. If it is a third value,
+then **an alarm-stopped pump goes on contributing basal IOB in AAPS indefinitely**, and only the
+alert notification tells anyone.
+
+**How:** use an **occlusion**, which this pump raises reliably (§8.2) and which genuinely stops it.
+Removing the cartridge does *not* raise an alarm — the pump treats a menu-driven cartridge change
+as a deliberate procedure and there is nothing unexpected to report.
+
+1. Pump running on saline, delivering.
+2. Start a bolus large enough to give you time — **5 U** — and **clamp or kink the line** while it
+   runs.
+3. Wait for the pump to alarm and stop. Note the alarm's exact wording on the pump.
+4. **Do not silence it yet.** Press **Refresh** on the YPSO tab and record the line.
+5. Silence/acknowledge the alarm on the pump, but leave the pump stopped. Refresh, record again.
+6. Restart the pump on its own buttons. Refresh, record again.
+
+Three readings, because the pump may distinguish *alarming*, *stopped after an alarm*, and
+*running* — and if it does, step 4's value is the one worth having.
+
+**Also record:**
+
+- The **reservoir** field. §4 notes the pump reported raw `-1` after an occlusion alarm, which the
+  driver now shows as `reservoir=unknown` rather than as an almost-empty cartridge. Confirm that is
+  what the line says, not `reservoir=-0.01`.
+- Whether the alert notification fired, and how long after the alarm. The measured worst case is
+  one idle poll interval — 27 minutes has been seen (§8.2).
+- Whether `suspendRecord=` opened.
+
+**What it would mean:**
+
+| Reading at step 4 or 5 | What follows |
+|---|---|
+| `byte0=3` | The best outcome. The suspend record opens by itself, basal IOB stops accruing, and §8.2's alert-log channel is a backup rather than the only signal |
+| A third value | Map it as **not delivering**, against the display. Until that is done, an alarm-stopped pump silently over-counts basal IOB — record this prominently, because it changes what §8.6 is allowed to claim |
+
+---
+
+### 5c. During priming and a cartridge change
+
+**The question:** the pump moves fluid while priming, but none of it is therapy. Does byte 0
+distinguish that from delivering basal?
+
+**How:** run a normal cartridge change through the pump's own menu, on saline, and Refresh at each
+step you can reach:
+
+1. Pump stopped for the change (the pump does this itself). Record.
+2. **Cartridge removed.** Record — especially the reservoir field, which should read
+   `reservoir=unknown` rather than a number.
+3. **During priming**, while fluid is visibly moving. Record.
+4. After the change completes and the pump is running again. Record.
+
+**What it would mean:** a value seen only while priming belongs in the **not delivering** set —
+priming is not therapy, and AAPS should not count it as basal. Note that mapping it that way means
+a suspend record will open during every cartridge change, which is correct: basal is genuinely not
+being given. Record whether that is what you see once the mapping exists.
+
+---
+
+### 5d. Paused
+
+Upstream lists `PAUSED = 7`. It has never been seen on V05, and it may not exist on this firmware
+at all.
+
+**How:** look for a pause or hold function in the pump's menus. If there is none, **that is the
+finding** — write it down and move on, because it retires the row rather than leaving it open. If
+there is one, engage it, Refresh, and record as above.
+
+---
+
+### 5e. Reservoir empty mid-delivery
+
+**The question:** what byte 0 reads when the cartridge runs dry while delivering, and whether it
+differs from an occlusion stop.
+
+**How:** the practical version is to start the phase with a nearly empty saline cartridge rather
+than to drain a full one. Put in a small amount, run a bolus larger than what is left, and let it
+run out.
+
+**Record** byte 0 at the moment it stops, the reservoir field, the pump's own message, whether the
+alert log grew, and whether `suspendRecord=` opened. Note that a **low** reservoir is not a pump
+alert at all (§4g) — the mylife controller computes that on the phone — so an alert here, if one
+appears, is specifically the empty condition.
+
+---
+
+### Phase 5 results
+
+Fill this in from the log. **One row per observation, and only from a reading with the pump's own
+display recorded beside it.** Leave a row blank rather than guessing it.
+
+| State | `byte0` | Pump display said | `suspendRecord` | Alert log grew? | Raw payload |
+|---|---|---|---|---|---|
+| Running, idle | 10 | "Running" | none | no | `0A …` (already mapped) |
+| Stopped from the buttons | 3 | "Stopped" | | | `03 …` (already mapped) |
+| During a bolus (5a) | | | | | |
+| Alarming, not yet acknowledged (5b) | | | | | |
+| Stopped after an alarm (5b) | | | | | |
+| Cartridge removed (5c) | | | | | |
+| Priming (5c) | | | | | |
+| Paused (5d) | | | | | |
+| Reservoir empty (5e) | | | | | |
+
+### Phase 5 is finished when
+
+Every row above is either filled in or struck out as unreachable on this firmware, and each filled
+row names what the **pump's display** said. `PORTING_NOTES` §8.3 is then updated from this table
+and from nothing else.
+
+---
+
+# Phase 6 — the suspend record ⏳
+
+**Depends on Phase 5a.** Run 5a first: 6d cannot be interpreted without knowing what byte 0 does
+during a bolus.
+
+## What is being proven
+
+A stopped pump delivers no basal, and AAPS's IOB accounting does not consult `isSuspended()` —
+basal insulin on board is computed from the profile and whatever temporary basals are on record
+(`PORTING_NOTES` §8.6). So every driver that can detect a stopped pump holds a **0% temporary
+basal typed `PUMP_SUSPEND`** open for as long as the pump is stopped. This one now does too, and
+none of it has been watched on hardware.
+
+The record expires after **60 minutes** on purpose, so that one orphaned by a crash does not tell
+AAPS basal was off for days. That makes re-assertion load-bearing: if nothing re-opens it, a pump
+stopped for longer than an hour goes back to accruing phantom basal IOB.
+
+### 6a. Stop the pump on its own buttons
+
+1. Pump running on saline. Confirm `byte0=10` and `suspendRecord=none`.
+2. **Stop the pump using its own buttons.**
+3. Press **Refresh** on the YPSO tab.
+
+**Confirm all four:**
+
+- The log line reads `mode=STOPPED` and `suspendRecord=open since <time>`.
+- `Pump is not delivering (mode 'Stopped'); recorded a 0% basal …` appears.
+- An **urgent AAPS notification** says the pump is not delivering.
+- AAPS's own records show it: Treatments → Temp Basals has a **0% / 0.00 U/h** entry starting now.
+  Look at AAPS, not only at the pump — §4h's TBR cancel passed every pump-side check and AAPS still
+  disagreed, and the UI is what caught it.
+
+### 6b. It is re-asserted across polls
+
+This is the check that the `StateFlow` conflation fix was for: a stopped pump reports identical
+bytes poll after poll, and the collector that writes this record used to fire only when the value
+*changed*.
+
+1. Leave the pump stopped, AAPS running, for **just over an hour**. Idle polling is roughly every
+   20 minutes, so expect three or four `[ypso-state]` lines.
+2. Press Refresh a few times during the hour rather than waiting passively — each one is a poll.
+
+**Confirm:**
+
+- Every `[ypso-state]` line through the whole hour says `suspendRecord=open`. **Not one says
+  `none`.**
+- Around the 60-minute mark a **second** record opens — the first expired and was replaced. In
+  Treatments you should see two consecutive 0% entries, not a gap between them.
+- Basal IOB does not start climbing again at any point.
+
+A single `suspendRecord=none` line while the pump is stopped is a **failure**, and it is the exact
+shape of the bug this fix was for.
+
+### 6c. Restart the pump
+
+1. Restart the pump on its own buttons.
+2. Refresh.
+
+**Confirm:** `Pump is delivering again (mode 'Running'); closed the 0% suspend record`, the line
+reads `suspendRecord=none`, the notification clears, and the 0% entry in Treatments has **ended**
+rather than still running.
+
+### 6d. A bolus must not open one
+
+Depends on 5a. With the pump running normally, give a **2 U** bolus from AAPS and watch every
+`[ypso-state]` line from before it until two polls after.
+
+**Confirm:** `suspendRecord=none` throughout. If one opens, the delivery-mode byte changed during
+the bolus and something is treating an unmapped value as stopped — stop and report it, because it
+would mean a spurious suspend record on every bolus, and an app killed mid-bolus would leave one
+open for its full hour.
+
+### 6e. A real temporary basal is not mistaken for one
+
+The record is recognised as this driver's own by **type and duration together**. A real TBR has a
+different type; the 60-minute duration is the second half of the signature. This checks that a
+genuine TBR is never closed by accident.
+
+1. Pump running. Set a **50% TBR for 30 minutes** from AAPS and confirm it is running (byte 10, and
+   the ACT tab offering to cancel it).
+2. Refresh twice. **Confirm** every line says `suspendRecord=none` and the TBR is untouched — the
+   driver must not mistake a real TBR for its own record, and must not close it.
+3. Let it run or cancel it normally. Confirm the cancel behaves as Phase 3 says.
+
+**Then the interaction with the least analysis behind it**, which is worth watching precisely
+because nobody has reasoned it through: with a **real 50% TBR running**, stop the pump on its own
+buttons and Refresh. Record what happens to both records — whether the suspend record opens
+alongside the TBR or instead of it, what Treatments shows, and then what restarting the pump leaves
+behind. Write down what you see rather than what should happen; this row exists to be observed, not
+confirmed.
+
+### Phase 6 is passed when
+
+6a–6d all confirm, with 6b showing an unbroken hour of `suspendRecord=open`, and 6e's observation
+recorded whatever it turned out to be.
+
+---
+
+# Phase 7 — the history-sync gate ⏳
+
+**This is the switch that turns pump history into insulin on board.** Getting it wrong corrupts IOB
+silently and persistently rather than visibly, which is why it has been built and left off for
+three sessions (`PORTING_NOTES` §8.5). Do it with someone watching and nothing else running.
+
+**Before starting:** run Phases 5 and 6. Do not enable this on a session where anything else is
+being changed.
+
+### 7a. First enable takes a baseline and imports nothing
+
+⚠ **The moment a baseline bug would surface as phantom IOB.** If the watermark is missing, the
+driver must record where to start and import *nothing* — otherwise the pump's recent history becomes
+treatments carrying IOB, including boluses from before AAPS was installed.
+
+1. Note AAPS's current **IOB** and the number of entries in Treatments. Screenshot both.
+2. Confirm the watermark is unset: this is the first enable, and `ypso_last_synced_sequence`
+   defaults to `-1`. If this driver has ever had the preference on, it is **not** unset and 7a
+   cannot be run without clearing it.
+3. Turn on **YpsoSyncHistoryToAaps** in the YpsoPump preferences.
+4. Press **Refresh**.
+
+**Confirm:**
+
+```
+History sync: no watermark yet, so taking sequence <N> as the baseline and importing nothing.
+```
+
+- **No new treatments.** IOB unchanged. If anything appears, turn the preference straight back off
+  and record what appeared — that is the failure this step exists to catch.
+- `<N>` should be close to the newest sequence in a **Read history** dump taken just before.
+
+### 7b. A bolus given on the pump's own menu reaches AAPS
+
+The gap this whole feature exists for: until now a manual bolus was invisible to the loop, so IOB
+was under-stated and AAPS would dose on top of insulin already delivered — the stacking direction.
+
+1. Give a **1.5 U** bolus **from the pump's own menu**, on saline. Note the time to the minute.
+2. Press **Refresh**.
+
+**Confirm:**
+
+- `History sync: importing BolusDelivered seq=<S>` and `imported 1 event(s) above <watermark>`.
+- Treatments shows **one** bolus of **1.5 U**, at the right time — within seconds, not hours. A
+  bolus off by twelve hours is a real failure mode here (§5), and the clock correction (§8.6) is
+  what defends against it.
+- IOB moves by roughly 1.5 U.
+- Press Refresh again. It must still be **one** bolus, not two.
+
+### 7c. A bolus from AAPS is not duplicated when the sync re-reads it
+
+The skip list that used to protect this was **removed** (§8.5): the sync upserts on `pumpId`, and
+the pump's sequence is the `pumpId` both at delivery time and at sync time, so the same bolus
+resolves to one record by identity rather than by exclusion.
+
+1. Give a **1.0 U** bolus **from AAPS**. Confirm it appears in Treatments as usual.
+2. Note its timestamp to the second.
+3. Press **Refresh** so the sync re-reads it. Then Refresh once more.
+
+**Confirm:**
+
+- **One** 1.0 U treatment, not two, after both refreshes.
+- The amount is unchanged.
+- The timestamp may **move slightly**, from the phone's time to the pump's, and that is expected —
+  it is the one field the dropped skip list was defending. **Record how far it moved.** More than
+  ten seconds means the clock correction is not doing its job, since the driver now resyncs the
+  pump's clock whenever drift exceeds 10 s.
+
+### 7d. The 24-entry burst from a profile write
+
+One basal profile write appends **24 entries** (§4i). The read window is 50, so it should fit —
+but this is the closest thing to an overflow the driver can produce on demand.
+
+1. Write a basal profile from AAPS (Phase 4's procedure, and put the original back afterwards).
+2. Press **Refresh**.
+
+**Confirm:**
+
+- No `entr(ies) above <watermark> were never read and are lost` line.
+- The watermark advances past all 24.
+- No treatments appear from them — basal profile entries map to nothing, deliberately.
+- Note the **time the sync takes**. It is roughly 195 ms per entry, so a 50-entry window is about
+  10 seconds on every connection. Fine now; far too slow for a loop issuing SMBs every five
+  minutes, and this is the measurement that says how close that is (§8.5).
+
+**On the gap warning:** it was inert until this session — measured across the union of the event and
+alert logs, where the alert log always reaches back years, so it answered zero for every possible
+input. It is now measured per log. That means 7d is the first time it has ever been able to fire,
+so a quiet run here is worth something it was not worth before.
+
+### 7e. Leave it running and look again
+
+Leave the preference on with the pump idle for **an hour or two**, then check Treatments for
+anything that appeared without a cause. Phantom IOB is the failure mode, and it is quiet.
+
+### Phase 7 is passed when
+
+7a imports nothing, 7b's manual bolus arrives exactly once at the right amount and time, 7c stays
+at one record with the timestamp moving less than ten seconds, 7d is quiet, and 7e finds nothing
+unexplained.
+
+**If any of them fails, turn `YpsoSyncHistoryToAaps` back off** before doing anything else. It is a
+preference precisely so that it can be switched off in one action.
