@@ -705,6 +705,51 @@ priming is not therapy, and AAPS should not count it as basal. Note that mapping
 a suspend record will open during every cartridge change, which is correct: basal is genuinely not
 being given. Record whether that is what you see once the mapping exists.
 
+#### 5c-ii. …and while you are in there, find out whether type 25 exists
+
+**A second question the same cartridge change answers**, and it decides whether AAPS's **site-change
+timer (CAGE) will ever restart by itself.**
+
+Three of the four consumable timers are driven from pump events, and only one of them has been seen
+on this pump:
+
+| Pump event | → therapy event | → AAPS timer | Ever seen in a dump? |
+|---|---|---|---|
+| `16 Rewind Finished` | Insulin Change | **IAGE** | ✅ yes, at a real cartridge change |
+| `25 Cannula Priming Finished` | Site Change | **CAGE** | ❌ **never** |
+| `24 Battery Removed` | Battery Change | **BAGE** | ⚠ three exist, all from 2026-03-29, matching nothing anyone did |
+| `4 Priming Finished`, over 9 U | Tube Change | *(none — no AAPS timer consumes it)* | ✅ yes, four of them, 0.03–2.00 U |
+
+⚠ **Type 25 has never appeared.** The mapping to a site change comes from mylife Lotus's convention,
+not from anything this pump has been observed to log. The one cartridge change captured in full
+produced a rewind, four primes and a mode change — **and no type 25.** Either this firmware does not
+log cannula priming separately, or that session never primed a cannula.
+
+That matters because the failure is **silent**: with history sync on, CAGE would simply never
+restart, and nothing would say why. A timer that quietly does not restart is worse than one that
+obviously does not exist.
+
+**How:** do the cartridge change properly, **including priming the cannula** — not just filling the
+tubing. Then press **Read history** and read the dump.
+
+**Record, from the dump:**
+
+1. Every entry the change produced, in order, with `seq=`, `type=` and `v1=`.
+2. **Whether a `type=25 (Cannula Priming Finished)` appears at all.** This is the answer.
+3. The `v1` on each `type=4 (Priming Finished)` — it is the primed amount in centi-units, and only a
+   prime above **9 U** (`v1 > 900`) is treated as a tube change.
+4. Whether a `type=16 (Rewind Finished)` appears, which is the one already confirmed.
+
+**What it would mean:**
+
+| Dump shows | What follows |
+|---|---|
+| A `type=25` | The mapping is real. CAGE will restart once Phase 7 turns history sync on |
+| No `type=25`, but a large `type=4` right where the cannula prime happened | The prime is the only signal this pump gives, and the site-change mapping needs rethinking against it |
+| No `type=25` and nothing else new | ⚠ **CAGE cannot restart automatically on this pump.** Record it plainly — it is a documented limitation, not a bug to hunt |
+
+**This is a read.** Nothing is written, and it can be done on the same cartridge change as 5c above.
+
 ---
 
 ### 5d. Paused
@@ -748,6 +793,7 @@ display recorded beside it.** Leave a row blank rather than guessing it.
 | Stopped after an alarm (5b) | | | | | |
 | Cartridge removed (5c) | | | | | |
 | Priming (5c) | | | | | |
+| **Does `type=25` exist? (5c-ii)** | *(not a byte-0 row — record yes/no and the entries the cartridge change produced)* | | | | |
 | Paused (5d) | | | | | |
 | Reservoir empty (5e) | | | | | |
 
@@ -756,6 +802,9 @@ display recorded beside it.** Leave a row blank rather than guessing it.
 Every row above is either filled in or struck out as unreachable on this firmware, and each filled
 row names what the **pump's display** said. `PORTING_NOTES` §8.3 is then updated from this table
 and from nothing else.
+
+5c-ii is the exception to the display rule: its answer comes from the history dump, and "no type 25
+exists" is a complete answer rather than a blank row.
 
 ---
 
