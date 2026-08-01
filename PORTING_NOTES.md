@@ -1406,8 +1406,46 @@ spurious suspend record on *every bolus* — the exact harm §8.6 predicted, cau
 looking for it. The question has to be answerable without the answer being acted on.
 
 `SALINE_TEST_PROCEDURE.md` **Phase 5** is the procedure, with a results table that stays blank until
-each reading has the pump's own display recorded beside it. **Nothing below has been observed yet**
-— the instrument exists, the observations do not.
+each reading has the pump's own display recorded beside it.
+
+#### ✅ [verified] A bolus is **not** a distinct delivery mode — 2026-08-01
+
+The first row of the table above is answered, and it is the good outcome. A 3 U bolus on saline,
+read at the first 500 ms poll that confirmed `DELIVERING`:
+
+```
+before   raw=[0A 62 42 …]  reservoir 169.94
+during   raw=[0A 56 42 …]  reservoir 169.82   ← probe=during-bolus, byte0=10 'Running'
+after    raw=[0A 36 41 …]  reservoir 166.94
+```
+
+**Byte 0 read `10` throughout — the same value as an idle running pump.** So AAPS does not flip to
+"suspended" mid-bolus, nothing needs adding to the delivering set, and §8.6's predicted failure —
+a spurious `PUMP_SUSPEND` record on every bolus — cannot happen for this reason. `suspendRecord=`
+stayed `none` on every line including the polls after.
+
+**The reservoir is what makes this an observation rather than a lucky read.** The probe's own
+payload reads 169.82 U, 0.12 U below the pre-bolus figure, so the pump was genuinely mid-delivery
+when it answered — not idle before the bolus started or after it finished, which is exactly the
+trap §4f fell into when it read a cleared bolus status as "nothing was delivered". The total fell
+by 169.94 − 166.94 = **3.00 U exactly**.
+
+Two things confirmed in passing:
+
+- **§4f's settled-entry rule works.** The wait ran to `Idle`, *then* read the log, and got
+  `seq=160590 type=2(Bolus Immediate) v1=300` — the settled entry, never the type-19 echo.
+- **§8.6's recognition rule works, against the hardest case.** A real 0% TBR for 120 minutes was
+  running (pulled from Nightscout, see below) and every line still read `suspendRecord=none`. A 0%
+  TBR is the closest possible thing to the driver's own suspend record, and it was correctly not
+  claimed as one — the duration and type together are doing their job.
+
+⚠ **The test rig has a third controller nobody had listed: Nightscout.** The 0% TBR above was not
+set by hand; it arrived from the *other* pump's CamAPS loop through a shared Nightscout and was
+enacted on the research pump. The same link uploads outward — an NS upload fired 10 ms after the
+saline bolus settled. **A saline bolus that reaches a real therapy record is insulin the record says
+was given and the patient never received**, with nothing in it to say otherwise. §8.4 item 11 and the
+test-rig notes warn about the Lotus study phone; this is the same hazard by a path neither
+mentioned.
 
 ### 8.4 Other unmapped states, in rough order of how much they could cost
 

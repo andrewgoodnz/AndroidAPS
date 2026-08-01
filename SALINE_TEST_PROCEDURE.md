@@ -46,6 +46,21 @@ profile unprompted the moment it wakes; it did so twice on 2026-07-31 and both t
 unexplained pump-side change. Turn it off before any basal test, or a read-back diff cannot
 distinguish a driver bug from the other app.
 
+**⚠⚠ And a third one, found 2026-08-01: Nightscout.** The tablet's NSClient shares a Nightscout
+instance with the *other* pump's live CamAPS loop, and it runs **both ways**:
+
+- **Inbound**, it enacts real therapy decisions on the research pump. A 0% TBR for 120 minutes
+  appeared mid-session with nobody having touched anything; it was CamAPS's zero temp, arriving
+  through NS. Anything unexplained the pump does should be checked against NS before it is
+  investigated as a driver fault.
+- **Outbound**, and this is the one that matters: **an upload fired 10 ms after a 3 U saline bolus
+  settled.** A saline bolus that reaches a real therapy record is insulin the record says was given
+  and the patient never received, with nothing in it to say otherwise — and every bolus, TBR and
+  profile write in Phases 5–7 will do the same.
+
+**Before any phase below: turn NS uploading off on the test tablet, or point it at a separate
+instance.** Read-only inbound is survivable if you remember it is there. Outbound is not.
+
 ---
 
 **All four phases have passed on hardware.** Each was written up before its code, so that its
@@ -788,7 +803,7 @@ display recorded beside it.** Leave a row blank rather than guessing it.
 |---|---|---|---|---|---|
 | Running, idle | 10 | "Running" | none | no | `0A …` (already mapped) |
 | Stopped from the buttons | 3 | "Stopped" | | | `03 …` (already mapped) |
-| During a bolus (5a) | | | | | |
+| **During a bolus (5a)** ✅ | **10** | "Bolus complete" (after) — reservoir 169.82 mid-delivery proves the read was taken while delivering | none | no | `0A 56 42 00 00 02 05 00 00 00 64 00 00 00 00 00 00 00` |
 | Alarming, not yet acknowledged (5b) | | | | | |
 | Stopped after an alarm (5b) | | | | | |
 | Cartridge removed (5c) | | | | | |
