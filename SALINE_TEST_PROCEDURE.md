@@ -804,11 +804,16 @@ display recorded beside it.** Leave a row blank rather than guessing it.
 | Running, idle | 10 | "Running" | none | no | `0A …` (already mapped) |
 | Stopped from the buttons | 3 | "Stopped" | | | `03 …` (already mapped) |
 | **During a bolus (5a)** ✅ | **10** | "Bolus complete" (after) — reservoir 169.82 mid-delivery proves the read was taken while delivering | none | no | `0A 56 42 00 00 02 05 00 00 00 64 00 00 00 00 00 00 00` |
-| Alarming, not yet acknowledged (5b) | | | | | |
-| Stopped after an alarm (5b) | | | | | |
-| Cartridge removed (5c) | | | | | |
-| Priming (5c) | | | | | |
-| **Does `type=25` exist? (5c-ii)** | *(not a byte-0 row — record yes/no and the entries the cartridge change produced)* | | | | |
+| **Alarming, not yet acknowledged (5b)** ✅ | **3** | "Occlusion - check infusion set" | **open** | yes, 146 → 147, `105 Occlusion` | `03 0F 40 00 00 02 00 00 00 00 64 00 00 00 00 00 00 00` |
+| **Stopped after an alarm (5b)** ✅ | **3** | same alarm acknowledged, pump stopped | open | — | `03 0F 40 00 00 02 00 00 00 00 64 00 00 00 00 00 00 00` — **byte-identical to the line above** |
+| Cartridge removed (5c) | | | | | ⏳ missed: AAPS was disconnected for the whole change |
+| Priming (5c) | | | | | ⏳ missed, same reason |
+| **Does `type=25` exist? (5c-ii)** ✅ | **No — none, in 50 events + 50 alerts back to Feb 2025.** The 2026-08-01 cartridge change produced `seq=160635 type=16(Rewind Finished)` and `seq=160637 type=4(Priming Finished) v1=1000` (10.00 U) and nothing else. **CAGE cannot restart automatically on this pump** | | | | |
+
+⚠ **Press Refresh *during* each step of 5c.** The 2026-08-01 attempt lost both readings: AAPS
+disconnected on "Queue empty" at 17:13:32 and did not reconnect until 17:17:44, so the cartridge-out
+and priming states came and went with nothing connected. The driver only reads when AAPS connects,
+and a cartridge change is comfortably longer than the gap between commands.
 | Paused (5d) | | | | | |
 | Reservoir empty (5e) | | | | | |
 

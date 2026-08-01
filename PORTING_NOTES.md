@@ -1441,11 +1441,75 @@ Two things confirmed in passing:
 
 ⚠ **The test rig has a third controller nobody had listed: Nightscout.** The 0% TBR above was not
 set by hand; it arrived from the *other* pump's CamAPS loop through a shared Nightscout and was
-enacted on the research pump. The same link uploads outward — an NS upload fired 10 ms after the
-saline bolus settled. **A saline bolus that reaches a real therapy record is insulin the record says
-was given and the patient never received**, with nothing in it to say otherwise. §8.4 item 11 and the
-test-rig notes warn about the Lotus study phone; this is the same hazard by a path neither
-mentioned.
+enacted on the research pump. **Inbound only** — uploading is off on the test tablet, and an earlier
+revision of this paragraph claimed the saline bolus had been uploaded outward. It had not. That
+claim came from reading `● RUN Starting upload NEW_DATA` as evidence of an upload; it is the
+NSClient *worker starting*, it runs on a schedule regardless of whether uploading is permitted, and
+it says nothing about whether anything left the device. **A log line that names an action is not
+evidence the action had an effect** — the same mistake as §4f's type-19 echo, made against AAPS's
+own logs this time. The inbound hazard stands: anything unexplained the pump does should be checked
+against NS before it is investigated as a driver fault.
+
+#### ✅ [verified] An alarm stop reads `3`, and alarming is indistinguishable from stopped — 2026-08-01
+
+The most important row of the table, and the good outcome. An occlusion forced during a 5 U bolus on
+saline, pump display reading **"Occlusion - check infusion set"**:
+
+```
+byte0=3 name='Stopped' mode=STOPPED delivering=false suspendRecord=open
+raw=[03 0F 40 00 00 02 00 00 00 00 64 00 00 00 00 00 00 00]
+```
+
+**No third value.** An alarm stop reports the same `3` as a stop from the pump's own buttons, so the
+driver already learns of it through the delivery-mode byte and acts without needing to be taught
+anything new. The whole §8.6 chain ran unprompted: the suspend record opened, `delivering=false`,
+basal IOB stopped accruing. The alert fired too — count 146 → 147, `105 Occlusion`, urgent — **26
+seconds** after the occlusion, because AAPS was already connected for the bolus. §8.2's 27-minute
+worst case is the *idle* path, not this one.
+
+**⚠ But alarming and acknowledged-stopped are byte-identical.** Four readings while the alarm sounded
+and four after acknowledging it produced the same 18 bytes, to the byte. So **byte 0 says the pump
+has stopped and never says why** — §8.2's alert log is not made moot by this, it is the complement
+to it. The driver reads both, which is what it needs to do.
+
+`3` now covers three situations with no way to tell them apart from this characteristic: stopped by
+button, stopped by alarm, and alarming.
+
+**The bolus reported honestly under a real occlusion.** Asked 5.0 U, `type=2 v1=295` → 2.95 U,
+`success=false`, settled to 2.95 U under `pumpId=160594`; the reservoir fell 166.94 → 163.99, which
+is 2.95 U exactly. §4f's partial-amount path had only ever been exercised by a user cancel.
+
+**And one thing nobody asked:** the alarm stop **cleared the running temporary basal on the pump**.
+Byte 10 went from `0%, 112 min left` to `100`. Worth knowing before trusting a TBR to survive an
+alarm.
+
+#### ⚠ Found by watching: `cancelTempBasal` closes the suspend record
+
+Not a state-mapping finding — it fell out of the same log. With the pump stopped and a suspend
+record open, AAPS issued a temporary-basal cancel:
+
+```
+17:11:23  suspendRecord=open since 5:11 pm
+17:11:52  cancelTempBasal: confirmed=true
+          TBR is stopped but the entry AAPS expected (seq=1785561083912) was not in the log
+          Recorded TBR stop under endPumpId=… , new=true          ← ended the suspend record
+17:12:44  Pump is not delivering … new=true                        ← a second record opened
+```
+
+`syncStopTemporaryBasalWithPumpId` stops whatever temporary basal is currently running and does not
+check whether that is the `PUMP_SUSPEND` record. So for 52 seconds **AAPS believed basal had resumed
+while the pump was stopped.** The next poll re-asserted it, which is only quick because someone was
+pressing Refresh; on idle polling the window is **up to 20 minutes of phantom basal IOB**. That is
+the failure §8.6 exists to prevent, reached by a third door — after the `StateFlow` conflation and
+the original missing record.
+
+Note also `seq=1785561083912`: the driver went looking in the *pump's* log for the suspend record's
+`pumpId`, which is a synthetic timestamp and can never be there. The two identifier spaces are
+mixed.
+
+**Not fixed here** — it was found mid-session and changing delivery-adjacent code while a human is
+running hardware tests is how a test session becomes a debugging session. It wants its own change
+and its own gate.
 
 ### 8.4 Other unmapped states, in rough order of how much they could cost
 
@@ -1821,6 +1885,25 @@ SDK. Twelve settings sit there unmapped, and the bolus increment is plausibly on
 caps behind event types 33 and 34. `probeUnknownSettings()` now reads them and logs the values, hung
 off the **Read history** button because it is a diagnostic and twelve extra round trips (~2.5 s)
 should not land on every status poll. It is a read; nothing is written.
+
+#### First reading of indices 2–13 — 2026-08-01
+
+```
+index 2 = 10        index 6 = 17505     index 10 = 3
+index 3 = 50        index 7 = 188       index 11 = 0
+index 4 = 26247     index 8 = 2         index 12 = 1
+index 5 = 32107     index 9 = 0         index 13 = 1
+```
+
+**Index 2 = 10 is a strong candidate for the bolus increment**: 10 centi-units is 0.10 U, exactly the
+step `PumpType.YPSOPUMP` hard-codes and the pump is currently set to. That is a hypothesis, not a
+mapping — a value agreeing with an assumption is the weakest kind of evidence there is, and this
+file has already been caught by one (§4f's type-19 echo said what the driver expected too).
+
+**It is settled by one cheap test:** change the increment on the pump, press **Read history**, and
+see whether index 2 becomes 5 or 100. Until then nothing should read this index. Indices 4, 5 and 6
+hold large values that look like an identifier or checksum; guessing at them is what made upstream's
+delivery-mode table wrong, so they stay unmapped.
 
 ---
 
