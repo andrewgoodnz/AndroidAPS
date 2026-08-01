@@ -126,6 +126,34 @@ class SystemStatusDataTest {
     }
 
     /**
+     * The raw hex is the evidence channel for every byte-0 value still unmapped (§8.3), so it has
+     * to survive the decode intact — uppercase, space-separated, every byte including the ones this
+     * class does not interpret. A state nobody has seen is exactly the state whose *unread* fields
+     * matter, and this is the only place they are kept.
+     */
+    @Test
+    fun `the whole payload is carried through as hex`() {
+        assertThat(SystemStatusData.parse(runningUnderTbr)!!.rawHex)
+            .isEqualTo("0A 2B 16 00 00 02 9C 00 00 00 82 00 00 00 F0 00 00 00")
+    }
+
+    /**
+     * An unmapped mode still decodes everything else and still names itself unmistakably. The name
+     * carries the number because "Unverified mode 7" in a log is a mapping observation, whereas
+     * "Unknown" is not.
+     */
+    @Test
+    fun `an unmapped delivery mode keeps its raw value and says so`() {
+        val paused = runningUnderTbr.copyOf().also { it[0] = 7 }
+
+        val status = SystemStatusData.parse(paused)!!
+
+        assertThat(status.deliveryMode).isEqualTo(7)
+        assertThat(status.deliveryModeName).isEqualTo("Unverified mode 7")
+        assertThat(status.rawHex).startsWith("07 2B 16")
+    }
+
+    /**
      * §4d. Rates must be divided in `Double`. Widening `120 / 100f` gives 1.2000000476837158, and
      * `isThisProfileSet` compares the pump against the AAPS profile — so a Float divide would
      * report a mismatch on a correct profile for ever.

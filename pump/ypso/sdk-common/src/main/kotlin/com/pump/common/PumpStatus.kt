@@ -23,6 +23,11 @@ package com.pump.common
  * @property deliveryModeName Nombre legible del modo de administración actual.
  * @property lastBolusUnits Cantidad de insulina del último bolo administrado, en unidades.
  * @property lastBolusTime Marca de tiempo (epoch en milisegundos) del último bolo administrado.
+ * @property deliveryModeRaw the undecoded byte the pump reported, or -1 before any status read.
+ *   [operatingMode] and [deliveryModeName] are both *interpretations* of it, and only two of its
+ *   256 values have ever been identified against the pump's display — so the raw number is what a
+ *   human mapping a new state needs, and it must not be reachable only through the decode.
+ * @property rawStatusHex the whole system-status payload as hex, for the same reason.
  */
 data class PumpStatus(
     val serialNumber: String = "",
@@ -40,7 +45,9 @@ data class PumpStatus(
     val warningCode: Int = 0,
     val deliveryModeName: String = "",
     val lastBolusUnits: Double = 0.0,
-    val lastBolusTime: Long = 0
+    val lastBolusTime: Long = 0,
+    val deliveryModeRaw: Int = -1,
+    val rawStatusHex: String = ""
 ) {
     /**
      * Devuelve true si hay una tasa basal temporal (TBR) activa con tiempo restante mayor que cero.

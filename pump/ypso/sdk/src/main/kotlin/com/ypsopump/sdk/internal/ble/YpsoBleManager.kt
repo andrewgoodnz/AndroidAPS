@@ -824,7 +824,9 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
 
             val status = SystemStatusData.parse(data.copyOfRange(0, data.size - 2))
             if (status == null) {
-                log("getSystemStatus: payload too short (${data.size - 2}B)")
+                // With the hex, because a short payload is itself an unmapped state: if some pump
+                // state answers this characteristic differently, this line is the only record of it.
+                log("getSystemStatus: payload too short (${data.size - 2}B) = ${data.toHexString()}")
                 callback(null)
                 return@readExtended
             }

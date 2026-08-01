@@ -237,6 +237,20 @@ class YpsoPumpManagerImpl private constructor(
     private val _pumpStatus = MutableStateFlow<PumpStatus?>(null)
     override val pumpStatus: StateFlow<PumpStatus?> = _pumpStatus
 
+    /**
+     * Emits once per system-status read, **including reads that changed nothing**.
+     *
+     * ⚠ [pumpStatus] cannot serve that purpose and quietly did not: a `StateFlow` conflates equal
+     * values, and a stopped pump answers byte-for-byte identically poll after poll — same mode,
+     * same reservoir, no rate, no TBR. So a collector on `pumpStatus` sees the stop *once* and then
+     * nothing, for as long as the pump stays stopped. Anything that has to happen on every poll —
+     * re-asserting the suspend record before it expires, logging what the pump is reporting — has
+     * to hang off a flow that emits on every read instead. `replay = 0` because a status read from
+     * ten minutes ago is not news.
+     */
+    private val _statusReads = MutableSharedFlow<PumpStatus>(replay = 0, extraBufferCapacity = 8)
+    val statusReads: SharedFlow<PumpStatus> = _statusReads
+
     private val _pumpEvents = MutableSharedFlow<PumpEvent>(replay = 10)
     override val pumpEvents: SharedFlow<PumpEvent> = _pumpEvents
 
@@ -925,6 +939,12 @@ class YpsoPumpManagerImpl private constructor(
                 }
 
                 if (status.fastStatus == BolusNotificationStatus.DELIVERING) {
+                    // The one moment the delivery-mode byte can be observed mid-bolus. Nothing else
+                    // in AAPS reads the system status while a bolus runs — the command queue is
+                    // blocked behind this call — so without this read the question in §8.3 cannot be
+                    // answered at all. Once per bolus, on the first poll that confirms delivery, and
+                    // the result is logged and nothing else: see probeDeliveryMode.
+                    if (!sawDelivering) probeDeliveryMode("during-bolus")
                     sawDelivering = true
                     progressSeen = maxOf(progressSeen, status.fastInjected.toDouble())
                     _bolusProgress.value = BolusProgress(progressSeen, amount, finished = false, cancelled = cancelRequested)
@@ -1513,7 +1533,32 @@ class YpsoPumpManagerImpl private constructor(
                     percentage = status.tbrPercent,
                     remainingMinutes = status.tbrRemainingMinutes
                 )
-            } else null
+            } else null,
+            deliveryModeRaw = status.deliveryMode,
+            rawStatusHex = status.rawHex
+        )
+        _statusReads.tryEmit(_pumpStatus.value!!)
+    }
+
+    /**
+     * Reads the system status **for the log only**, changing nothing.
+     *
+     * ⚠ It deliberately does not call [updateStatusFromSystem], and that is the whole point of it
+     * existing separately. This is called from inside a bolus, and feeding a mid-bolus reading into
+     * the status would run `syncSuspendedState` on it — so if byte 0 turns out to be a third value
+     * while delivering, the act of looking would open a spurious `PUMP_SUSPEND` record on every
+     * bolus. The question "what does the pump report during a bolus?" has to be answerable without
+     * the answer being acted on, because the answer is exactly what nobody knows yet (§8.3).
+     */
+    private suspend fun probeDeliveryMode(what: String) {
+        val status = suspendGetSystemStatus()
+        if (status == null) {
+            log("[ypso-state] probe=$what — the system status could not be read")
+            return
+        }
+        log(
+            "[ypso-state] probe=$what byte0=${status.deliveryMode} name='${status.deliveryModeName}' " +
+                "rate=${status.currentBasalRate}U/h tbr=${status.tbrPercent}% raw=[${status.rawHex}]"
         )
     }
 

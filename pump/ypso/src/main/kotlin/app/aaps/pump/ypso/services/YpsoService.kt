@@ -40,6 +40,7 @@ import com.pump.common.BasalProfile
 import com.pump.common.OperatingMode
 import com.pump.common.PumpConnectionState
 import com.pump.common.PumpHistoryEvent
+import com.pump.common.PumpStatus
 import com.ypsopump.sdk.YpsoEventTypes
 import com.ypsopump.sdk.YpsoPumpManagerImpl
 import dagger.android.DaggerService
@@ -155,8 +156,16 @@ class YpsoService : DaggerService() {
                 ypsoPump.deliveryModeName = status.deliveryModeName
                 ypsoPump.isDelivering = status.isDelivering
                 ypsoPump.activeTbr = status.activeTbr
-                syncSuspendedState(status.operatingMode, status.deliveryModeName)
                 rxBus.send(EventYpsoPumpDataChanged())
+            }
+        }
+
+        // Every status read, including the ones that changed nothing — see
+        // YpsoPumpManagerImpl.statusReads for why the StateFlow above cannot carry this.
+        scope.launch {
+            pumpManager.statusReads.collect { status ->
+                syncSuspendedState(status.operatingMode, status.deliveryModeName)
+                logDeliveryState(status)
             }
         }
 
@@ -287,7 +296,14 @@ class YpsoService : DaggerService() {
      *
      * [SUSPEND_TBR_MINUTES] is distinctive on purpose: it is how the record is recognised as this
      * driver's own on resume, so a real temporary basal is never mistaken for one and closed by
-     * accident. It is re-asserted on every poll while the pump stays stopped.
+     * accident. It also expires, so a record orphaned by a crash does not outlive the outage by
+     * days — which is why it has to be re-asserted, and why it is driven from
+     * `YpsoPumpManagerImpl.statusReads` rather than from the status `StateFlow`. A stopped pump
+     * reports the same bytes poll after poll, a `StateFlow` conflates equal values, and this ran
+     * once on the transition and then never again: the record would have expired after
+     * [SUSPEND_TBR_MINUTES] with the pump still stopped, and AAPS would have gone back to counting
+     * basal IOB that was not being delivered. That is the same bug this method exists to fix,
+     * arriving by a different door.
      *
      * ⚠ **An unrecognised delivery mode does not open this record**, and that distinction is the
      * whole reason [PumpStatus.operatingMode] is a three-valued thing rather than `isDelivering`.
@@ -300,10 +316,7 @@ class YpsoService : DaggerService() {
      * that persists, and this driver does not make claims from bytes it has not identified.
      */
     private fun syncSuspendedState(mode: OperatingMode, modeName: String) {
-        val open = pumpSync.expectedPumpState().temporaryBasal
-        val ourSuspendRecord = open?.takeIf {
-            it.type == PumpSync.TemporaryBasalType.PUMP_SUSPEND && it.duration == T.mins(SUSPEND_TBR_MINUTES).msecs()
-        }
+        val ourSuspendRecord = openSuspendRecord()
 
         if (mode == OperatingMode.UNKNOWN) {
             aapsLogger.warn(
@@ -347,6 +360,52 @@ class YpsoService : DaggerService() {
             pumpSerial = pumpSerial()
         )
         aapsLogger.info(LTag.PUMP, "Pump is delivering again (mode '$modeName'); closed the 0% suspend record, new=$stopped")
+    }
+
+    /**
+     * The 0% temporary basal this driver opens for a stopped pump, if one is currently open.
+     *
+     * Recognised by type **and** duration together. A real temporary basal AAPS asked for has a
+     * different type; [SUSPEND_TBR_MINUTES] is the second half of the signature, so that a
+     * `PUMP_SUSPEND` record left by anything else is not closed as though it were ours.
+     */
+    private fun openSuspendRecord(): PumpSync.PumpState.TemporaryBasal? =
+        pumpSync.expectedPumpState().temporaryBasal?.takeIf {
+            it.type == PumpSync.TemporaryBasalType.PUMP_SUSPEND && it.duration == T.mins(SUSPEND_TBR_MINUTES).msecs()
+        }
+
+    /**
+     * One greppable line per status read, carrying the bytes rather than the driver's reading of
+     * them.
+     *
+     * **Written to be read from `logcat` by someone standing at the pump**, in a state where they
+     * cannot look at the phone's screen — an alarm sounding, a cartridge half-changed, a bolus
+     * running. That is why the raw byte and the whole payload are here and not only on the YPSO
+     * tab: 254 of byte 0's 256 values have never been identified (§8.3), and the states that would
+     * identify them are exactly the states in which the phone is not the thing being watched.
+     *
+     * Everything on the line is either a raw pump byte or a fact about AAPS's own records, so the
+     * two can be compared without trusting the decode that sits between them:
+     *
+     * ```
+     * [ypso-state] byte0=10 name='Running' mode=STARTED delivering=true suspendRecord=none raw=[0A 2B ...]
+     * ```
+     *
+     * `suspendRecord` is sampled **after** [syncSuspendedState] has run, so the line says what this
+     * poll settled on rather than what it inherited — which is the question when the thing being
+     * checked is whether a bolus opens one.
+     */
+    private fun logDeliveryState(status: PumpStatus) {
+        val suspendRecord = openSuspendRecord()
+        aapsLogger.info(
+            LTag.PUMP,
+            "[ypso-state] byte0=${status.deliveryModeRaw} name='${status.deliveryModeName}' mode=${status.operatingMode} " +
+                "delivering=${status.isDelivering} " +
+                "suspendRecord=${suspendRecord?.let { "open since ${dateUtil.dateAndTimeString(it.timestamp)}" } ?: "none"} " +
+                "rate=${status.activeBasalRate}U/h tbr=${status.activeTbr?.let { "${it.percentage}% ${it.remainingMinutes}min" } ?: "none"} " +
+                "reservoir=${status.reservoirUnits ?: "unknown"} " +
+                "raw=[${status.rawStatusHex}]"
+        )
     }
 
     /**

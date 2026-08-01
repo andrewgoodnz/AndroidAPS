@@ -30,6 +30,11 @@ import java.util.Calendar
  *   already scaled by [tbrPercent] — 1.20 U/h under a 130% TBR reads as 1.56 U/h.
  * @property tbrPercent 100 when no temporary basal is running.
  * @property tbrRemainingMinutes counts down once a minute; 0 when no TBR is running.
+ * @property rawHex the payload this was decoded from, as hex. Kept for the same reason
+ *   [PumpClockData.dateWire] is: 254 of the 256 values byte 0 can take have never been identified
+ *   (§8.3), and a decode is only as good as the bytes under it. When the pump enters a state
+ *   nobody has seen, the *whole* payload is the evidence — the fields around byte 0 say what else
+ *   changed with it — and it has to be readable from a log by someone who cannot touch the phone.
  */
 internal data class SystemStatusData(
     val deliveryMode: Int,
@@ -40,7 +45,8 @@ internal data class SystemStatusData(
     val currentBasalRate: Double,
     val tbrPercent: Int,
     val tbrRemainingMinutes: Int,
-    val reservoirKnown: Boolean = true
+    val reservoirKnown: Boolean = true,
+    val rawHex: String = ""
 ) {
 
     val isTbrRunning: Boolean get() = tbrPercent != TBR_PERCENT_NONE
@@ -96,7 +102,8 @@ internal data class SystemStatusData(
                 batteryBars = bars,
                 currentBasalRate = le32(6) / 100.0,
                 tbrPercent = le32(10),
-                tbrRemainingMinutes = le32(14)
+                tbrRemainingMinutes = le32(14),
+                rawHex = payload.joinToString(" ") { "%02X".format(it) }
             )
         }
     }
