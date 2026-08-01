@@ -243,7 +243,13 @@ class YpsoService : DaggerService() {
     private suspend fun correctClockIfDrifted() {
         val skewMs = ypsoPump.pumpClockSkewMs ?: return
         val skewSeconds = abs(skewMs) / 1000L
-        if (skewSeconds < CLOCK_RESYNC_THRESHOLD_SECONDS) return
+        if (skewSeconds < CLOCK_RESYNC_THRESHOLD_SECONDS) {
+            // Logged even when there is nothing to do, because this is the number that says whether a
+            // history-synced timestamp landing seconds away from the phone's is clock drift or just
+            // how long the bolus took to deliver (Phase 7c). Without it the two are indistinguishable.
+            aapsLogger.debug(LTag.PUMP, "Pump clock is ${skewMs}ms from the phone's, under the ${CLOCK_RESYNC_THRESHOLD_SECONDS}s threshold; left alone")
+            return
+        }
 
         if (skewSeconds > CLOCK_IMPLAUSIBLE_HOURS * 3600L) {
             aapsLogger.error(
