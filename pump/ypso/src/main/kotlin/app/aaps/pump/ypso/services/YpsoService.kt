@@ -603,25 +603,60 @@ class YpsoService : DaggerService() {
     private suspend fun syncHistoryToAaps() {
         if (!preferences.get(YpsoBooleanKey.YpsoSyncHistoryToAaps)) return
 
+        // Timing is not diagnostics here, it is the measurement Phase 7d exists to take: a 50-entry
+        // window at ~195 ms an entry is ~10 s on every connection, which is survivable for a manual
+        // driver and not survivable for a loop issuing an SMB every five minutes (§8.5). Read and
+        // import are timed apart because only the read scales with the window.
+        val startedAt = System.currentTimeMillis()
+        val watermarkBefore = preferences.get(YpsoLongNonKey.LastSyncedSequence)
+        aapsLogger.info(
+            LTag.PUMP,
+            "History sync: starting, watermark=" + if (watermarkBefore < 0) "unset ($watermarkBefore)" else "$watermarkBefore"
+        )
+
         val result = pumpManager.readHistoryWithDump(preferences.get(YpsoIntKey.YpsoHistoryReadCount))
+        val readMillis = System.currentTimeMillis() - startedAt
+        val entriesRead = result.eventSequences.size + result.alertSequences.size
+        aapsLogger.info(
+            LTag.PUMP,
+            "History sync: read ${result.eventSequences.size} event(s) seq " +
+                "${result.eventSequences.minOrNull()}..${result.eventSequences.maxOrNull()}, " +
+                "${result.alertSequences.size} alert(s) seq " +
+                "${result.alertSequences.minOrNull()}..${result.alertSequences.maxOrNull()}, " +
+                "${result.events.size} of them mapped — in $readMillis ms" +
+                if (entriesRead > 0) " (${readMillis / entriesRead} ms/entry)" else ""
+        )
+
         val newest = result.newestSequence
         if (newest == null) {
             aapsLogger.warn(LTag.PUMP, "History sync: the pump returned no entries at all; nothing to do")
             return
         }
 
-        val watermark = preferences.get(YpsoLongNonKey.LastSyncedSequence)
+        val watermark = watermarkBefore
         if (watermark < 0) {
             preferences.put(YpsoLongNonKey.LastSyncedSequence, newest)
             aapsLogger.info(
                 LTag.PUMP,
                 "History sync: no watermark yet, so taking sequence $newest as the baseline and importing nothing. " +
-                    "Anything the pump does from here is synced."
+                    "Anything the pump does from here is synced. " +
+                    "(${result.events.size} mapped event(s) were read and none was imported; " +
+                    "watermark unset -> $newest, in ${System.currentTimeMillis() - startedAt} ms)"
             )
             return
         }
 
+        // The gap check is logged with its inputs whatever the answer, because this arithmetic was
+        // wrong for three sessions and read as "no gap" the whole time (§8.5). An absent warning is
+        // only evidence if the numbers it was computed from are on the record next to it.
         val missed = result.missedSince(watermark)
+        aapsLogger.info(
+            LTag.PUMP,
+            "History sync: gap check against watermark $watermark — " +
+                "events newest=${result.eventSequences.maxOrNull()} oldest=${result.eventSequences.minOrNull()}, " +
+                "alerts newest=${result.alertSequences.maxOrNull()} oldest=${result.alertSequences.minOrNull()} " +
+                "-> $missed missed"
+        )
         if (missed > 0) {
             // A log line rather than a notification: this has never happened, and the read window is
             // 50 entries against a 24-entry worst case (a full basal profile write). If it starts
@@ -637,15 +672,36 @@ class YpsoService : DaggerService() {
 
         val fresh = result.freshEvents(watermark)
 
+        // Every mapped entry the read covered, with the decision taken on it and why. Phase 7 has to
+        // adjudicate "nothing was imported" and "one thing was imported" apart from "nothing was
+        // looked at", and only the entries that were considered and rejected tell those apart.
+        result.events
+            .filter { it.position <= watermark }
+            .sortedBy { it.position }
+            .forEach { event ->
+                aapsLogger.debug(
+                    LTag.PUMP,
+                    "History sync: skipping ${event::class.simpleName} seq=${event.position} " +
+                        "at ${dateUtil.dateAndTimeAndSecondsString(event.timestamp)} — at or below watermark $watermark"
+                )
+            }
+
+        val importedAt = System.currentTimeMillis()
         fresh.forEach { event ->
-            aapsLogger.info(LTag.PUMP, "History sync: importing ${event::class.simpleName} seq=${event.position}")
+            aapsLogger.info(
+                LTag.PUMP,
+                "History sync: importing ${event::class.simpleName} seq=${event.position} " +
+                    "at ${dateUtil.dateAndTimeAndSecondsString(event.timestamp)}"
+            )
             syncToAaps(event)
         }
 
         preferences.put(YpsoLongNonKey.LastSyncedSequence, newest)
         aapsLogger.info(
             LTag.PUMP,
-            "History sync: imported ${fresh.size} event(s) above $watermark; watermark now $newest"
+            "History sync: imported ${fresh.size} event(s) above $watermark; watermark $watermark -> $newest. " +
+                "Took ${System.currentTimeMillis() - startedAt} ms for $entriesRead entr(ies) " +
+                "(read $readMillis ms, import ${System.currentTimeMillis() - importedAt} ms)"
         )
     }
 
@@ -1114,7 +1170,11 @@ class YpsoService : DaggerService() {
             is PumpHistoryEvent.Unknown        -> syncConsumableChange(event, serial)
 
             else                               ->
-                aapsLogger.debug(LTag.PUMP, "No PumpSync mapping for ${event::class.simpleName}, skipped")
+                aapsLogger.info(
+                    LTag.PUMP,
+                    "No PumpSync mapping for ${event::class.simpleName} seq=${event.position}, skipped — " +
+                        "nothing reaches treatments from it"
+                )
         }
     }
 
@@ -1135,12 +1195,18 @@ class YpsoService : DaggerService() {
                 if (primed > YpsoEventTypes.TUBE_CHANGE_PRIME_THRESHOLD_UNITS) {
                     insertTherapyEvent(TE.Type.TUBE_CHANGE, event, serial)
                 } else {
-                    aapsLogger.debug(LTag.PUMP, "Prime of ${primed}U below tube-change threshold, not recorded")
+                    aapsLogger.info(
+                        LTag.PUMP,
+                        "Prime of ${primed}U at seq=${event.position} below tube-change threshold, not recorded"
+                    )
                 }
             }
 
             else                                    ->
-                aapsLogger.debug(LTag.PUMP, "Unmapped pump event type ${event.eventType}, skipped")
+                aapsLogger.info(
+                    LTag.PUMP,
+                    "Unmapped pump event type ${event.eventType} at seq=${event.position}, skipped"
+                )
         }
     }
 
@@ -1152,7 +1218,10 @@ class YpsoService : DaggerService() {
             TE.Type.PUMP_BATTERY_CHANGE -> preferences.get(YpsoBooleanKey.YpsoLogBatteryChange)
             else                    -> true
         }
-        if (!enabled) return
+        if (!enabled) {
+            aapsLogger.info(LTag.PUMP, "Therapy event $type at seq=${event.position} skipped — its preference is off")
+            return
+        }
         pumpSync.insertTherapyEventIfNewWithTimestamp(
             timestamp = event.timestamp,
             type = type,
