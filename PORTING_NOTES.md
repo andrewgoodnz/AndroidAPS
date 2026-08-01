@@ -1895,15 +1895,37 @@ index 4 = 26247     index 8 = 2         index 12 = 1
 index 5 = 32107     index 9 = 0         index 13 = 1
 ```
 
-**Index 2 = 10 is a strong candidate for the bolus increment**: 10 centi-units is 0.10 U, exactly the
-step `PumpType.YPSOPUMP` hard-codes and the pump is currently set to. That is a hypothesis, not a
-mapping — a value agreeing with an assumption is the weakest kind of evidence there is, and this
-file has already been caught by one (§4f's type-19 echo said what the driver expected too).
+#### ✅ [verified] Index 3 is the bolus increment, in centi-units
 
-**It is settled by one cheap test:** change the increment on the pump, press **Read history**, and
-see whether index 2 becomes 5 or 100. Until then nothing should read this index. Indices 4, 5 and 6
-hold large values that look like an identifier or checksum; guessing at them is what made upstream's
-delivery-mode table wrong, so they stay unmapped.
+The increment was changed on the pump and the probe re-run:
+
+```
+pump on 0.5 U   →  index 3 = 50      every other index unchanged
+pump on 2.0 U   →  index 3 = 200     every other index unchanged
+```
+
+Two settings, one moving value, eleven unchanged indices as the control. **This is the first
+settings index mapped on this pump beyond the three the SDK already knew.**
+
+⚠ **It was nearly mapped to the wrong index, and the near-miss is the lesson.** The first reading
+was written up here as *"index 2 = 10 is a strong candidate: 10 centi-units is 0.10 U, exactly the
+step `PumpType.YPSOPUMP` hard-codes and the pump is currently set to."* The pump was **not** set to
+0.1 U — it was on 0.5, which its owner knew and this file had assumed away. The value agreed with
+the *assumption*, and the assumption was the thing that was wrong. §4f's type-19 echo was the same
+shape: a number that says what the reader expected is the weakest evidence there is, and it reads
+identically to the strongest until something independent contradicts it.
+
+Indices 4, 5 and 6 hold large values that look like an identifier or checksum and did not move
+across either read. They stay unmapped; guessing at them is what made upstream's delivery-mode table
+wrong.
+
+**⚠ Whether the increment constrains a *commanded* bolus is a separate question, and open.** The
+pump logs deliveries at 0.01 U resolution — `v1=249`, `v1=295`, `v1=58` were all recorded while the
+increment was 0.5 U — so the wire protocol plainly is not limited to the step. But every one of
+those was a **partial** the pump chose, not an amount anyone asked for: every deliberate bolus in
+this project has been 0.5, 2.0, 3.0 or 5.0 U, all multiples of 0.5, so the question has never been
+put. It may well be a setting for the pump's own menu only, in which case `bolusSize = 0.1` is
+harmless and the concern below dissolves. One off-grid bolus settles it.
 
 ---
 
