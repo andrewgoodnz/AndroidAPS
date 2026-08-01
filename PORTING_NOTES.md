@@ -958,12 +958,18 @@ Mapping (`YpsoPumpManagerImpl.toHistoryEvent`, event IDs from `YpsoProtocolConst
 | Pump event | → |
 |---|---|
 | 2 / 3 / 18 / 26 bolus completed (immediate / delayed / combined / blind) | `BolusDelivered` |
-| 9 TBR running | `TbrStarted(pct, minutes)` |
-| 10 / 32 TBR completed / aborted | `TbrEnded` |
+| 9 / 10 / 32 TBR running / completed / aborted | `TbrStarted(pct, minutes)` — **all three**, see below |
 | 6 / 7 / 8 basal profile changed | `BasalRateChanged` |
 | 16 rewind finished | `CartridgeChanged` |
 | 4 priming, 25 cannula priming, 24 battery removed | `Unknown` carrying type + values |
 | 100–108 alerts | `Alert` |
+
+⚠ **That TBR row used to read `10 / 32 → TbrEnded`, and the mapper has not agreed with it since
+§4h.** This pump keeps **one** entry per temporary basal and rewrites it in place, so a type-10
+entry is not an end event with no start — it is the whole temporary basal, described completely:
+started at its timestamp, ran `value2` minutes at `value1` percent. Mapping it to `TbrEnded` threw
+away the percentage and the duration and handed AAPS an end for a start it had never seen, because
+a read taken after the TBR finished never sees the type-9 state at all.
 
 Therapy events (`YpsoService.syncConsumableChange`), per the Lotus-confirmed rules:
 rewind → **Insulin Change**; cannula priming → **Site Change**; battery removed → **Battery
