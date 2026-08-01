@@ -20,8 +20,9 @@ class HistoryReadResultTest {
 
     private fun result(
         events: List<PumpHistoryEvent>,
-        sequencesRead: List<Long> = events.map { it.position }
-    ) = YpsoPumpManagerImpl.HistoryReadResult(events, emptyList(), sequencesRead)
+        sequencesRead: List<Long> = events.map { it.position },
+        alertSequences: List<Long> = emptyList()
+    ) = YpsoPumpManagerImpl.HistoryReadResult(events, emptyList(), sequencesRead, alertSequences)
 
     @Test
     fun `only entries above the watermark are fresh`() {
@@ -121,5 +122,65 @@ class HistoryReadResultTest {
 
         assertThat(read.newestSequence).isNull()
         assertThat(read.missedSince(watermark = 100)).isEqualTo(0)
+    }
+
+    /**
+     * ⚠⚠ The check that could not fail, and the reason the gap is now measured per log.
+     *
+     * The two logs share one sequence counter but are read as two separate windows, and they fill at
+     * completely different rates — this pump has logged 50 events in an afternoon and 50 alerts
+     * since 2025. So the union's oldest entry is always an ancient alert, always far below any
+     * watermark, and taking the gap across the union answered **zero for every possible input**,
+     * including this one: the event window overflowed and 49 treatments are missing.
+     *
+     * `PORTING_NOTES` has now been burned three times by a confirmation that could not fail (§4f's
+     * type-19 echo, §5's epoch check). This pins the third.
+     */
+    @Test
+    fun `an overflowed event window is not hidden by an alert window reaching back years`() {
+        val read = result(
+            events = emptyList(),
+            sequencesRead = listOf(150L, 151L, 152L),
+            alertSequences = listOf(40L, 41L, 42L)
+        )
+
+        assertThat(read.missedSince(watermark = 100)).isEqualTo(49)
+    }
+
+    /**
+     * The ordinary case, and the one that must stay quiet: alerts are old news, events are
+     * contiguous, nothing is missing. An alert log that has had no new entry at all contributes no
+     * gap — otherwise every single poll would announce one.
+     */
+    @Test
+    fun `an alert log with nothing new contributes no gap`() {
+        val read = result(
+            events = emptyList(),
+            sequencesRead = listOf(101L, 102L, 103L),
+            alertSequences = listOf(40L, 41L, 42L)
+        )
+
+        assertThat(read.missedSince(watermark = 100)).isEqualTo(0)
+    }
+
+    /** A gap in the alert log is still a gap: an occlusion nobody was told about is a safety event. */
+    @Test
+    fun `an overflowed alert window is reported too`() {
+        val read = result(
+            events = emptyList(),
+            sequencesRead = listOf(101L, 102L),
+            alertSequences = listOf(120L, 121L)
+        )
+
+        assertThat(read.missedSince(watermark = 100)).isEqualTo(19)
+    }
+
+    /** The watermark still spans both logs, because the pump counts them together. */
+    @Test
+    fun `the newest sequence spans both logs`() {
+        val read = result(events = emptyList(), sequencesRead = listOf(101L), alertSequences = listOf(140L))
+
+        assertThat(read.newestSequence).isEqualTo(140L)
+        assertThat(read.sequencesRead).containsExactly(101L, 140L)
     }
 }

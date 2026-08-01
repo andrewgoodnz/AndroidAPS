@@ -601,8 +601,10 @@ class YpsoService : DaggerService() {
             // happening the log says so and the window can be raised.
             aapsLogger.error(
                 LTag.PUMP,
-                "History sync: $missed entr(ies) between $watermark and ${result.oldestSequence} were never read and are lost. " +
-                    "Read window is ${result.sequencesRead.size} entries — raise YpsoHistoryReadCount if this repeats."
+                "History sync: $missed entr(ies) above $watermark were never read and are lost. " +
+                    "Windows: ${result.eventSequences.size} event(s) back to ${result.eventSequences.minOrNull()}, " +
+                    "${result.alertSequences.size} alert(s) back to ${result.alertSequences.minOrNull()} — " +
+                    "raise YpsoHistoryReadCount if this repeats."
             )
         }
 

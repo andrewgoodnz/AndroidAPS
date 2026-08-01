@@ -651,7 +651,8 @@ class YpsoPumpManagerImpl private constructor(
         val events: List<PumpHistoryEvent>,
         val rawDump: List<String>,
         /**
-         * Every sequence number this read covered, **including entries that mapped to nothing**.
+         * Every sequence number the **event** log read covered, including entries that mapped to
+         * nothing.
          *
          * A watermark cannot be taken from [events] alone. Clock changes, daily totals and
          * unrecognised types are deliberately dropped by the mapper, so the highest *mapped* sequence
@@ -660,8 +661,23 @@ class YpsoPumpManagerImpl private constructor(
          * it is above the caller's watermark, entries were missed between the two and the caller has
          * a gap it needs to know about rather than silently step over.
          */
-        val sequencesRead: List<Long>
+        val eventSequences: List<Long>,
+        /**
+         * The same for the **alert** log, kept apart from [eventSequences] deliberately.
+         *
+         * ⚠ Merging the two made [missedSince] a check that could not fail. The two logs share one
+         * sequence counter (§5) but they are read as two separate windows of N entries each, and
+         * they fill at wildly different rates: this pump has logged 50 events in an afternoon and
+         * 50 alerts since 2025. So the union's oldest entry is always an ancient alert, always far
+         * below any watermark, and the gap arithmetic always answered zero — including in exactly
+         * the case it exists for, where a burst of events overflowed the event window. A gap has to
+         * be measured inside each window, because each window is what could overflow.
+         */
+        val alertSequences: List<Long> = emptyList()
     ) {
+
+        /** Both logs together, which is the right unit for a watermark: they share one counter. */
+        val sequencesRead: List<Long> get() = eventSequences + alertSequences
 
         val newestSequence: Long? get() = sequencesRead.maxOrNull()
         val oldestSequence: Long? get() = sequencesRead.minOrNull()
@@ -683,16 +699,31 @@ class YpsoPumpManagerImpl private constructor(
                 .sortedBy { it.position }
 
         /**
-         * How many entries existed between [watermark] and the oldest entry actually read, and were
-         * therefore never seen. Zero when the read reaches back far enough to be contiguous.
+         * How many entries existed above [watermark] and were never read, because a log filled
+         * faster than its read window. Zero when both windows reach back far enough to be
+         * contiguous with what the caller has already seen.
          *
          * A non-zero answer means treatments are missing, not that the read was merely short: the
          * pump keeps one sequence counter across both logs, so any gap in it is a gap in what AAPS
          * knows. A single basal profile write appends 24 entries, so a small read window can open one
          * quickly.
+         *
+         * Measured **per log** and reported as the worse of the two — see [alertSequences] for what
+         * measuring it across the union did instead.
          */
-        fun missedSince(watermark: Long): Long {
-            val oldest = oldestSequence ?: return 0
+        fun missedSince(watermark: Long): Long =
+            maxOf(gapAbove(watermark, eventSequences), gapAbove(watermark, alertSequences))
+
+        /**
+         * The gap one window leaves above [watermark].
+         *
+         * A window whose newest entry is at or below the watermark contributes nothing: that log has
+         * had no new entries at all, which is the ordinary case for alerts and is not a gap.
+         */
+        private fun gapAbove(watermark: Long, sequences: List<Long>): Long {
+            val newest = sequences.maxOrNull() ?: return 0
+            if (newest <= watermark) return 0
+            val oldest = sequences.min()
             return (oldest - watermark - 1).coerceAtLeast(0)
         }
     }
@@ -723,7 +754,8 @@ class YpsoPumpManagerImpl private constructor(
                 "idx=${e.index} seq=${e.sequence} ts=${e.timestamp} type=${e.entryType}(${e.entryTypeName}) " +
                     "v1=${e.value1} v2=${e.value2} v3=${e.value3}"
             },
-            sequencesRead = all.map { it.sequence }
+            eventSequences = events.map { it.sequence },
+            alertSequences = alerts.map { it.sequence }
         )
     }
 
