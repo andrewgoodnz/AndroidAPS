@@ -1,4 +1,4 @@
-﻿import org.gradle.api.JavaVersion
+import org.gradle.api.JavaVersion
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 @Suppress("ConstPropertyName")
