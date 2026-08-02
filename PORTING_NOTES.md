@@ -2,6 +2,11 @@
 
 Driver for an **unlocked plaintext research YpsoPump** on current AndroidAPS (3.4.2.4).
 
+> **New here? Read `README_YPSO.md` first.** It is the handover document — what the driver is, what
+> it has been verified to do, what it cannot do, and how to bring one up from nothing. **This** file
+> is the record of what the pump was observed doing and why the code is shaped the way it is,
+> including every wrong turn, because the wrong turns are the part that is expensive to rediscover.
+
 **Status, 2026-08-02: every phase has now run on hardware, and what is left is one performance
 decision and two things only time can answer.** The driver bonds, connects, authenticates in
 plaintext with no key exchange, reads every value it needs, and **writes** — the pump clock (§4e), a
@@ -1294,22 +1299,26 @@ pairing screen makes the user confirm the serial before bonding. **Never select 
 6. **History.** "Read history" on the YPSO tab. Compare types and timestamps against the pump's
    history screen. **[verified]** — the `idx`/`seq` question this step used to open is answered
    in §5, and index 0 is the newest entry.
-7. Leave `YpsoSyncHistoryToAaps` off until `sincePosition` filtering is decided (§8, last item).
+7. **`YpsoSyncHistoryToAaps` is on by default and should be left on.** This step used to say the
+   opposite, before Phase 7 settled it (§8.5). On a *new* pump the first enable takes a baseline and
+   imports nothing, which is what makes leaving it on safe.
 8. **The clock write** — phase 1 of `SALINE_TEST_PROCEDURE.md`. **[verified]** Also the quickest
    way to prove the write path still works after any change to the framing code.
 
 Firmware confirmed **V05.02.03**.
 
-**Two cosmetic decode faults noticed while running phase 1, neither blocking:**
+**Two cosmetic decode faults noticed while running phase 1. One is fixed, one is not:**
 
-- `ypso_serial_number` is stored with a trailing NUL — `10074292` followed by `U+0000`, which the
-  preferences XML shows as `&#0;`. `getStringValue(0)` on the device-name
-  characteristic keeps the NUL terminator. It is harmless on screen but it also feeds
-  `pumpSerial` on every `PumpSync` call, so it wants fixing **before** `YpsoSyncHistoryToAaps`
-  is switched on, or records could split on a serial mismatch.
-- Firmware displays as `0.2.2.1` where the pump says **V05.02.03**. `formatVersion` joins the
-  raw bytes as decimal, which is not this characteristic's encoding. Cosmetic, but it is the
-  field a user would quote in a bug report.
+- ✅ **Fixed.** `ypso_serial_number` was stored with a trailing NUL — `10074292` followed by
+  `U+0000`, which the preferences XML shows as `&#0;`, because `getStringValue(0)` on the
+  device-name characteristic keeps the terminator. Harmless on screen, but it also feeds
+  `pumpSerial` on **every** `PumpSync` call, so records could have split on a serial mismatch the
+  moment history sync went on. `cleanBleString()` — `trim { it.code <= 0x20 }` — now runs on the
+  way out of the SDK.
+- ⏳ **Still open, and still cosmetic.** Firmware displays as `0.2.2.1` where the pump says
+  **V05.02.03**. `formatVersion` joins the raw bytes as decimal, which is not this characteristic's
+  encoding. Nothing depends on the string, but it is the field a user would quote in a bug report,
+  so it is worth an hour when somebody has one.
 
 ---
 
@@ -2450,15 +2459,17 @@ deliberately short, and each entry is here because it cannot be anywhere else:
 | `settings.gradle` | +3 lines: `:pump:ypso`, `:pump:ypso:sdk`, `:pump:ypso:sdk-common` | Gradle has to be told the modules exist |
 | `app/build.gradle.kts` | +1 line: `implementation(project(":pump:ypso"))` | The app has to depend on the driver |
 | `app/src/main/kotlin/app/aaps/di/AppComponent.kt` | +2 lines: `YpsoModule` | Dagger's component list is upstream's file |
+| `app/src/androidTest/kotlin/app/aaps/di/TestAppComponent.kt` | +2 lines: `YpsoModule` | The same list again, for instrumented tests. Miss it and the androidTest build stops compiling |
 | `app/src/main/kotlin/app/aaps/di/PluginsListModule.kt` | +7 lines: `bindYpsoPlugin` at `@IntKey(175)` | The plugin map is upstream's file |
 | `gradle/libs.versions.toml` | +1 line: `no-nordicsemi-android-ble` | Version catalogue is central by design |
 | `.gitignore` | +1 line: `/reference` | Keeps the vendor sources and decrypted exports out of the repo. Nothing under `reference/` is tracked |
 | `PORTING_NOTES.md`, `SALINE_TEST_PROCEDURE.md`, `README_YPSO.md` | new files | New files never conflict |
 
-**Six lines of real conflict surface, in five upstream files.** All five are additive single-line
-insertions into lists, which is the cheapest possible kind of conflict to resolve — and it is worth
-knowing that `PluginsListModule` and `AppComponent` are exactly the files upstream edits when *it*
-adds a pump, so those two are the ones that will actually conflict.
+**Eight lines of real conflict surface, in six upstream files** — down from 91 changed files before
+the donor module was deleted. Every one is an additive insertion into a list, which is the cheapest
+kind of conflict there is; and `PluginsListModule`, `AppComponent` and `TestAppComponent` are exactly
+the files upstream edits when *it* adds a pump, so those three are the ones that will actually
+conflict.
 
 **Three files came off this list on 2026-08-03**, by deleting the donor module (§1):
 
