@@ -126,15 +126,16 @@ a failure mode the phone was ever the primary defence against.
 
 ### Two of byte 0's 256 delivery-mode values are identified
 
-`3 = Stopped`, `10 = Running`. Every state reachable on the hardware came back as one of the two —
-during a bolus, during an alarm, after one, and **through a whole cartridge change** — and there is
-no pause state on this pump at all. One situation has still never been read: **reservoir empty
-mid-delivery**. An unidentified value makes AAPS treat the pump as suspended, which holds the loop
-off, and deliberately writes no therapy record.
+`3 = Stopped`, `10 = Running`, and **every state reachable on this hardware has now been read** —
+during a bolus, during an alarm, after one, through a whole cartridge change, and with the cartridge
+run dry mid-bolus. There is no pause state on this pump at all. An unidentified value would make AAPS
+treat the pump as suspended, which holds the loop off, and deliberately writes no therapy record.
 
-A cartridge change is separable from an alarm stop, but by the **reservoir field** rather than by
-byte 0: it reads `FF FF FF FF` (−1) for the whole procedure, and the driver reports
-`reservoir=unknown` rather than a garbage number.
+**What separates those states is the reservoir field, not byte 0.** It reads `FF FF FF FF` (−1,
+"unknown") while the cartridge is out or being changed, and a known **`0`** when the cartridge has run
+empty — so the driver can tell "no cartridge" from "empty cartridge" even though the delivery mode is
+`3` for both. Running dry also raises a real pump alert (`104 Cartridge Empty`, urgent); a *low*
+reservoir never does.
 
 ### Smaller ones
 

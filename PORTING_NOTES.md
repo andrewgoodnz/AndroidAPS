@@ -43,10 +43,13 @@ window when nothing has moved cut a quiet poll to **~580 ms**, verified in Phase
    makes it audible instead of silent (§8.5).
 
 **Byte 0 of the system status is identified for two values out of 256, and that is the answer, not a
-gap** — every state reachable on hardware came back as one of those two. During a bolus it reads
-`10`; while alarming, after an alarm, and stopped by hand it reads `3`; and there is no pause state
-on this pump at all (§8.3). Two rows remain, both free at the next cartridge change: **cartridge out
-or priming**, and **reservoir empty**. `SALINE_TEST_PROCEDURE.md` Phase 5 holds the table.
+gap — Phase 5's table is now complete.** Every state reachable on hardware came back as one of those
+two. During a bolus it reads `10`; while alarming, after an alarm, stopped by hand, **through a whole
+cartridge change, and with the cartridge run dry** it reads `3`; and there is no pause state on this
+pump at all (§8.3). What separates those states is not byte 0 but the **reservoir field** — `-1` while
+the cartridge is out or being changed, a known `0` when it has run empty. Only "during priming with
+fluid moving" is unfilled, and it is recorded as **unreachable by this method** rather than blank:
+the reservoir reads `-1` throughout a change, so no reading can be shown to have been taken live.
 
 **Four checks in this file have now turned out to be incapable of failing** — the type-19 bolus echo
 (§4f), the epoch "verified" against wall-clock readings (§5), the gap warning measured across both
@@ -1461,7 +1464,7 @@ been looked at**:
 | ~~during priming / a cartridge change~~ | ✅ **Answered 2026-08-03. It reads `3`, and the reservoir reads `-1`.** See below |
 | after an alarm has stopped the pump | **the most important one.** If an alarm stops delivery and byte 0 goes to a third value, this is where AAPS should learn insulin has stopped — and it may be a better channel than the alert log |
 | ~~paused~~ | ✅ **Retired 2026-08-01. There is no pause on this pump** — its menus offer stop only, so upstream's `PAUSED = 7` is unreachable on V05.02.03. Not an unmapped state; not a state |
-| reservoir empty mid-delivery | never seen; the reservoir field is known to read `-1` after an occlusion alarm |
+| ~~reservoir empty mid-delivery~~ | ✅ **Answered 2026-08-03. It reads `3`, and the reservoir reads a known `0` — not `-1`.** See below |
 
 #### ✅ It is now observable — 2026-08-01
 
@@ -1539,6 +1542,43 @@ it says nothing about whether anything left the device. **A log line that names 
 evidence the action had an effect** — the same mistake as §4f's type-19 echo, made against AAPS's
 own logs this time. The inbound hazard stands: anything unexplained the pump does should be checked
 against NS before it is investigated as a driver fault.
+
+#### ✅ [verified] Running dry reads `3`, and empty is **not** the same as unknown — 2026-08-03
+
+The last unread row of the table above, reached by priming a cartridge down to 3.91 U and asking for
+a 5 U bolus on saline. The pump delivered 3.92 U, stopped, and alarmed:
+
+```
+byte0=3 name='Stopped' mode=STOPPED delivering=false suspendRecord=open reservoir=0.0
+raw=[03 00 00 00 00 02 00 00 00 00 64 00 00 00 00 00 00 00]
+
+Pump alert log grew from 147 to 148 — reading the 1 newest
+PUMP ALERT: Alert: Cartridge Empty (type 104, seq 160777)
+Pump alert 104 (Alert: Cartridge Empty), urgent=true
+```
+
+**Three results, and the second is the one nobody predicted.**
+
+**Byte 0 reads `3`.** No new value — and with this row filled, **byte 0 is now identified for every
+state this pump has been made to enter.** Two values out of 256, and that is the answer rather than
+a gap.
+
+**The reservoir reads a known `00 00 00 00`, not `FF FF FF FF`.** The pump distinguishes *"the
+cartridge is empty"* from *"there is no cartridge"*, and puts them in the same field as 0 and −1.
+`reservoirKnown` reports the first as a genuine zero and the second as unknown, which is correct in
+both cases and had never been exercised in either. So the delivery-mode byte cannot separate a
+cartridge change from a dry cartridge, and **the reservoir field can** — the third time in these notes
+the payload has carried information the decode's headline value did not.
+
+**Running dry *does* alert**, which a low reservoir does not (§4g). The distinction is now concrete:
+the mylife controller computes *low* on the phone and the pump's count never moves, but *empty* is a
+real pump alarm and reached AAPS as an urgent notification with sound.
+
+**And the partial-bolus path ran under a cause it had never seen.** Every previous partial was a user
+cancel or an occlusion. Asked 5.0 U against 3.91 U in the cartridge, the pump logged
+`seq=160776 type=2 v1=392` → 3.92 U, the driver reported `success=false` carrying the full 3.92 U,
+and the provisional 5.0 U record settled down to 3.92 U under the pump's own sequence. §0's two rules
+working in opposite directions at once, on the same bolus: recorded in full, reported as failed.
 
 #### ✅ [verified] A cartridge change reads `3`, and the reservoir reads `-1` — 2026-08-03
 

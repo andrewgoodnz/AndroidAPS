@@ -21,7 +21,7 @@ failed for any input. It is now written as **6b-RERUN**, with an instrument that
 | A | **6b-RERUN — the renewal fix** | ⚠ **Still unverified, and it is the last correctness gate before insulin.** The overnight run of 08-01→02 was on a **pre-fix build** (`fca883077c` landed 08:46 on 08-02, the pump restarted at 08:49), so it reproduced the defect and tested nothing. The procedure is now written for the fixed build and the driver has an instrument that can fail: a `[ypso-suspend] LAPSED` line, and minutes-remaining on every `[ypso-state]` line. **Do not test it by checking that every poll reads `suspendRecord=open`** — that check reported zero across a run containing two real gaps. Needs a stopped pump and **3 unattended hours** | **6b-RERUN**, §8.6 |
 | B | **Fix `insertAnnouncement`'s dedupe key** | It keys on `now()`, not `pumpId`, so it is the one sync path that is not idempotent. The watermark currently hides it. Worth fixing on its own terms rather than depending on the thing that hides it | §8.5 |
 | C | ~~**Phase 5c — cartridge out and priming**~~ | ✅ **CLOSED 2026-08-03.** Cartridge out reads `byte0=3` with the reservoir `FF FF FF FF` (−1) — the first sighting of reservoir `-1`, handled correctly. The *priming* row is recorded as **unreachable by this method**: liveness cannot be proved because the reservoir reads −1 throughout, so a mid-prime reading is byte-identical to one taken after it | **Phase 5c**, §8.3 |
-| D | **Phase 5e — reservoir empty mid-delivery** | The **last** unread delivery-mode state. Never seen. The pump does alert (`104 Cartridge Empty`), but what byte 0 reads at that moment is unknown. Needs a nearly-empty cartridge — decide the fill volume at a cartridge change, not after | **Phase 5e**, §8.3 |
+| D | ~~**Phase 5e — reservoir empty mid-delivery**~~ | ✅ **CLOSED 2026-08-03.** Reads `byte0=3` with the reservoir a **known `0`** — not the `-1` of a cartridge change, so the pump does distinguish empty from absent. Alert count 147 → 148, `104 Cartridge Empty`, urgent. **Phase 5's table is complete** | **Phase 5e**, §8.3 |
 | E | **Reconnect mid-bolus** | Pull BLE range during a 2 U bolus. The pump finishes regardless; what is untested is whether AAPS's *record* settles. A provisional record goes in before sending and `ReconnectManager` chases the link back, armed for the bolus only | §4g |
 | F | **Kill AAPS mid-bolus** | Force-stop during delivery. The provisional record must survive and keep counting — this decides whether `PumpSyncStorage` is needed | §4g |
 | G | **Change the phone's timezone** | Untested: the driver should queue a clock sync and the pump's clock should follow | §8.6 |
@@ -874,7 +874,7 @@ disconnected on "Queue empty" at 17:13:32 and did not reconnect until 17:17:44, 
 and priming states came and went with nothing connected. The driver only reads when AAPS connects,
 and a cartridge change is comfortably longer than the gap between commands.
 | ~~Paused (5d)~~ ✅ | — | **No pause function exists.** The pump offers stop only, so `PAUSED = 7` is unreachable on V05.02.03 | — | — | — |
-| Reservoir empty (5e) | | | | | |
+| **Reservoir empty (5e)** ✅ | **3** | pump stopped, requesting a cartridge change | **open** | **yes, 147 → 148, `104 Cartridge Empty`, urgent** | `03 00 00 00 00 02 00 00 00 00 64 00 00 00 00 00 00 00` — reservoir `00 00 00 00` = a **known zero**, not the `FF FF FF FF` (−1) of a cartridge change |
 
 ### Phase 5 is finished when
 
