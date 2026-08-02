@@ -76,16 +76,29 @@ These are the things a new user should be told before they find them.
 
 ### The pump logs no cannula-priming event, so CAGE cannot restart itself
 
-**There is no `type=25` anywhere in this pump's history.** AAPS's site-change age timer (CAGE) is
-driven by a `CANNULA_CHANGE` therapy event, the driver maps type 25 to exactly that, and **the pump
-has never once emitted a type 25** — a cartridge change through its own menu produces cartridge and
-prime entries and no cannula event. **You must record site changes by hand in AAPS**, exactly as an
-MDI user does. This is a property of the pump's log, not a gap in the driver, and no amount of work
-here will change it.
+**There is no `type=25` anywhere in this pump's history**, and it is worse than an omission. AAPS's
+site-change age timer (CAGE) is driven by a `CANNULA_CHANGE` therapy event; the driver maps type 25
+to exactly that, and the pump has never emitted one.
 
-The neighbouring events *do* work, which is what makes this one easy to assume is fine: a prime
-above 9 U becomes a `TUBE_CHANGE`, and a battery removal becomes a `PUMP_BATTERY_CHANGE`. So IAGE
-and battery age fill themselves in, and CAGE silently does not.
+**A cartridge change on 2026-08-03 with a deliberate 30 U cannula prime settled it:**
+
+```
+06:28:06  INSULIN_CHANGE   rewind
+06:31:24  TUBE_CHANGE      14.35 U prime (tubing)
+06:35:13  TUBE_CHANGE      30 U prime — the cannula prime
+06:37:43  INSULIN_CHANGE   second rewind
+```
+
+The cannula prime arrived as `type=4`, **the same event as the tubing prime**. So the pump gives no
+signal that separates the two, and there is nothing to remap CAGE onto — the only candidate is
+indistinguishable from an event that is not a site change.
+
+**You must record site changes by hand in AAPS**, exactly as an MDI user does. This is a property of
+the pump's log, not a gap in the driver, and no amount of work here will change it.
+
+The neighbouring timers *do* fill themselves in, which is what makes this one easy to assume is
+fine: the rewind becomes an `INSULIN_CHANGE` (IAGE) and a battery removal becomes a
+`PUMP_BATTERY_CHANGE` (BAGE). IAGE and battery age work; CAGE silently does not.
 
 ### The event log holds 3000 entries — roughly three months
 
@@ -114,10 +127,14 @@ a failure mode the phone was ever the primary defence against.
 ### Two of byte 0's 256 delivery-mode values are identified
 
 `3 = Stopped`, `10 = Running`. Every state reachable on the hardware came back as one of the two —
-including during a bolus, during an alarm, and after one — and there is no pause state on this pump
-at all. Two situations have still never been read: **cartridge out or priming**, and **reservoir
-empty**. An unidentified value makes AAPS treat the pump as suspended, which holds the loop off, and
-deliberately writes no therapy record.
+during a bolus, during an alarm, after one, and **through a whole cartridge change** — and there is
+no pause state on this pump at all. One situation has still never been read: **reservoir empty
+mid-delivery**. An unidentified value makes AAPS treat the pump as suspended, which holds the loop
+off, and deliberately writes no therapy record.
+
+A cartridge change is separable from an alarm stop, but by the **reservoir field** rather than by
+byte 0: it reads `FF FF FF FF` (−1) for the whole procedure, and the driver reports
+`reservoir=unknown` rather than a garbage number.
 
 ### Smaller ones
 

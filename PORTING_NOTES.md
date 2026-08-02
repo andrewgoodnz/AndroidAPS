@@ -1458,7 +1458,7 @@ been looked at**:
 | State | Why it matters |
 |---|---|
 | during a bolus | if byte 0 changes, AAPS flips to "suspended" mid-bolus, every bolus |
-| during priming / a cartridge change | the pump is genuinely not delivering; does it say so, or does it say something new? |
+| ~~during priming / a cartridge change~~ | ✅ **Answered 2026-08-03. It reads `3`, and the reservoir reads `-1`.** See below |
 | after an alarm has stopped the pump | **the most important one.** If an alarm stops delivery and byte 0 goes to a third value, this is where AAPS should learn insulin has stopped — and it may be a better channel than the alert log |
 | ~~paused~~ | ✅ **Retired 2026-08-01. There is no pause on this pump** — its menus offer stop only, so upstream's `PAUSED = 7` is unreachable on V05.02.03. Not an unmapped state; not a state |
 | reservoir empty mid-delivery | never seen; the reservoir field is known to read `-1` after an occlusion alarm |
@@ -1539,6 +1539,46 @@ it says nothing about whether anything left the device. **A log line that names 
 evidence the action had an effect** — the same mistake as §4f's type-19 echo, made against AAPS's
 own logs this time. The inbound hazard stands: anything unexplained the pump does should be checked
 against NS before it is investigated as a driver fault.
+
+#### ✅ [verified] A cartridge change reads `3`, and the reservoir reads `-1` — 2026-08-03
+
+Read live during a real cartridge change on saline, with AAPS driven from `adb` so the tester's hands
+stayed on the pump:
+
+```
+byte0=3 name='Stopped' mode=STOPPED delivering=false suspendRecord=open reservoir=unknown
+raw=[03 FF FF FF FF 02 00 00 00 00 64 00 00 00 00 00 00 00]
+```
+
+**No third value here either.** Five readings across the change — cartridge out, cartridge back in,
+and twice more inside the prime procedure — all read `3`, the same as a button stop and an alarm
+stop. Byte 0 is now confirmed for every state this pump has been made to enter.
+
+**And this is the first sighting of `reservoir = -1`.** §8.4 item 5 listed it as *"coded for
+(`reservoirKnown`), never observed"*. Bytes 1–4 read `FF FF FF FF`, `reservoirKnown` handled it, and
+the UI showed `reservoir=unknown` rather than a garbage figure. Observed, and correct.
+
+⚠ **The payload distinguishes this state; byte 0 does not.** Compare the three:
+
+```
+running          0A 2A 39 00 00 …
+stopped / alarm  03 0F 40 00 00 …
+cartridge change 03 FF FF FF FF …
+```
+
+So a cartridge change is separable from an alarm stop — by the reservoir field, not by the delivery
+mode. That is precisely why §5c asks for the whole payload rather than the decode, and it is the
+second time that instruction has paid.
+
+⚠⚠ **One row of Phase 5 is now unreachable by the method that answered the rest, and it is worth
+recording why.** "During priming, with fluid visibly moving" cannot be *proved* live. §8.3's bolus
+reading was trustworthy because the reservoir in its own payload sat 0.12 U below the pre-bolus
+figure — the payload carried its own evidence of liveness. During a cartridge change the reservoir
+reads `-1`, so a reading taken mid-prime is byte-identical to one taken thirty seconds after it.
+The value is near-certainly `3` — it is `3` on both sides and throughout — but that is inference,
+and §8.3's own rule is that nothing is mapped on inference. **Recorded as unreachable rather than
+as verified.** The cost of being wrong is nil; the cost of a row marked ✅ on a reading nobody could
+stand behind is the thing this file keeps finding.
 
 #### ✅ [verified] An alarm stop reads `3`, and alarming is indistinguishable from stopped — 2026-08-01
 
@@ -1658,9 +1698,12 @@ none of them was, was a pump problem.
    and whether that reaches `isSuspended()` promptly is now **watched and confirmed**: a button stop
    showed `mode=STOPPED` on the first poll after it, opened the suspend record, and closed it on
    restart (Phase 6a/6c, 2026-08-01). An *alarm* stop does the same thing and reports the same byte.
-5. **Reservoir `-1`.** Coded for (`reservoirKnown`), never observed. Likewise an unprogrammed basal
-   slot reading `-1` → `0.0`, which would make `isThisProfileSet` false permanently (§4i).
-   **Procedure written:** Phase 5c reaches it by removing the cartridge, and 5e by running one dry.
+5. ~~**Reservoir `-1`.**~~ ✅ **Observed 2026-08-03.** `reservoirKnown` handled it correctly through a
+   whole cartridge change — bytes 1–4 read `FF FF FF FF` and the UI showed `reservoir=unknown`
+   rather than a garbage figure (§8.3). What remains unobserved is reservoir `-1` reached by
+   **running dry mid-delivery** — a different route to the same field, and Phase 5e's question.
+   Still open too: an unprogrammed basal slot reading `-1` → `0.0`, which would make
+   `isThisProfileSet` false permanently (§4i).
 6. **Low battery.** Only 2-of-4 bars has ever been seen. The mapping of 0 and 1 bars, and whether the
    pump alerts, are both unknown — and AAPS acts on pump battery level.
 7. **Bolus and basal caps.** Event types 33 and 34 exist for them. Whether the pump refuses an

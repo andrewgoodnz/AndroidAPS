@@ -20,8 +20,8 @@ failed for any input. It is now written as **6b-RERUN**, with an instrument that
 |---|---|---|---|
 | A | **6b-RERUN — the renewal fix** | ⚠ **Still unverified, and it is the last correctness gate before insulin.** The overnight run of 08-01→02 was on a **pre-fix build** (`fca883077c` landed 08:46 on 08-02, the pump restarted at 08:49), so it reproduced the defect and tested nothing. The procedure is now written for the fixed build and the driver has an instrument that can fail: a `[ypso-suspend] LAPSED` line, and minutes-remaining on every `[ypso-state]` line. **Do not test it by checking that every poll reads `suspendRecord=open`** — that check reported zero across a run containing two real gaps. Needs a stopped pump and **3 unattended hours** | **6b-RERUN**, §8.6 |
 | B | **Fix `insertAnnouncement`'s dedupe key** | It keys on `now()`, not `pumpId`, so it is the one sync path that is not idempotent. The watermark currently hides it. Worth fixing on its own terms rather than depending on the thing that hides it | §8.5 |
-| C | **Phase 5c — cartridge out and priming** | The last two delivery-mode states never read. **Free at your next cartridge change** if you press Refresh while the cartridge is out and again while priming | **Phase 5c**, §8.3 |
-| D | **Phase 5e — reservoir empty mid-delivery** | Never seen. The pump does alert (`104 Cartridge Empty`, 37 in the log), but what byte 0 reads at that moment is unknown | **Phase 5e**, §8.3 |
+| C | ~~**Phase 5c — cartridge out and priming**~~ | ✅ **CLOSED 2026-08-03.** Cartridge out reads `byte0=3` with the reservoir `FF FF FF FF` (−1) — the first sighting of reservoir `-1`, handled correctly. The *priming* row is recorded as **unreachable by this method**: liveness cannot be proved because the reservoir reads −1 throughout, so a mid-prime reading is byte-identical to one taken after it | **Phase 5c**, §8.3 |
+| D | **Phase 5e — reservoir empty mid-delivery** | The **last** unread delivery-mode state. Never seen. The pump does alert (`104 Cartridge Empty`), but what byte 0 reads at that moment is unknown. Needs a nearly-empty cartridge — decide the fill volume at a cartridge change, not after | **Phase 5e**, §8.3 |
 | E | **Reconnect mid-bolus** | Pull BLE range during a 2 U bolus. The pump finishes regardless; what is untested is whether AAPS's *record* settles. A provisional record goes in before sending and `ReconnectManager` chases the link back, armed for the bolus only | §4g |
 | F | **Kill AAPS mid-bolus** | Force-stop during delivery. The provisional record must survive and keep counting — this decides whether `PumpSyncStorage` is needed | §4g |
 | G | **Change the phone's timezone** | Untested: the driver should queue a clock sync and the pump's clock should follow | §8.6 |
@@ -832,9 +832,42 @@ display recorded beside it.** Leave a row blank rather than guessing it.
 | **During a bolus (5a)** ✅ | **10** | "Bolus complete" (after) — reservoir 169.82 mid-delivery proves the read was taken while delivering | none | no | `0A 56 42 00 00 02 05 00 00 00 64 00 00 00 00 00 00 00` |
 | **Alarming, not yet acknowledged (5b)** ✅ | **3** | "Occlusion - check infusion set" | **open** | yes, 146 → 147, `105 Occlusion` | `03 0F 40 00 00 02 00 00 00 00 64 00 00 00 00 00 00 00` |
 | **Stopped after an alarm (5b)** ✅ | **3** | same alarm acknowledged, pump stopped | open | — | `03 0F 40 00 00 02 00 00 00 00 64 00 00 00 00 00 00 00` — **byte-identical to the line above** |
-| Cartridge removed (5c) | | | | | ⏳ missed: AAPS was disconnected for the whole change |
-| Priming (5c) | | | | | ⏳ missed, same reason |
-| **Does `type=25` exist? (5c-ii)** ✅ | **No — none, in 50 events + 50 alerts back to Feb 2025.** The 2026-08-01 cartridge change produced `seq=160635 type=16(Rewind Finished)` and `seq=160637 type=4(Priming Finished) v1=1000` (10.00 U) and nothing else. **CAGE cannot restart automatically on this pump** | | | | |
+| **Cartridge removed (5c)** ✅ | **3** | pump stopped for the change, cartridge out | **open** since 06:28 | — | `03 FF FF FF FF 02 00 00 00 00 64 00 00 00 00 00 00 00` — **reservoir reads `FF FF FF FF` = −1**, and `reservoir=unknown` |
+| **Priming (5c)** ⚠ **unreachable by this method** | (`3` on both sides and throughout the procedure, but see below) | pump in the cartridge-change menu | open | — | **Liveness cannot be proved.** §8.3's bolus reading was trustworthy because its own payload showed the reservoir 0.12 U down mid-delivery. During a change the reservoir reads `-1`, so a mid-prime reading is byte-identical to one taken after it. Left unverified rather than filled in from inference |
+| **Does `type=25` exist? (5c-ii)** ✅ **CLOSED** | **No — confirmed twice, the second time with a deliberate cannula prime.** See below | | | | |
+
+#### ✅ [verified] 5c-ii closed 2026-08-03 — and the answer is worse than "type 25 is missing"
+
+The 2026-08-01 change produced `seq=160635 type=16` and `seq=160637 type=4 v1=1000` and no type 25 —
+but that change **may never have primed a cannula**, so it could not settle the question. §5c-ii said
+so, and asked for a change that primed the cannula deliberately.
+
+Done 2026-08-03. A full change with a **30 U cannula prime**, adjudicated against the database rather
+than the log:
+
+```sql
+select datetime(timestamp/1000,'unixepoch','localtime'), type, pumpId from therapyEvents …
+2026-08-03 06:28:06  INSULIN_CHANGE   160742    rewind
+2026-08-03 06:31:24  TUBE_CHANGE      160745    14.35 U prime (tubing)
+2026-08-03 06:35:13  TUBE_CHANGE      160751    30 U prime — THE CANNULA PRIME
+2026-08-03 06:37:43  INSULIN_CHANGE   160756    second rewind
+```
+
+**No `CANNULA_CHANGE`, no `type=25`** — and the cannula prime arrived as **`type=4`, the same event
+as the tubing prime**, over the same 9 U threshold, mapped the same way. So the pump does not merely
+omit a cannula event: **it emits no signal that distinguishes a cannula prime from a tubing prime.**
+
+That closes the middle row of 5c-ii's own decision table. There is nothing to remap the site change
+onto, because the only candidate is indistinguishable from an event that is not a site change.
+**CAGE cannot restart automatically on this pump, and no amount of driver work will change that.**
+Site changes must be recorded by hand, as an MDI user does.
+
+⚠ **The log could not have answered this.** `insertTherapyEvent` does not log its success path, so
+both entries read only as `importing Unknown seq=…`. Every branch that *would* have logged —
+"Prime of X U … below tube-change threshold", "Unmapped pump event type N", "its preference is off" —
+stayed silent, which narrowed it to three possibilities and settled none. The database was the only
+thing that could tell `CANNULA_CHANGE` from `TUBE_CHANGE`, which is the fifth time in these notes
+that a question was decided by the database after the log had been read as if it were evidence.
 
 ⚠ **Press Refresh *during* each step of 5c.** The 2026-08-01 attempt lost both readings: AAPS
 disconnected on "Queue empty" at 17:13:32 and did not reconnect until 17:17:44, so the cartridge-out
