@@ -75,10 +75,14 @@ reading top-down would otherwise take a delivering driver for an inert one.
 3. **`YpsoSyncHistoryToAaps` is now ON**, and this used to say the opposite. What the pump does on
    its own — above all a bolus from its own menu — **now becomes insulin on board**. It reached that
    state through Phase 7, one preference validated in five steps with the database checked
-   independently of the log at each one (§8.5). The shipped default is still `false` pending 7e.
-4. **Nothing added this session can move insulin.** Session 5 added log lines and nothing else: the
-   sync logic was deliberately not touched while it was being tested, which is the rule the
-   procedure sets for itself.
+   independently of the log at each one (§8.5). **The shipped default is `true`** —
+   `YpsoBooleanKey.YpsoSyncHistoryToAaps("ypso_sync_history_to_aaps", true)`, flipped once 7e and 7f
+   passed. It remains a preference so it can be switched off in one action.
+4. **Nothing added in session 5 could move insulin**, and nothing added in session 6 can either.
+   Session 5 added log lines and nothing else — the sync logic was deliberately not touched while it
+   was being tested, which is the rule the procedure sets for itself. Session 6 removed refused
+   capability *claims*, deleted the unregistered donor module and wrote documentation; it added no
+   delivery path.
 
 **A successful GATT write proves nothing on this pump.** It does not NAK a bad write — the
 wrong auth password produced a perfectly successful write and only failed on the *next read*
