@@ -6,16 +6,16 @@ which records what the pump has actually been observed to do.
 ## ⏳ Everything still to run — read this first
 
 As of 2026-08-02, **all four delivery phases have passed, Phase 5 is answered except two rows,
-Phase 6 has passed all six steps, and Phase 7 has passed in full.** History sync is **switched on**.
-What remains is observation and one unverified performance change, not capability.
+Phase 6 has passed all six steps, and Phases 7 and 7f have passed in full.** History sync is
+**on by default**, and a quiet poll costs ~580 ms rather than 20 s. What remains is observation, not
+capability.
 
 **Still to run, most valuable first:**
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
-| A | **Phase 7f — the cheap probe** | ⚠ **Built `5ac789dd8e`, never run.** It changes what the sync reads, so it does **not** inherit Phase 7's pass. 7e spent 4.8 minutes of radio across four idle hours to learn nothing had happened; the probe should make that ~5.6 s. Its failure mode is the quiet one — a probe that says "nothing new" when something happened stops IOB silently | **Phase 7f**, §8.5 |
-| B | **Phase 6b re-confirm — the renewal fix** | ⚠ **Still unverified.** The overnight run of 08-01→02 was on a **pre-fix build** (`fca883077c` landed 08:46 on 08-02, the pump restarted at 08:49), so it reproduced the defect and tested nothing. **Do not test it by checking that every poll reads `suspendRecord=open`** — that check passed across a run containing two real gaps. Read `duration` out of `temporaryBasals`: pre-fix it is exactly 60.00 min every time, with the fix it should be ~40. **Opportunistic** — fold it into the next time the pump is stopped for other reasons | **Phase 6b**, §8.6 |
-| C | **Fix `insertAnnouncement`'s dedupe key** | It keys on `now()`, not `pumpId`, so it is the one sync path that is not idempotent. The watermark currently hides it. Worth fixing on its own terms rather than depending on the thing that hides it | §8.5 |
+| A | **Phase 6b re-confirm — the renewal fix** | ⚠ **Still unverified.** The overnight run of 08-01→02 was on a **pre-fix build** (`fca883077c` landed 08:46 on 08-02, the pump restarted at 08:49), so it reproduced the defect and tested nothing. **Do not test it by checking that every poll reads `suspendRecord=open`** — that check passed across a run containing two real gaps. Read `duration` out of `temporaryBasals`: pre-fix it is exactly 60.00 min every time, with the fix it should be ~40. **Opportunistic** — fold it into the next time the pump is stopped for other reasons | **Phase 6b**, §8.6 |
+| B | **Fix `insertAnnouncement`'s dedupe key** | It keys on `now()`, not `pumpId`, so it is the one sync path that is not idempotent. The watermark currently hides it. Worth fixing on its own terms rather than depending on the thing that hides it | §8.5 |
 | C | **Phase 5c — cartridge out and priming** | The last two delivery-mode states never read. **Free at your next cartridge change** if you press Refresh while the cartridge is out and again while priming | **Phase 5c**, §8.3 |
 | D | **Phase 5e — reservoir empty mid-delivery** | Never seen. The pump does alert (`104 Cartridge Empty`, 37 in the log), but what byte 0 reads at that moment is unknown | **Phase 5e**, §8.3 |
 | E | **Reconnect mid-bolus** | Pull BLE range during a 2 U bolus. The pump finishes regardless; what is untested is whether AAPS's *record* settles. A provisional record goes in before sending and `ReconnectManager` chases the link back, armed for the bolus only | §4g |
@@ -1317,7 +1317,38 @@ preference precisely so that it can be switched off in one action.
 
 ---
 
-# Phase 7f — the cheap probe ⏳ **BUILT 2026-08-02, NOT YET RUN**
+# Phase 7f — the cheap probe ✅ **PASSED 2026-08-02**
+
+> **Eight syncs after install: six quiet, two full reads, and the probe was right every time.**
+>
+> ```
+> 18:28:03  newest sequence is 160710, still at the watermark — nothing new,
+>           so the window was not read. Probe took 576 ms.
+> 19:16:45  read 50 event(s) seq 160662..160714 … importing BolusDelivered seq=160714
+>           imported 1 event(s); watermark 160710 -> 160714. Probe 579 ms.
+> 19:17:20  newest sequence is 160714, still at the watermark … Probe took 572 ms.
+> 19:47:13  imported 24 event(s) above 160714; watermark 160714 -> 160738. Probe 619 ms.
+> ```
+>
+> | | |
+> |---|---|
+> | Probe cost | **572–621 ms**, eight samples |
+> | Quiet sync, before → after | **20 500 ms → ~580 ms**, a **36× cut** |
+> | Cost when a read *is* needed | **+580 ms** on top of the full read |
+> | Radio across the eight syncs | **47 s**, against 164 s under the old code |
+> | Extrapolated idle day (72 polls, 4 with events) | **24.6 min/day → 2.1 min/day** |
+>
+> `grep -c "read 50 event"` returned **0** across the whole quiet period — the window was genuinely
+> not read, not merely read fast. Database unchanged throughout except the one imported bolus
+> (`id=21 ver=0 1.0 U pumpId=160714`) and AAPS's own profile-switch rows.
+>
+> **⚠ The 0.4 s estimate was wrong, and why is worth keeping.** `readHistory` reads the log **count**
+> before any entry, so the probe is count + index-write + value-read **per log** — six GATT round
+> trips at ~95 ms, not four. That also cross-checks the ~200 ms/entry figure exactly, since an entry
+> is two of those round trips. The arithmetic closing is better evidence than the estimate having
+> been right would have been.
+
+## Phase 7f — the original procedure
 
 **This is sync logic, so it does not inherit Phase 7's pass.** Commit `5ac789dd8e` changed what the
 sync reads: index 0 of each log first (~0.4 s), and the full 100-entry window **only** when the
@@ -1383,3 +1414,5 @@ instead of happening in silence.
 still crosses. **Then, and not before, flip `YpsoSyncHistoryToAaps` to default `true`** — the flip
 is a statement that the shipped build is ready, and it should not be made about a build carrying
 unverified sync logic.
+
+✅ **All three passed 2026-08-02, and the default was flipped to `true` the same day.**

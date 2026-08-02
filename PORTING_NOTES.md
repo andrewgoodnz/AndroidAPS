@@ -22,14 +22,15 @@ manual bolus arrived exactly once at the right amount and time; an AAPS bolus st
 across two re-reads; a 24-entry burst reached no treatment and opened no gap; and four idle hours
 produced fourteen empty syncs and not one row in any treatment table.
 
-**Three things stand between here and an insulin trial, and none of them is a capability:**
+**The sync's cost is solved.** It was 20.4 s on every status read — twice what this file predicted,
+because `YpsoHistoryReadCount` applies to *each* log. A probe that reads index 0 first and skips the
+window when nothing has moved cut a quiet poll to **~580 ms**, verified in Phase 7f (§8.5).
 
-1. **The sync costs 20.4 s on every status read** — twice what this file predicted, because
-   `YpsoHistoryReadCount` applies to *each* log. A cheap probe that reads index 0 first is
-   **written and unverified**; Phase 7f is its gate (§8.5).
-2. **6b's renewal fix has never run.** The overnight test was on a pre-fix build, so it reproduced
+**Two things stand between here and an insulin trial, and neither is a capability:**
+
+1. **6b's renewal fix has never run.** The overnight test was on a pre-fix build, so it reproduced
    the defect and proved nothing about the repair (§8.6).
-3. **The 3000-entry log cap now has a date on it** — roughly three months at this user's rate of
+2. **The 3000-entry log cap now has a date on it** — roughly three months at this user's rate of
    profile changes. What happens when it wraps is now traced rather than guessed at, and the probe
    makes it audible instead of silent (§8.5).
 
@@ -1719,11 +1720,10 @@ timestamp, and a clock change makes those go backwards.
 
 #### ✅ [verified] Switched on 2026-08-02, after Phase 7a–7d passed on hardware
 
-**The preference is on, on the test device. The code default is still `false`** — deliberately, and
-that is not an oversight. 7e was still running when this was written, and flipping the shipped
-default is a change to what a *fresh install* does, which is a different decision from what this
-pump does today. Turn it over once 7e is clean; it is one line in `YpsoBooleanKey` and wants its own
-commit. Where the blockers ended up:
+**`YpsoSyncHistoryToAaps` now defaults to `true`**, flipped once Phase 7 passed in full *and* Phase
+7f validated the probe that keeps the cost survivable. The flip was deliberately held until then: it
+is a statement that the shipped build is ready, and it should not be made about a build carrying
+sync logic nobody has run. Where the blockers ended up:
 
 | Blocker | Status |
 |---|---|
@@ -1769,10 +1769,13 @@ It runs at the end of every `readPumpStatus`, so **every status read now costs t
 That is survivable for a manually-driven pump and it is not survivable for a loop issuing an SMB
 every five minutes — it delays every command by that much.
 
-#### ⏳ [built, unverified] Ask one question instead of reading a hundred entries
+#### ✅ [verified] Ask one question instead of reading a hundred entries — 2026-08-02
 
-Commit `5ac789dd8e`, written after Phase 7 passed and **not yet run on hardware** — Phase 7f is its
-gate.
+Commit `5ac789dd8e`, gated behind Phase 7f and passed the same day: **20 500 ms → ~580 ms on a quiet
+poll, a 36× cut**, with the probe correctly letting a manual bolus and a 24-entry profile burst
+through on the two connections that had something to fetch. Eight probes, 572–621 ms, and
+`grep -c "read 50 event"` returned 0 across the quiet period — the window was genuinely not read.
+Across an idle day that is **24.6 min/day of radio down to 2.1**.
 
 The fix is not "read fewer entries", it is "don't read at all unless something happened". **Index 0
 is always the newest entry** (§5), so two entry reads — one per log — answer *"has anything

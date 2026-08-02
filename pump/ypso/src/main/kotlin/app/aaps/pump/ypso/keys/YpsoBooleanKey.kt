@@ -41,12 +41,16 @@ enum class YpsoBooleanKey(
      * a baseline and imports nothing, a manual bolus arrives exactly once, an AAPS bolus stays one
      * record across re-reads, and a 24-entry profile burst reaches no treatment.
      *
-     * **Still `false` here**, which is a decision about fresh installs rather than about this pump:
-     * 7e — leave it running and look for treatments with no cause — had not finished when this was
-     * written. Turn it over once it has. Note the cost first: the sync adds ~20 s to every status
-     * read, which §8.5 says has to come down before this driver can drive a loop.
+     * **On by default since 2026-08-02**, once Phase 7 passed in full — 7e ran four idle hours and
+     * produced fourteen empty syncs and not one row in any treatment table — and Phase 7f validated
+     * the probe that keeps the cost survivable. Without that probe this would add ~20 s to every
+     * status read; with it, ~0.6 s on the polls where nothing happened, which is most of them
+     * (§8.5).
+     *
+     * It stays a preference so it can be switched off in one action, which is what the procedure
+     * asks for if anything downstream of it ever looks wrong.
      */
-    YpsoSyncHistoryToAaps("ypso_sync_history_to_aaps", false),
+    YpsoSyncHistoryToAaps("ypso_sync_history_to_aaps", true),
 
     YpsoLogInsulinChange("ypso_log_insulin_change", true),
     YpsoLogSiteChange("ypso_log_site_change", true),
