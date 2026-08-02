@@ -252,13 +252,15 @@ change to the framing code.
 
 Stated plainly, because this is the question the whole project is pointed at.
 
-**One correctness gate is open:**
+**One correctness gate is all but closed:**
 
-- **Phase 6b has never been run on the build that fixes it.** The 0% suspend record must be held
-  continuously while the pump is stopped. The fix for the renewal gap was committed *after* the only
-  long unattended run, so what that run measured was the defect. `SALINE_TEST_PROCEDURE.md`
-  **6b-RERUN** is the procedure; it needs a stopped pump and three unattended hours, and it decides
-  on the database rather than the log.
+- **Phase 6b passed on 2026-08-03** — 2h33m of stopped pump, four renewal cycles, **zero uncovered
+  time**. The 0% suspend record is held continuously while the pump is stopped, which is what stops
+  AAPS counting basal insulin that is not being delivered.
+- ⚠ **But it passed on the build from the day before**, which predates a refactor of that same code
+  now at HEAD. One two-hour stopped run on the current build closes it properly, and would also
+  exercise the lapse detector, which has never run on hardware either.
+  `SALINE_TEST_PROCEDURE.md` **6b-RERUN** is the procedure; it decides on the database, not the log.
 
 **Two things only time can answer:**
 

@@ -10,15 +10,15 @@ Phase 6 has passed five of six steps, and Phases 7 and 7f have passed in full.**
 **on by default**, and a quiet poll costs ~580 ms rather than 20 s. What remains is observation, not
 capability — with one exception, and it is first in the list below.
 
-⚠ **6b is the exception, and it was previously recorded here as passed.** It was not: the run that
-"passed" it was on a build committed before the fix, and the criterion it passed could not have
-failed for any input. It is now written as **6b-RERUN**, with an instrument that can fail.
+✅ **6b passed on 2026-08-03** — four renewal cycles, zero uncovered time, decided on the database.
+⚠ But on the **08-02 build**, which predates both today's refactor of that code and the
+`[ypso-suspend] LAPSED` detector. One two-hour stopped run on HEAD closes it properly.
 
 **Still to run, most valuable first:**
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
-| A | **6b-RERUN — the renewal fix** | ⚠ **Still unverified, and it is the last correctness gate before insulin.** The overnight run of 08-01→02 was on a **pre-fix build** (`fca883077c` landed 08:46 on 08-02, the pump restarted at 08:49), so it reproduced the defect and tested nothing. The procedure is now written for the fixed build and the driver has an instrument that can fail: a `[ypso-suspend] LAPSED` line, and minutes-remaining on every `[ypso-state]` line. **Do not test it by checking that every poll reads `suspendRecord=open`** — that check reported zero across a run containing two real gaps. Needs a stopped pump and **3 unattended hours** | **6b-RERUN**, §8.6 |
+| A | **6b re-confirm on HEAD** | ✅ **The renewal fix PASSED 2026-08-03** — 2h33m stopped, four renewal cycles, **zero uncovered time**, adjudicated on `temporaryBasals.duration` (~35–40 min, not 60.00). ⚠ **But on build 3.4.2.4 of 08-02, which predates the `SuspendRecordDecision` extraction now at HEAD** — and predates the `[ypso-suspend] LAPSED` detector, which has still never run on hardware. Flash HEAD, leave a stopped pump two hours, re-run the query | **6b-RERUN**, §8.6 |
 | B | **Fix `insertAnnouncement`'s dedupe key** | It keys on `now()`, not `pumpId`, so it is the one sync path that is not idempotent. The watermark currently hides it. Worth fixing on its own terms rather than depending on the thing that hides it | §8.5 |
 | C | ~~**Phase 5c — cartridge out and priming**~~ | ✅ **CLOSED 2026-08-03.** Cartridge out reads `byte0=3` with the reservoir `FF FF FF FF` (−1) — the first sighting of reservoir `-1`, handled correctly. The *priming* row is recorded as **unreachable by this method**: liveness cannot be proved because the reservoir reads −1 throughout, so a mid-prime reading is byte-identical to one taken after it | **Phase 5c**, §8.3 |
 | D | ~~**Phase 5e — reservoir empty mid-delivery**~~ | ✅ **CLOSED 2026-08-03.** Reads `byte0=3` with the reservoir a **known `0`** — not the `-1` of a cartridge change, so the pump does distinguish empty from absent. Alert count 147 → 148, `104 Cartridge Empty`, urgent. **Phase 5's table is complete** | **Phase 5e**, §8.3 |
@@ -919,14 +919,64 @@ stopped for longer than an hour goes back to accruing phantom basal IOB.
   Look at AAPS, not only at the pump — §4h's TBR cancel passed every pump-side check and AAPS still
   disagreed, and the UI is what caught it.
 
-### 6b. It is re-asserted across polls ⏳ **RE-RUN REQUIRED — the fix has never been exercised**
+### 6b. It is re-asserted across polls ✅ **PASSED 2026-08-03 — on the renewal fix, not on today's refactor**
+
+> **The renewal fix works.** 2h33m of continuous stopped-pump coverage, four renewal cycles, **zero
+> uncovered time**. Unattended, and not even deliberate — the cartridge ran dry during Phase 5e at
+> 07:08 and the pump simply stayed stopped.
+>
+> ```
+> started              mins     expires
+> 2026-08-03 07:08:42  37.62 →  07:46:19   ┐
+> 2026-08-03 07:46:19  40.07 →  08:26:23   │  each record starts EXACTLY
+> 2026-08-03 08:26:23  34.98 →  09:01:22   │  when its predecessor expires
+> 2026-08-03 09:01:22  40.00 →  09:41:22   ┘
+> 2026-08-03 09:41:22  60.00 →  10:41:22   (still running, not yet truncated)
+> ```
+>
+> `started[n+1] − (started[n] + duration[n])` = **0 at all four transitions.**
+>
+> **The durations prove the fix is present, not just that the run went well, and the argument is not
+> circular.** A `PUMP_SUSPEND` record is *always created* with `duration = 60 min`; a stored duration
+> of 37.62 can only mean AAPS **truncated** it when a successor was synced over it 37.62 minutes in.
+> Pre-fix the code returned early whenever a record was open, so a successor could only arrive after
+> expiry and every stored duration was exactly `3600000`. **~40-minute durations are producible only
+> by renewal-before-expiry.** One observation entails both facts.
+>
+> The denominator guard is met: this procedure requires **≥ 2** renewals or the run never reached what
+> it was testing. There are **four**.
+>
+> Two earlier records the same morning — 06:28:40 (3.62 min) and 06:40:27 (4.35 min) — both ended
+> early because the pump restarted after a cartridge change. That is the **close** path, working, for
+> a fourth time (6c).
+
+> ⚠⚠ **It passed on the wrong build, and that is worth as much as the pass.** The tested build is
+> **3.4.2.4 of 2026-08-02 18:23**. HEAD is **3.4.2.6**, carrying the `SuspendRecordDecision`
+> extraction written 2026-08-03 — the same logic, refactored so a test could reach it, pinned by 15
+> unit tests, and **never run on hardware**.
+>
+> That is exactly the shape of the failure this re-run existed to correct. Last time the fix was
+> committed and the test ran on a build from before it; this time the test ran on a build from before
+> the refactor. "Mechanical and unit-tested" is not this file's standard for hardware behaviour —
+> §8.6 records four variants of one bug, every one introduced by a change that looked safe.
+>
+> | | |
+> |---|---|
+> | The renewal fix | ✅ verified on hardware |
+> | Today's refactor of it | ⏳ not on hardware |
+>
+> **Re-confirm on HEAD before an insulin trial.** It is cheap: leave a stopped pump for two hours on
+> the current build and re-run the query below. That run would also exercise the
+> `[ypso-suspend] LAPSED` detector and the minutes-remaining field, **neither of which has ever run
+> on hardware** — they were added the same day and this run predates them.
+
+#### 6b-RERUN — the procedure (still current; use it for the HEAD re-confirm)
 
 > **This is the last correctness gate before an insulin trial.** The overnight run below was on a
 > **pre-fix build**: it reproduced the defect faithfully and proved nothing about the repair. Read
 > "6b-RERUN" immediately after this box; the history is kept because it is what the re-run is being
 > judged against.
 
-#### 6b-RERUN — the procedure for the fixed build
 
 **Build under test:** anything at or after the commit that added the `[ypso-suspend] LAPSED` line.
 Confirm before starting, because a build without it cannot fail this test:
@@ -1225,7 +1275,8 @@ apart**, and 6e's observation is recorded whatever it turned out to be.
 passed across a 13h40 run containing two twenty-minute gaps, because the record is renewed before the
 line is written. A phase is only passed by a check that could have failed.
 
-**Status: five of six confirmed** on 2026-08-01/02. 6a, 6c, 6d, 6e and 6f stand.
+**Status: all six confirmed**, 6b on 2026-08-03 — see its box for the build caveat, which is a
+re-confirm rather than an open question.
 
 ⚠ **6b does not, and this line used to say "all six".** It failed, was fixed the next morning, and
 the fix has never been exercised — the only long run was on a build committed three minutes before

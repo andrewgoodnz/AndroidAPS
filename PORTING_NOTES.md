@@ -33,11 +33,12 @@ window when nothing has moved cut a quiet poll to **~580 ms**, verified in Phase
 
 **Two things stand between here and an insulin trial, and neither is a capability:**
 
-1. **6b's renewal fix has never run.** The overnight test was on a pre-fix build, so it reproduced
-   the defect and proved nothing about the repair (§8.6). The re-run now has an instrument that can
-   fail — a `[ypso-suspend] LAPSED` line and minutes-remaining on every state line — and a procedure
-   with its own denominator, in `SALINE_TEST_PROCEDURE.md` **6b-RERUN**. It needs a human, a stopped
-   pump and three unattended hours.
+1. ✅ **6b's renewal fix has now run, and it works** — 2026-08-03, 2h33m of stopped pump, four
+   renewal cycles, **zero uncovered time**, decided on `temporaryBasals.duration` rather than on a log
+   line (§8.6). ⚠ **But on the 08-02 build**, which predates the same day's `SuspendRecordDecision`
+   extraction and the `[ypso-suspend] LAPSED` detector — so what shipped at HEAD has still not been
+   watched on hardware. **One two-hour stopped run on HEAD closes it**, and it is the last correctness
+   item.
 2. **The 3000-entry log cap now has a date on it** — roughly three months at this user's rate of
    profile changes. What happens when it wraps is now traced rather than guessed at, and the probe
    makes it audible instead of silent (§8.5).
@@ -2139,6 +2140,48 @@ ran its full course and its successor opened 0.1–4.2 s *after* it expired. So 
 Re-deriving the run from `androidaps.db` also independently reproduced the original log analysis —
 the same two cycles, 19m48s and 19m59s — which is worth something on its own, given §8.6's history
 of checks that agreed with whatever they were shown.
+
+##### ✅ [verified] 6b passed — 2026-08-03, four cycles, zero uncovered
+
+Unattended, and not deliberate: the cartridge ran dry during Phase 5e at 07:08 and the pump stayed
+stopped for the rest of the morning.
+
+```
+started              mins     expires
+07:08:42             37.62 →  07:46:19   ┐
+07:46:19             40.07 →  08:26:23   │  each starts EXACTLY when
+08:26:23             34.98 →  09:01:22   │  its predecessor expires
+09:01:22             40.00 →  09:41:22   ┘
+09:41:22             60.00 →  10:41:22   (running, not yet truncated)
+```
+
+`started[n+1] − (started[n] + duration[n])` = **0 at every transition.**
+
+**The durations prove the fix is present, and the argument is not circular.** A record is *always
+created* with `duration = 60 min`, so a stored 37.62 can only mean AAPS truncated it when a successor
+arrived 37.62 minutes in. Pre-fix the code returned early whenever a record was open, so a successor
+could only arrive after expiry and every duration stored exactly `3600000`. **~40-minute durations
+are producible only by renewal-before-expiry.** One observation entails both facts — which is the
+opposite of the four checks in this file that entailed neither.
+
+The procedure's denominator guard is met: it requires ≥ 2 renewals or the run never reached what it
+tested. There were four.
+
+##### ⚠⚠ …and it passed on a build that predates the refactor of the code it tested
+
+The tested build is **3.4.2.4 of 2026-08-02 18:23**. HEAD is **3.4.2.6**, carrying the
+`SuspendRecordDecision` extraction written 2026-08-03 — same logic, lifted out so a test could reach
+it, pinned by 15 unit tests, **never run on hardware**. The `[ypso-suspend] LAPSED` detector and the
+minutes-remaining field have not run either; they were added the same day and this run predates them.
+
+**This is the fifth variant of the same mistake, and the first one caught before it was written up as
+a pass.** Not written; written but never re-asserted; re-asserted but closed by an automatic cancel;
+renewed only after a gap; and now **fixed, then refactored, and verified on the build from before the
+refactor**. The pattern is not the pump and it is not even the logic — it is that *what was tested*
+and *what will ship* drift apart between the fix and the test.
+
+It costs one stopped pump and two hours on HEAD to close, and until then the honest statement is:
+the renewal fix is verified; the code that implements it today is not.
 
 ##### ⚠ The first write-up of this was wrong twice, and both errors were mine
 
