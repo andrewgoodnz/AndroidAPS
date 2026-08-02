@@ -882,7 +882,117 @@ stopped for longer than an hour goes back to accruing phantom basal IOB.
   Look at AAPS, not only at the pump — §4h's TBR cancel passed every pump-side check and AAPS still
   disagreed, and the UI is what caught it.
 
-### 6b. It is re-asserted across polls ❌ **FAILED 2026-08-01 → fixed, needs a re-run**
+### 6b. It is re-asserted across polls ⏳ **RE-RUN REQUIRED — the fix has never been exercised**
+
+> **This is the last correctness gate before an insulin trial.** The overnight run below was on a
+> **pre-fix build**: it reproduced the defect faithfully and proved nothing about the repair. Read
+> "6b-RERUN" immediately after this box; the history is kept because it is what the re-run is being
+> judged against.
+
+#### 6b-RERUN — the procedure for the fixed build
+
+**Build under test:** anything at or after the commit that added the `[ypso-suspend] LAPSED` line.
+Confirm before starting, because a build without it cannot fail this test:
+
+```
+grep -c "ypso-suspend" <the apk's sources, or just check the version you installed>
+```
+
+**Duration:** at least **3 hours** stopped, unattended. Two expiry cycles is the minimum that can
+distinguish "renews" from "renewed once"; three hours gives four renewals and room for one to be
+missed and seen. Overnight is better and costs nothing but saline.
+
+**Setup**
+
+1. Pump on saline, off-body, cannula to air. Cartridge with enough volume to sit for the duration.
+2. AAPS running, screen off, on charge. Do **not** press Refresh — this test is about the idle poll
+   path, and pressing Refresh is what made the original failure look quick to recover from.
+3. Note the wall-clock time you stop the pump. Write it down; it is the left edge of the window.
+4. **Stop the pump on its own buttons.** Leave it stopped and leave the phone alone.
+
+**Then, at the end, four checks. All four must pass.**
+
+**① The database, and this is the one that decides it.** It does not depend on a log line surviving:
+
+```sql
+select timestamp, duration,
+       datetime(timestamp/1000,'unixepoch','localtime') as started,
+       duration/60000.0 as minutes
+from temporaryBasals
+where isValid=1 and referenceId is null and type='PUMP_SUSPEND'
+order by timestamp;
+```
+
+| | Pre-fix (what the overnight run showed) | Fixed (what a pass looks like) |
+|---|---|---|
+| `duration` of every record but the last | exactly `3600000` — 60.00 min, ran its full course | **≈40 min** — truncated by its successor opening early |
+| Interval between consecutive `started` values | ~60 min, sometimes 80 when one lapsed | **≈40 min, never more than ~45** |
+| Coverage | 39m47s uncovered in 13h40 | **zero uncovered** |
+
+**A run whose records all read `duration = 3600000` is a run without the fix, whatever else the log
+says.** That sentence is the whole reason this test is being repeated.
+
+The arithmetic that adjudicates it: for each consecutive pair, `started[n+1] - (started[n] +
+duration[n])` must be **≤ 0**. A positive value is an uncovered window and its size is the hole.
+
+**② `[ypso-suspend] LAPSED` must not appear. Once.**
+
+```
+grep "ypso-suspend" AndroidAPS.log
+```
+
+This line is new, and it exists because the old test could not fail (see the box below). It is
+emitted from `syncSuspendedState` *before* a replacement record is opened, comparing the expiry the
+previous poll recorded against the current time. It is the only place in the driver where a hole is
+observable at the moment it exists rather than by arithmetic afterwards.
+
+⚠ **An empty grep is only evidence if the run was long enough to contain expiries.** Confirm the
+denominator first — `grep -c "renewed the 0% basal"` must be **≥ 2**, or the test did not reach the
+thing it is testing and the empty result means nothing. This is exactly the trap 7d and the type-19
+echo fell into: a check that passed because its input never arrived.
+
+**③ Read the MIDDLE of the log, not the ends.** A record that lapses partway looks like a pass from
+either end — the first line reads `open`, the last line reads `open`, and the hole is between them.
+
+```
+grep "\[ypso-state\]" AndroidAPS.log
+```
+
+Every line now carries the minutes remaining:
+
+```
+[ypso-state] byte0=3 name='Stopped' mode=STOPPED delivering=false \
+  suspendRecord=open since 2:30:12 am (41min left of 60) rate=… raw=[03 …]
+```
+
+Take the lines from the **middle third of the run** and read the countdown. A held record sawtooths
+**60 → 40 → 60 → 40**, and the figure **never approaches zero**. What a lapse looks like is a line
+reading a small number of minutes left, or `none`, followed by one reading `60min left of 60` with a
+**new** `since` — the record was replaced rather than renewed.
+
+**④ AAPS shows it as a flat gap in the basal record.** Overview → the basal graph across the stopped
+window must be **flat at zero for its whole width**, with no steps back up to profile rate. In
+Treatments → Temp Basals the 0% entries must **abut**: each one starting at or before the previous
+one's end, with no visible gap between the bars. Look at this on the phone, not only in the log —
+§4h's cancel passed every pump-side check and the UI is what caught it.
+
+**Then close it.** Restart the pump (6c). The record must end — not expire — and the graph must
+return to profile basal at the restart time, not up to 60 minutes later.
+
+**If it fails.** Record the hole width and the two record timestamps either side of it, and stop:
+`SUSPEND_TBR_RENEW_BELOW_MINUTES` is the number to move, and moving it is a code change, not a
+retry. Do not simply run it again — the failure is phase-dependent and a second run can pass by
+luck, which is how the 2-in-13 rate was originally reported as "about half the time" from a
+two-sample run.
+
+**What this test cannot reach.** A pump left stopped for over an hour is an alarm condition already
+being ignored, and none of the everyday scenarios get there: a site change is 15–30 min, and a
+shower or swim goes through AAPS's own Disconnect Pump, which writes `EMULATED_PUMP_SUSPEND` — a
+different record type this code never touches. The reason to run it anyway is that *"while the pump
+is stopped a 0% record is open"* is either an invariant or it is not, and a documented-but-false
+invariant is what somebody relies on later.
+
+#### 6b — the history this re-run is judged against ❌ **FAILED 2026-08-01, pre-fix build**
 
 > **Result over 13h40 unattended, pump stopped: 2 gaps in 13 expiry cycles**, 19m48s and 19m59s,
 > 39m47s uncovered in total (4.9%). Eleven cycles renewed within 0–4 seconds.
@@ -943,7 +1053,11 @@ says. That is a check that can fail, which the `suspendRecord=open` one could no
 for the rest of the session. Every record in that run reads `duration = 60.00 min`. The overnight
 data reproduces the defect faithfully and says **nothing** about whether the fix works.
 
-### 6b — the original procedure
+### 6b — the original procedure ⚠ **SUPERSEDED by 6b-RERUN; kept because its failure is instructive**
+
+**Do not run this version.** Its acceptance criterion is the one that reported zero across a run
+containing two real gaps. It is here so that the next person to write a check has an example of one
+that could not fail, sitting next to the thing that replaced it.
 
 This is the check that the `StateFlow` conflation fix was for: a stopped pump reports identical
 bytes poll after poll, and the collector that writes this record used to fire only when the value
@@ -963,6 +1077,10 @@ bytes poll after poll, and the collector that writes this record used to fire on
 
 A single `suspendRecord=none` line while the pump is stopped is a **failure**, and it is the exact
 shape of the bug this fix was for.
+
+⚠ **…and it can never be observed, which is why the above is superseded.** `syncSuspendedState` runs
+*before* `logDeliveryState`, so a fresh record always exists by the time a line is written. The
+criterion is not merely weak; it is unreachable for every possible input. Use 6b-RERUN.
 
 ### 6c. Restart the pump
 

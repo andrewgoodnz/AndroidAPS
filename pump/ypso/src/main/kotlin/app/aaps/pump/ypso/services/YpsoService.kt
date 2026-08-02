@@ -100,6 +100,21 @@ class YpsoService : DaggerService() {
     /** Serialises the blocking bridge so two command-queue calls cannot overlap. */
     private val commandLock = Any()
 
+    /**
+     * When the 0% suspend record observed at the previous poll was due to expire, or null if there
+     * was none.
+     *
+     * The only reason this exists is that **the obvious check cannot fail** (§8.6). `logDeliveryState`
+     * runs *after* `syncSuspendedState`, so by the time a line is written a fresh record always
+     * exists and every line reads `suspendRecord=open` — including the pairs bracketing a
+     * twenty-minute hole. The 13h40 run that contained two real gaps reported zero.
+     *
+     * A lapse is only visible by noticing that the record which *should* still have been open is
+     * gone. That needs one number carried between polls, and this is it. Held in memory
+     * deliberately: it is a within-run instrument, and a restart is not a lapse.
+     */
+    private var suspendRecordExpiryMs: Long? = null
+
     override fun onCreate() {
         super.onCreate()
         aapsLogger.debug(LTag.PUMP, "YpsoService onCreate")
@@ -334,10 +349,31 @@ class YpsoService : DaggerService() {
                 "Delivery mode '$modeName' has never been identified; the loop is held off but no suspend record is written. " +
                     "Record what the pump's own display says against this mode — PORTING_NOTES §8.3"
             )
+            // No record is maintained in this state on purpose, so one expiring here is the design
+            // rather than the Phase 6b failure. Stop watching, or the next stopped poll would
+            // report a lapse that this branch caused deliberately.
+            suspendRecordExpiryMs = null
             return
         }
 
         if (mode != OperatingMode.STARTED) {
+            // Did the record that was open at the previous poll survive to this one? This is the
+            // only place a lapse is observable: syncSuspendedState is about to open a replacement,
+            // and every line written after that reads `open` whether or not there was a hole.
+            //
+            // The width is measured rather than inferred — expiry was known, now() is known, and
+            // the difference is how long AAPS spent counting basal IOB for a stopped pump.
+            val expectedExpiry = suspendRecordExpiryMs
+            if (ourSuspendRecord == null && expectedExpiry != null) {
+                val holeMs = dateUtil.now() - expectedExpiry
+                aapsLogger.error(
+                    LTag.PUMP,
+                    "[ypso-suspend] LAPSED — the 0% record expired at ${dateUtil.dateAndTimeString(expectedExpiry)} and " +
+                        "nothing replaced it for ${holeMs / 1000}s. AAPS counted basal IOB for a stopped pump for that long. " +
+                        "This is the SALINE_TEST_PROCEDURE Phase 6b failure, and it is the only line that reports it"
+                )
+            }
+
             // ⚠ Renew *before* expiry, never after. Waiting for the record to lapse and then
             // noticing leaves a hole the width of one poll interval, and the hole is not
             // hypothetical: an unattended run on 2026-08-01 produced two of them, 19m48s and
@@ -350,7 +386,10 @@ class YpsoService : DaggerService() {
             // expiry and whether it renews is decided by drift. One observed miss was by a single
             // second. Renewing early breaks that phase-lock as well as leaving margin.
             val remainingMs = ourSuspendRecord?.let { (it.timestamp + it.duration) - dateUtil.now() }
-            if (remainingMs != null && remainingMs > T.mins(SUSPEND_TBR_RENEW_BELOW_MINUTES).msecs()) return
+            if (remainingMs != null && remainingMs > T.mins(SUSPEND_TBR_RENEW_BELOW_MINUTES).msecs()) {
+                suspendRecordExpiryMs = ourSuspendRecord.timestamp + ourSuspendRecord.duration
+                return
+            }
 
             val synced = pumpSync.syncTemporaryBasalWithPumpId(
                 timestamp = dateUtil.now(),
@@ -362,6 +401,7 @@ class YpsoService : DaggerService() {
                 pumpType = PumpType.YPSOPUMP,
                 pumpSerial = pumpSerial()
             )
+            suspendRecordExpiryMs = dateUtil.now() + T.mins(SUSPEND_TBR_MINUTES).msecs()
 
             if (remainingMs != null) {
                 // Still the same suspension, just topped up. Not news, and not a second alarm:
@@ -386,6 +426,7 @@ class YpsoService : DaggerService() {
         // Delivering again. Close only a record this driver opened — a real temporary basal has a
         // different type and duration, and closing one would tell AAPS basal resumed when it had not.
         rxBus.send(EventDismissNotification(Notification.PUMP_SUSPENDED))
+        suspendRecordExpiryMs = null
         if (ourSuspendRecord == null) return
         val stopped = pumpSync.syncStopTemporaryBasalWithPumpId(
             timestamp = dateUtil.now(),
@@ -435,7 +476,16 @@ class YpsoService : DaggerService() {
             LTag.PUMP,
             "[ypso-state] byte0=${status.deliveryModeRaw} name='${status.deliveryModeName}' mode=${status.operatingMode} " +
                 "delivering=${status.isDelivering} " +
-                "suspendRecord=${suspendRecord?.let { "open since ${dateUtil.dateAndTimeString(it.timestamp)}" } ?: "none"} " +
+                "suspendRecord=${
+                    suspendRecord?.let {
+                        // The minutes left are what make a line from the *middle* of a run readable.
+                        // `open` alone is true on both sides of a hole; a figure that counts down
+                        // 60 → 40 → 60 and never approaches zero is what a held record looks like,
+                        // and one line says so without arithmetic across the run.
+                        "open since ${dateUtil.dateAndTimeString(it.timestamp)} " +
+                            "(${((it.timestamp + it.duration) - dateUtil.now()) / 60000}min left of ${it.duration / 60000})"
+                    } ?: "none"
+                } " +
                 "rate=${status.activeBasalRate}U/h tbr=${status.activeTbr?.let { "${it.percentage}% ${it.remainingMinutes}min" } ?: "none"} " +
                 "reservoir=${status.reservoirUnits ?: "unknown"} " +
                 "raw=[${status.rawStatusHex}]"

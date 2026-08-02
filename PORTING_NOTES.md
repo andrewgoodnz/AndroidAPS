@@ -29,7 +29,10 @@ window when nothing has moved cut a quiet poll to **~580 ms**, verified in Phase
 **Two things stand between here and an insulin trial, and neither is a capability:**
 
 1. **6b's renewal fix has never run.** The overnight test was on a pre-fix build, so it reproduced
-   the defect and proved nothing about the repair (§8.6).
+   the defect and proved nothing about the repair (§8.6). The re-run now has an instrument that can
+   fail — a `[ypso-suspend] LAPSED` line and minutes-remaining on every state line — and a procedure
+   with its own denominator, in `SALINE_TEST_PROCEDURE.md` **6b-RERUN**. It needs a human, a stopped
+   pump and three unattended hours.
 2. **The 3000-entry log cap now has a date on it** — roughly three months at this user's rate of
    profile changes. What happens when it wraps is now traced rather than guessed at, and the probe
    makes it audible instead of silent (§8.5).
@@ -2033,6 +2036,30 @@ check look like if the thing it watches for had happened?**
 **Fourth variant of one bug.** Not written; written but never re-asserted; re-asserted but closed by
 an automatic cancel; renewed only after a gap. Each fix correct, each leaving another route to the
 same wrong belief, and none of them the pump.
+
+##### ✅ The check that can fail — added 2026-08-03, before the re-run
+
+The re-run needed an instrument, because the pre-fix run had shown that the obvious one reports a
+pass through a hole. Two additions, both read-only:
+
+- **`suspendRecordExpiryMs`**, one field carried between polls, holding when the record observed at
+  the previous poll was due to expire. If a stopped poll finds no open record *and* that field is
+  set, the record lapsed, and the width is `now − expiry` rather than an inference. It logs at error
+  as `[ypso-suspend] LAPSED`. This fires **before** the replacement is opened, which is the ordering
+  the old check got wrong.
+- **Minutes remaining on the `[ypso-state]` line.** `suspendRecord=open` is true on both sides of a
+  hole; `open since 2:30:12 am (41min left of 60)` is not. A held record sawtooths 60 → 40 → 60 and
+  never approaches zero, so **one line from the middle of a run** answers the question. That matters
+  because a record that lapses partway reads as a pass from either end.
+
+The mode-`UNKNOWN` branch clears the watch deliberately: no record is maintained in that state by
+design, so an expiry there is not this failure and reporting it as one would train the reader to
+ignore the line.
+
+`SALINE_TEST_PROCEDURE.md` **6b-RERUN** is the procedure, and it names its own denominator: an empty
+`LAPSED` grep is evidence only if `renewed the 0% basal` appears at least twice, or the run never
+reached an expiry and the empty result means nothing. That guard is there because four checks in
+this file have now passed on inputs that could not have made them fail.
 
 **And one thing the pattern does not require, but this pump does.** `isDelivering` is false both for
 "confirmed stopped" and for "delivery mode never identified" — right for gating the loop, where the
