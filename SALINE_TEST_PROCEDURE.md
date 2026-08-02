@@ -5,16 +5,20 @@ which records what the pump has actually been observed to do.
 
 ## ⏳ Everything still to run — read this first
 
-As of 2026-08-02, **all four delivery phases have passed, Phase 5 is answered except two rows,
-Phase 6 has passed all six steps, and Phases 7 and 7f have passed in full.** History sync is
+As of 2026-08-03, **all four delivery phases have passed, Phase 5 is answered except two rows,
+Phase 6 has passed five of six steps, and Phases 7 and 7f have passed in full.** History sync is
 **on by default**, and a quiet poll costs ~580 ms rather than 20 s. What remains is observation, not
-capability.
+capability — with one exception, and it is first in the list below.
+
+⚠ **6b is the exception, and it was previously recorded here as passed.** It was not: the run that
+"passed" it was on a build committed before the fix, and the criterion it passed could not have
+failed for any input. It is now written as **6b-RERUN**, with an instrument that can fail.
 
 **Still to run, most valuable first:**
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
-| A | **Phase 6b re-confirm — the renewal fix** | ⚠ **Still unverified.** The overnight run of 08-01→02 was on a **pre-fix build** (`fca883077c` landed 08:46 on 08-02, the pump restarted at 08:49), so it reproduced the defect and tested nothing. **Do not test it by checking that every poll reads `suspendRecord=open`** — that check passed across a run containing two real gaps. Read `duration` out of `temporaryBasals`: pre-fix it is exactly 60.00 min every time, with the fix it should be ~40. **Opportunistic** — fold it into the next time the pump is stopped for other reasons | **Phase 6b**, §8.6 |
+| A | **6b-RERUN — the renewal fix** | ⚠ **Still unverified, and it is the last correctness gate before insulin.** The overnight run of 08-01→02 was on a **pre-fix build** (`fca883077c` landed 08:46 on 08-02, the pump restarted at 08:49), so it reproduced the defect and tested nothing. The procedure is now written for the fixed build and the driver has an instrument that can fail: a `[ypso-suspend] LAPSED` line, and minutes-remaining on every `[ypso-state]` line. **Do not test it by checking that every poll reads `suspendRecord=open`** — that check reported zero across a run containing two real gaps. Needs a stopped pump and **3 unattended hours** | **6b-RERUN**, §8.6 |
 | B | **Fix `insertAnnouncement`'s dedupe key** | It keys on `now()`, not `pumpId`, so it is the one sync path that is not idempotent. The watermark currently hides it. Worth fixing on its own terms rather than depending on the thing that hides it | §8.5 |
 | C | **Phase 5c — cartridge out and priming** | The last two delivery-mode states never read. **Free at your next cartridge change** if you press Refresh while the cartridge is out and again while priming | **Phase 5c**, §8.3 |
 | D | **Phase 5e — reservoir empty mid-delivery** | Never seen. The pump does alert (`104 Cartridge Empty`, 37 in the log), but what byte 0 reads at that moment is unknown | **Phase 5e**, §8.3 |
@@ -1188,8 +1192,14 @@ apart**, and 6e's observation is recorded whatever it turned out to be.
 passed across a 13h40 run containing two twenty-minute gaps, because the record is renewed before the
 line is written. A phase is only passed by a check that could have failed.
 
-**Status: all six confirmed** on 2026-08-01/02. 6b failed first, was fixed the next morning, and its
-re-confirm is opportunistic (see the to-run table at the top).
+**Status: five of six confirmed** on 2026-08-01/02. 6a, 6c, 6d, 6e and 6f stand.
+
+⚠ **6b does not, and this line used to say "all six".** It failed, was fixed the next morning, and
+the fix has never been exercised — the only long run was on a build committed three minutes before
+the pump restarted onto it. Recording that as a pass turned "fixed" into "confirmed" without
+anything in between, which is the same substitution the criterion above warns about, made about the
+phase rather than inside it. **6b-RERUN is required, and it is not opportunistic**: it is the last
+correctness gate before an insulin trial.
 
 ---
 
