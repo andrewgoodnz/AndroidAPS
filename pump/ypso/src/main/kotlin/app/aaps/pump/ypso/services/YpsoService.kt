@@ -313,9 +313,12 @@ class YpsoService : DaggerService() {
      *
      * ⚠ **An unrecognised delivery mode does not open this record**, and that distinction is the
      * whole reason [PumpStatus.operatingMode] is a three-valued thing rather than `isDelivering`.
-     * Only two of 256 byte-0 values have ever been identified (§8.3), and nobody has looked at what
-     * the pump reports *during a bolus*. If that turns out to be a third value, treating unknown as
-     * stopped would open a spurious suspend record on every single bolus.
+     * Only two of 256 byte-0 values have ever been identified (§8.3) — but that is now the answer
+     * rather than a gap: every state reachable on hardware came back as one of the two, a bolus
+     * included (it reads `10`), and there is no pause state on this pump at all. The rule stands
+     * anyway, because it costs nothing and cartridge-out and reservoir-empty have still not been
+     * read; if either turns out to be a third value, treating unknown as stopped would open a
+     * spurious suspend record.
      *
      * `isSuspended()` still reports true for an unknown mode, so the **loop** stays conservative and
      * refuses to act. That costs nothing and reverses instantly. Writing a therapy record is a claim
@@ -717,7 +720,7 @@ class YpsoService : DaggerService() {
      *
      * Always produces a human-readable dump for the firmware parity check. Writing the events
      * into AAPS treatment records is gated behind [YpsoBooleanKey.YpsoSyncHistoryToAaps] — see
-     * that key's comment for why it defaults to off.
+     * that key's comment for where that switch now stands.
      */
     fun loadHistory(): Boolean = awaitResult("loadHistory", false) {
         val count = preferences.get(YpsoIntKey.YpsoHistoryReadCount)
@@ -1066,9 +1069,10 @@ class YpsoService : DaggerService() {
                 //
                 // The pump's sequence number is preferred as the id, so this stop and a later
                 // history sync of the same event agree. When the log gives us nothing, the
-                // timestamp stands in — a possible future dedupe collision on a sync switch that
-                // is off (and that needs rework anyway now the entry is known to mutate) is a far
-                // smaller problem than a temporary basal AAPS thinks is still running.
+                // timestamp stands in — a possible dedupe collision is a far smaller problem than a
+                // temporary basal AAPS thinks is still running. That trade was priced while the
+                // sync switch was off; it is on now, so the collision is reachable rather than
+                // hypothetical, and this wants rework anyway since the entry is known to mutate.
                 val sequence = result.pumpSequence
                 val endPumpId = sequence ?: dateUtil.now()
                 // Only a mismatch worth warning about: AAPS held an id for a running temporary basal

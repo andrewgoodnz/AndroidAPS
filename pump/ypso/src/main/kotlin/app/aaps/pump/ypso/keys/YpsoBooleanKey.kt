@@ -28,13 +28,23 @@ enum class YpsoBooleanKey(
     YpsoLegacyAuthSalt("ypso_legacy_auth_salt", false),
 
     /**
-     * Write pump history into AAPS treatment records.
+     * Write pump history into AAPS treatment records — above all a bolus given on the pump's own
+     * menu, which nothing else here would ever see.
      *
-     * Off by default, deliberately: the pumpId used for de-duplication is the pump's history
-     * slot index, and it is not yet confirmed on hardware that those indices are stable rather
-     * than reused ring-buffer slots. Turning this on before that is settled risks duplicated or
-     * silently-merged boluses, which is an IOB error. Read the history first, compare the dump
-     * against the pump screen, then enable.
+     * **This comment used to say the pumpId was the history slot index and that its stability was
+     * unconfirmed. Both are out of date.** `pumpId` carries the pump's own **sequence number**
+     * (§5) precisely because the slot index *is* a reused ring-buffer position — index 0 is the
+     * newest entry, so every new event renumbers every older one. Using it would have merged or
+     * rejected boluses silently.
+     *
+     * Validated on hardware 2026-08-02, `SALINE_TEST_PROCEDURE.md` Phase 7: the first enable takes
+     * a baseline and imports nothing, a manual bolus arrives exactly once, an AAPS bolus stays one
+     * record across re-reads, and a 24-entry profile burst reaches no treatment.
+     *
+     * **Still `false` here**, which is a decision about fresh installs rather than about this pump:
+     * 7e — leave it running and look for treatments with no cause — had not finished when this was
+     * written. Turn it over once it has. Note the cost first: the sync adds ~20 s to every status
+     * read, which §8.5 says has to come down before this driver can drive a loop.
      */
     YpsoSyncHistoryToAaps("ypso_sync_history_to_aaps", false),
 

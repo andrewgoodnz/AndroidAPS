@@ -5,18 +5,16 @@ which records what the pump has actually been observed to do.
 
 ## ⏳ Everything still to run — read this first
 
-As of 2026-08-02, **all four delivery phases have passed, Phase 5 is answered except two rows, and
-Phase 6 has passed all six steps** — 6b found a real defect overnight, which is fixed and wants
-re-confirming opportunistically rather than on purpose. The single largest thing left is **Phase 7**,
-history sync — the switch that turns pump history into insulin on board. It should have a session to
-itself.
+As of 2026-08-02, **all four delivery phases have passed, Phase 5 is answered except two rows,
+Phase 6 has passed all six steps, and Phase 7 has passed 7a–7d with 7e running.** History sync is
+**switched on**. What remains is observation and one performance decision, not capability.
 
 **Still to run, most valuable first:**
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
-| A | **Phase 7 — switch history sync on, with someone watching** | ⚠ Built, never enabled. The first sync must import **nothing** — it only records where to start. If treatments appear, the baseline is wrong and that is phantom IOB | **Phase 7**, §8.5 |
-| B | **Phase 6b re-confirm — the renewal fix** | ⚠ **Do not test this by checking that every poll reads `suspendRecord=open`** — that check passed across a run containing two real gaps. Compare consecutive record start times: with the fix, `renewed the 0% basal` should appear every ~40 min and no two starts should be more than ~40 min apart. **Opportunistic** — fold it into the next time the pump is stopped for other reasons; the exposure does not justify a dedicated night | **Phase 6b**, §8.6 |
+| A | **Phase 6b re-confirm — the renewal fix** | ⚠ **Still unverified.** The overnight run of 08-01→02 was on a **pre-fix build** (`fca883077c` landed 08:46 on 08-02, the pump restarted at 08:49), so it reproduced the defect and tested nothing. **Do not test it by checking that every poll reads `suspendRecord=open`** — that check passed across a run containing two real gaps. Read `duration` out of `temporaryBasals`: pre-fix it is exactly 60.00 min every time, with the fix it should be ~40. **Opportunistic** — fold it into the next time the pump is stopped for other reasons | **Phase 6b**, §8.6 |
+| A2 | **Split the history read window, then re-measure** | ⚠ The sync costs **20.4 s on every connection** — double what §8.5 assumed, because both logs are read at 50. Half of it is re-reading alerts from 2019. This is the one thing standing between the driver and SMB-rate looping | §8.5 |
 | C | **Phase 5c — cartridge out and priming** | The last two delivery-mode states never read. **Free at your next cartridge change** if you press Refresh while the cartridge is out and again while priming | **Phase 5c**, §8.3 |
 | D | **Phase 5e — reservoir empty mid-delivery** | Never seen. The pump does alert (`104 Cartridge Empty`, 37 in the log), but what byte 0 reads at that moment is unknown | **Phase 5e**, §8.3 |
 | E | **Reconnect mid-bolus** | Pull BLE range during a 2 U bolus. The pump finishes regardless; what is untested is whether AAPS's *record* settles. A provisional record goes in before sending and `ReconnectManager` chases the link back, armed for the bolus only | §4g |
@@ -26,6 +24,13 @@ itself.
 | I | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
 | J | **Restore a profile you care about** | A write you cannot reverse is not finished | Phase 4 |
 | K | **The extended bolus** | Still refused. Out of scope until the standard bolus has soaked | — |
+
+**Closed on 2026-08-02, no longer on the list:**
+
+| Was | Outcome |
+|---|---|
+| **Phase 7 — switch history sync on, with someone watching** | ✅ **7a–7d passed, sync is ON.** The first enable took a baseline of 160658 and imported nothing; a manual bolus arrived once at the right amount and time; an AAPS bolus stayed one record; a 24-entry burst reached no treatment. 7e was still running when this was written |
+| **The log cap — what happens at 3000 entries** | ⏳ **Still open, and now dated.** A profile percentage change for exercise rewrites all 24 slots and reverting costs another 24 — ~48 entries per episode, 4–5× a week, so ~200–240 a week against a 3000-entry log. That is a wrap in roughly **three months**, not a theoretical concern. If sequences restart there, a monotonic watermark stops being sound |
 
 **Closed on 2026-08-01, no longer on the list:**
 
@@ -915,6 +920,28 @@ grep "recorded a 0% basal\|renewed the 0% basal" AndroidAPS.log
 With the fix in place, renewals should now appear roughly every **40 minutes** (`renewed the 0%
 basal with ~20 min left`) and consecutive record starts should never be more than ~40 min apart.
 
+**⚠ Better still, measure it in the database rather than the log** — added 2026-08-02, after the
+overnight run above was re-derived from `androidaps.db` and matched the log analysis exactly
+(19m48s and 19m59s, same two cycles). The durable signature does not depend on a log line existing:
+
+```sql
+select timestamp, duration from temporaryBasals
+where isValid=1 and referenceId is null and type='PUMP_SUSPEND' order by timestamp;
+```
+
+**Before the fix, every record's `duration` is exactly 60.00 min** — it ran its full course and the
+successor opened 0.1–4.2 s *after* it expired, so the record lapsed at every single boundary and
+twice lapsed for a full poll. **With the fix, renewal happens at ~40 min, so AAPS truncates the
+running record** and durations should read **≈40 min, not 60.00**, with starts ~40 min apart.
+
+A run whose records all read `duration = 3600000` is a run **without** the fix, whatever the log
+says. That is a check that can fail, which the `suspendRecord=open` one could not.
+
+**⚠ The overnight run of 2026-08-01→02 was on a pre-fix build and the fix is still unverified.**
+`fca883077c` was committed at **08:46 on 2026-08-02**; the pump was restarted at **08:49:20** and ran
+for the rest of the session. Every record in that run reads `duration = 60.00 min`. The overnight
+data reproduces the defect faithfully and says **nothing** about whether the fix works.
+
 ### 6b — the original procedure
 
 This is the check that the `StateFlow` conflation fix was for: a stopped pump reports identical
@@ -1056,7 +1083,25 @@ three sessions (`PORTING_NOTES` §8.5). Do it with someone watching and nothing 
 **Before starting:** run Phases 5 and 6. Do not enable this on a session where anything else is
 being changed.
 
-### 7a. First enable takes a baseline and imports nothing
+### 7a. First enable takes a baseline and imports nothing ✅ **PASSED 2026-08-02**
+
+> **Predicted before the run, from a history dump taken first: baseline must be 160658.** It was.
+>
+> ```
+> 13:06:35 History sync: starting, watermark=unset (-1)
+> 13:06:57 read 50 event(s) seq 160490..160658, 50 alert(s) seq 108154..160625,
+>          88 of them mapped — in 21397 ms (213 ms/entry)
+> 13:06:57 no watermark yet, so taking sequence 160658 as the baseline and importing nothing
+> ```
+>
+> The watermark was genuinely unset: `ypso_last_synced_sequence` was **absent from the preferences
+> file entirely**, checked before the run, so this was a first enable and not a repeat.
+>
+> **Confirmed against the database, not the log.** Treatments 11 before and after, matching the
+> tester's count; nothing created in any table. And the check that could have failed: `seq 160492`
+> holds **4.0 U in AAPS against `v1=249` → 2.49 U in the pump's log** (an early abort, recorded
+> high). `syncBolusWithPumpId` is an upsert that rewrites the amount, so an import over that range
+> would have pulled 4.0 down to 2.49. It still reads 4.0 — nothing was touched.
 
 ⚠ **The moment a baseline bug would surface as phantom IOB.** If the watermark is missing, the
 driver must record where to start and import *nothing* — otherwise the pump's recent history becomes
@@ -1079,7 +1124,25 @@ History sync: no watermark yet, so taking sequence <N> as the baseline and impor
   and record what appeared — that is the failure this step exists to catch.
 - `<N>` should be close to the newest sequence in a **Read history** dump taken just before.
 
-### 7b. A bolus given on the pump's own menu reaches AAPS
+### 7b. A bolus given on the pump's own menu reaches AAPS ✅ **PASSED 2026-08-02**
+
+> A 1.5 U bolus on the pump's own menu, 13:17.
+>
+> ```
+> 13:17:49 importing BolusDelivered seq=160661 at 2/08/26 01:16:59 pm
+> 13:17:49 imported 1 event(s) above 160658; watermark 160658 -> 160661
+> ```
+>
+> Twenty-one entries were logged as **considered and skipped** below the watermark, and exactly one
+> taken — the distinction the old logging could not make.
+>
+> Database: one row, `id=17 ts=13:16:59.000 1.5 U pumpId=160661 ver=0`. Count 11 → 12. **IOB moved
+> −0.04 → 1.47**, a swing of 1.51 for a bolus a minute old — the amount arriving through a consumer
+> that cares about it, not a number in a log line.
+>
+> **Second refresh:** `skipping BolusDelivered seq=160661 — at or below watermark 160661`,
+> `imported 0`. The row stayed at **version 0**, so it was not merely left correct, it was never
+> written to.
 
 The gap this whole feature exists for: until now a manual bolus was invisible to the loop, so IOB
 was under-stated and AAPS would dose on top of insulin already delivered — the stacking direction.
@@ -1096,7 +1159,28 @@ was under-stated and AAPS would dose on top of insulin already delivered — the
 - IOB moves by roughly 1.5 U.
 - Press Refresh again. It must still be **one** bolus, not two.
 
-### 7c. A bolus from AAPS is not duplicated when the sync re-reads it
+### 7c. A bolus from AAPS is not duplicated when the sync re-reads it ✅ **PASSED 2026-08-02 — moved 6.455 s**
+
+> A 1.0 U bolus from AAPS. AAPS keeps every prior version of a row, so the whole lifecycle is on
+> record and the move is measurable to the millisecond rather than by eye:
+>
+> | version | timestamp | amount | pumpId | written |
+> |---|---|---|---|---|
+> | 0 | 13:26:23.079 | 1.0 U | — | provisional, before sending |
+> | 1 | 13:26:27.455 | 1.0 U | 160662 | settled, phone's clock |
+> | 2 | **13:26:21.000** | 1.0 U | 160662 | history sync, pump's clock |
+>
+> **One row throughout** — 0 and 1 are history rows against `id=18`, not separate treatments — and
+> the amount never left 1.0 U. Second refresh imported 0.
+>
+> **⚠ The 6.455 s is not a clock measurement, and the ten-second criterion above is unsound.**
+> Decomposed: measured skew **−2347 ms**, and the bolus took **≈4.3 s** to deliver (1.0 U at
+> 12 U/min). The pump's entry lines up with the **send**, not the completion — so the delta is
+> delivery duration plus skew, and it **scales with bolus size**. A 10 U bolus takes ~50 s, so it
+> would move ~52 s and trip this check with a perfectly healthy clock. Judge the clock by the
+> `Pump clock is …ms from the phone's` line, which is now logged below the threshold as well as
+> above it. Treat "the pump timestamps at the start" as one clean observation, not settled: the
+> older `seq 160492` record does not fit it neatly, but that is different code and an unknown skew.
 
 The skip list that used to protect this was **removed** (§8.5): the sync upserts on `pumpId`, and
 the pump's sequence is the `pumpId` both at delivery time and at sync time, so the same bolus
@@ -1115,12 +1199,47 @@ resolves to one record by identity rather than by exclusion.
   ten seconds means the clock correction is not doing its job, since the driver now resyncs the
   pump's clock whenever drift exceeds 10 s.
 
-### 7d. The 24-entry burst from a profile write
+### 7d. The 24-entry burst from a profile write ✅ **PASSED 2026-08-02 — 20.4 s per sync**
 
-One basal profile write appends **24 entries** (§4i). The read window is 50, so it should fit —
-but this is the closest thing to an overflow the driver can produce on demand.
+> **⚠ Step 1 below is wrong as written and would have tested nothing.** The pump logs one type-7
+> entry **per changed slot**, not one per slot — so re-writing the profile the pump already holds
+> appends **zero** entries. That is exactly what happened at 09:27 when AAPS re-pushed the active
+> profile after a reinstall: `writeBasalProfile: confirmed=true` and nothing in the log. Had 7d been
+> run as written, it would have passed while producing no burst at all — a fourth check that could
+> not fail.
+>
+> **Run it with a profile that differs in every slot.** Done here with a flat **0.35 U/h** against
+> a pump holding `[0.10, 0.15, 0.02, 0.25, 0.30×5, 0.05×15]`:
+>
+> ```
+> 13:32:52 read 50 event(s) seq 160581..160686, 50 alert(s) seq 108154..160625 — in 19940 ms
+> 13:32:52 gap check against watermark 160662 — events newest=160686 oldest=160581 -> 0 missed
+> 13:32:52 importing BasalRateChanged seq=160663 … 160686        (24 of them)
+> 13:32:52 No PumpSync mapping for BasalRateChanged seq=160663, skipped        ×24
+> 13:32:52 imported 24 event(s) above 160662; watermark 160662 -> 160686.
+>          Took 20407 ms for 100 entr(ies) (read 19940 ms, import 158 ms)
+> ```
+>
+> All four criteria met, and repeated on a second write (flat 0.15 U/h, `seq 160687..160710`).
+> Database: bolus, TBR, therapy-event and carb counts all unchanged. The only new rows were
+> `profileSwitches` and `effectiveProfileSwitches`, written by the profile activation **before** the
+> sync ran — AAPS's own bookkeeping, not the sync's.
+>
+> **Headroom, measured rather than assumed.** After the burst the event window spans 160581–160686:
+> 24 of its 50 slots are new, leaving **26 entries of margin** below the watermark. Two 24-entry
+> writes between one pair of polls would just fit; three would not.
+>
+> **⚠ Elapsed: 20.4 s per sync, not the ~10 s §8.5 predicted** — five syncs measured, 19.9–21.4 s,
+> ~200 ms/entry. §8.5 costed one 50-entry window; the driver reads **two**. See §8.5 for what that
+> means for SMB-rate looping and the cheap way out.
+
+One basal profile write appends **up to 24 entries** — one per slot that actually changes, and none
+at all if the profile written matches the one the pump holds (§5). The read window is 50, so a full
+burst should fit, and this is the closest thing to an overflow the driver can produce on demand.
 
 1. Write a basal profile from AAPS (Phase 4's procedure, and put the original back afterwards).
+   ⚠ **It must differ from the pump's current profile in every slot** — see the result above. A flat
+   rate that appears nowhere in the current profile is the easy way to guarantee that.
 2. Press **Refresh**.
 
 **Confirm:**
@@ -1137,16 +1256,42 @@ alert logs, where the alert log always reaches back years, so it answered zero f
 input. It is now measured per log. That means 7d is the first time it has ever been able to fire,
 so a quiet run here is worth something it was not worth before.
 
-### 7e. Leave it running and look again
+### 7e. Leave it running and look again ⏳ **RUNNING 2026-08-02**
 
 Leave the preference on with the pump idle for **an hour or two**, then check Treatments for
 anything that appeared without a cause. Phantom IOB is the failure mode, and it is quiet.
 
+**⚠ Two causes that are not the driver**, and both have produced exactly this signature before:
+Nightscout enacts inbound commands on the research pump (a 0% TBR for 120 minutes appeared
+mid-session once), and the Lotus study phone writes the basal profile the moment it wakes. Check
+both before calling anything phantom.
+
+### Phase 7 results — 2026-08-02
+
+| Step | Verdict | The number |
+|---|---|---|
+| 7a first enable imports nothing | ✅ **PASS** | baseline **160658**, predicted before the run |
+| 7b manual bolus arrives once | ✅ **PASS** | 1.5 U at 13:16:59, IOB −0.04 → 1.47 |
+| 7c AAPS bolus not duplicated | ✅ **PASS** | timestamp moved **−6.455 s**, of which ~4.3 s is delivery time and 2.35 s is skew |
+| 7d 24-entry burst | ✅ **PASS** | 24 imported, 0 to treatments, no gap, **20.4 s** per sync |
+| 7e nothing appears unbidden | ⏳ running | — |
+
+**`YpsoSyncHistoryToAaps` is ON** as of 2026-08-02 (`PORTING_NOTES` §8.5).
+
+Three things the run found that the procedure had wrong, all of the same shape — a check whose
+inputs nobody had examined:
+
+1. **7d as written could not fail.** A profile write only logs *changed* slots, so re-writing the
+   profile already on the pump appends nothing.
+2. **7c's ten-second threshold conflates two things.** The delta is delivery duration plus clock
+   skew, and it scales with bolus size.
+3. **6b's overnight run was on a pre-fix build**, so the renewal fix remains unverified.
+
 ### Phase 7 is passed when
 
 7a imports nothing, 7b's manual bolus arrives exactly once at the right amount and time, 7c stays
-at one record with the timestamp moving less than ten seconds, 7d is quiet, and 7e finds nothing
-unexplained.
+at one record with the timestamp moving less than ten seconds **once delivery duration is
+subtracted**, 7d is quiet, and 7e finds nothing unexplained.
 
 **If any of them fails, turn `YpsoSyncHistoryToAaps` back off** before doing anything else. It is a
 preference precisely so that it can be switched off in one action.
