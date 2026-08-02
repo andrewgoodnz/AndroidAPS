@@ -1749,8 +1749,19 @@ none of them was, was a pump problem.
 7. **Bolus and basal caps.** Event types 33 and 34 exist for them. Whether the pump refuses an
    over-cap bolus, and what the driver then reports, is untested — and "the pump refused" must not
    surface as success.
-8. **Extended and combined bolus.** Still refused by the driver. Out of scope until the standard
-   bolus has soaked, but they are two of the four bolus types the history mapper already decodes.
+8. **Extended and combined bolus.** Still refused, but no longer unscoped — **`SALINE_TEST_PROCEDURE.md`
+   Phase 8 is written**, 2026-08-03, before any code. The motivation is **comfort on large boluses**:
+   the pump delivers at a fixed ~33 U/min (§8.6), so 10 U goes in over 18 s where other pumps take
+   minutes. The mechanism already exists — `startBolus` takes `durationMinutes` and sets
+   `bolusType = 2`, so **what is missing is the gate, not the driver**. Two things the phase settles
+   before anything is advertised: whether an extended bolus **blocks the command queue for its whole
+   duration** (it would, if the pump reports busy rather than programmed — 8a, and a stop condition),
+   and whether it reaches AAPS in `extendedBoluses` rather than `boluses`, since the two have
+   different IOB decay. `cancelExtendedBolus` ships in the same change, deliberately breaking the
+   one-refusal-at-a-time rule, because `LoopPlugin.goToZeroTemp` calls `cancelExtended` on every pump
+   disconnect and a refusing cancel raises an audible delivery-error alarm. Sub-minute durations were
+   considered and rejected: 1 min on a 10 U bolus is still 10 U/min, so it answers a question comfort
+   does not ask. They remain two of the four bolus types the history mapper already decodes.
 9. **The event log filling or wrapping.** The count reads 3000 and looks capped. What happens to
    sequence numbers at the cap decides whether `sincePosition` can work at all (§8.5).
 10. **A DST transition.** `pumpSecondsToUnix` converts through a local calendar and is tested across

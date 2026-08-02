@@ -28,7 +28,7 @@ failed for any input. It is now written as **6b-RERUN**, with an instrument that
 | H | **A bolus while a TBR runs** | Never tried together; both are identified by sequence | — |
 | I | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
 | J | **Restore a profile you care about** | A write you cannot reverse is not finished | Phase 4 |
-| K | **The extended bolus** | Still refused. Out of scope until the standard bolus has soaked | — |
+| K | **The extended bolus** | ⚠ Still refused, and **now scoped**: the goal is comfort on large boluses, because the pump delivers at a fixed ~33 U/min so a 10 U bolus goes in over 18 s. The wire format already carries it (`duration > 0, type=2`) and `YpsoBleManager.startBolus` implements it — what is missing is the gate, not the code. **Procedure written: Phase 8.** Do 6b first | **Phase 8**, §8.6 |
 
 **Closed on 2026-08-02, no longer on the list:**
 
@@ -1577,3 +1577,186 @@ is a statement that the shipped build is ready, and it should not be made about 
 unverified sync logic.
 
 ✅ **All three passed 2026-08-02, and the default was flipped to `true` the same day.**
+
+---
+
+# Phase 8 — the extended bolus ⏳ **NOT STARTED**
+
+**Written 2026-08-03, before any code, which is the rule this file keeps for itself.** Four of the
+checks in these notes initially "passed" against a test that could not have failed, and every one of
+them was written *after* the thing it was checking. This phase exists on paper first so that its
+acceptance criteria were chosen while nobody was under pressure to accept a weaker one.
+
+## Why this exists, and what it is not
+
+**The goal is comfort on large boluses**, and nothing else. The pump delivers at a fixed **~33 U/min**
+(measured, §8.6), so a 10 U bolus goes in over 18 seconds. Other pumps' normal speed is 1.5–3 U/min —
+Omnipod delivers 0.05 U every 2 s. An extended bolus is the pump's own mechanism for that, and it is
+already in the wire format:
+
+```
+totalScaled(4B) + durationMinutes(4B) + immediateScaled(4B) + bolusType(1B)
+bolusType = 1 for a standard bolus (duration == 0), 2 for extended/multiwave
+```
+
+`YpsoBleManager.startBolus` already implements it. What refuses is
+`YpsoPumpManagerImpl.deliverExtendedBolus`, one layer above BLE. **So this phase opens a gate; it
+does not write a driver.**
+
+**⚠ This is not a loop capability and must not become one.** `isFakingTempsByExtendedBoluses` stays
+**false**. Nothing here is for emulating a temporary basal, and the SMB algorithm is not to be handed
+a new delivery channel on the strength of a comfort feature.
+
+**Sub-minute durations were considered and rejected.** A 1-minute extended bolus of 10 U is 10 U/min,
+still three times faster than the pumps whose speed people call comfortable, so it answers a question
+comfort does not ask. AAPS's existing 15-minute duration step gives 0.67 U/min on a 10 U bolus, which
+is already gentler than Omnipod. **The granularity is not the problem and does not need changing.**
+
+## Before starting
+
+- **Phase 6b's re-run must have passed.** Adding a delivery capability ahead of it means the last
+  correctness gate gets run against a driver that changed underneath it.
+- Saline, off-body, cannula to air. Full cartridge — this phase delivers repeatedly.
+- The study phone off; NSClient uploading off (§0).
+- ⚠ **Do not enable the multiwave/combined bolus in the same change.** It is a separate refusal and
+  gets its own gate. One at a time, as always.
+
+## 8a. The queue-blocking question — **do this first, and stop if it fails**
+
+**The question:** `deliverBolus` waits for the pump's `BolusStatus` to reach `Idle`, and the AAPS
+command queue is blocked behind that call for its whole duration (§8.3). If an extended bolus reports
+busy for its full programmed duration, then **a 15-minute extended bolus blocks the queue for 15
+minutes** — no status read, no temporary basal, no alert check, nothing. That would be a far worse
+regression than the feature is worth, and it is a property of the pump nobody can predict.
+
+**The cheapest possible exposure: 1 U over 1 minute.**
+
+1. Note the time. Send an extended bolus of **1 U over 1 min**.
+2. **While it is running, press Refresh on the YPSO tab.**
+3. Watch the log for `Pump bolus status reached Idle`, and for whether the Refresh produced an
+   `[ypso-state]` line.
+
+**Confirm:**
+
+| Outcome | What it means |
+|---|---|
+| `Idle` within a few seconds, and the Refresh gets through | ✅ The pump reports the bolus as *programmed*, not *running*. Continue |
+| `Idle` only at ~60 s, and the Refresh lands after it | ❌ **Stop.** The queue is blocked for the duration. The driver must return once the pump has accepted the command, and that is a design change to `deliverBolus`, not a test result |
+
+⚠ **A one-minute duration is short enough that both outcomes look similar if you only watch the
+ends.** Record three timestamps — the Refresh press, the `[ypso-state]` line it produced, and
+`reached Idle`. **Their ordering is the answer**, not any one of them.
+
+## 8b. Does the pump actually spread the delivery? — **read the MIDDLE**
+
+**The question:** whether `duration` changes anything, or the pump accepts it and delivers at
+33 U/min anyway.
+
+1. Reservoir reading before. **5 U over 15 min.**
+2. Press Refresh at roughly **2, 5, 8 and 12 minutes** and record the reservoir each time.
+3. Reservoir reading after.
+
+**Confirm:** the reservoir falls **gradually** — roughly 0.33 U/min, so about 1.7 U gone at 5 minutes
+and 4 U at 12.
+
+⚠⚠ **This is the check most likely to be written so that it cannot fail, and its failure mode is 6b's
+exactly.** Before and after readings alone are *identical* for an extended bolus and for an immediate
+one — both end 5 U down. **Only the middle distinguishes them.** A test that reads the ends and
+reports a pass has measured that 5 U left the cartridge, which was never in question.
+
+This is the same evidence §8.3 used to prove the bolus probe was live: the reservoir in the payload,
+partway through, sitting between the start and end figures.
+
+## 8c. What it logs, and whether it reaches AAPS as the right kind of record
+
+1. After 8b, press **Read history** and record every entry the extended bolus produced — `seq=`,
+   `type=`, `v1=`, `v2=`.
+2. Query the database, not the log — §5c-ii's lesson, where `insertTherapyEvent` logged nothing on
+   its success path and only the database could tell one record type from another:
+
+```sql
+select datetime(timestamp/1000,'unixepoch','localtime') ts, amount, duration, pumpId, isValid
+from extendedBoluses order by timestamp desc limit 5;
+
+select datetime(timestamp/1000,'unixepoch','localtime') ts, amount, type, pumpId
+from boluses order by timestamp desc limit 5;
+```
+
+**Confirm:** it lands in **`extendedBoluses`**, not in `boluses`. The two have different IOB decay
+models, and an extended bolus recorded as a normal one over-states insulin action early and
+under-states it late — a silent, persistent IOB error of the same class as the `pumpId` question
+Phase 7 existed to settle.
+
+**Record whichever it is**, because `YpsoHistoryMapper` decodes four bolus types and which one the
+pump uses here decides whether the **history sync** re-imports it correctly on the next poll. Then
+re-read history a second time and confirm it stays **one** record, as 7c did for the standard bolus.
+
+## 8d. Cancel — **ships in the same change, not after it**
+
+⚠ **The one place this file's "one refusal at a time" rule is deliberately bent, and the reason is
+concrete.** `LoopPlugin.goToZeroTemp` — the disconnect-pump and suspend-loop path — does this:
+
+```kotlin
+if (pump.pumpDescription.isExtendedBolusCapable && getExtendedBolusActiveAt(now) != null)
+    commandQueue.cancelExtended(...)      // on failure: runAlarm(extendedbolusdeliveryerror)
+```
+
+Advertise the capability with `cancelExtendedBolus` still refusing, and **every pump disconnect during
+an extended bolus raises an audible delivery-error alarm.** Deliver and cancel are a pair, and cancel
+is the safety half of it.
+
+1. Start **5 U over 15 min**. Let it run ~5 minutes.
+2. Cancel it from AAPS.
+
+**Confirm:** the pump stops delivering (the reservoir stops falling across two further Refreshes);
+the partial amount recorded is **the pump's figure, not the programmed 5 U**; and the
+`extendedBoluses` record is **ended**, not left running. Same rule as everywhere else — the amount
+comes from the pump's log, never from what was asked for.
+
+## 8e. The loop's own cancel path
+
+The thing 8d's warning is about, exercised deliberately rather than discovered.
+
+1. Start **5 U over 15 min**.
+2. While it runs, use AAPS's own **Disconnect Pump**.
+
+**Confirm:** `cancelExtended` succeeds, **no audible delivery-error alarm**, and the record closes.
+A failure here stays silent until the day somebody disconnects mid-bolus.
+
+## 8f. Byte 0, and the suspend record
+
+**The question:** whether an extended bolus is a distinct delivery mode, and — the harm §8.6 predicts
+— whether it opens a spurious `PUMP_SUSPEND` record.
+
+With a 15-minute extended bolus running, Refresh and read the `[ypso-state]` line.
+
+**Confirm:** `byte0=10`, and above all **`suspendRecord=none`**. If byte 0 turns out to be a third
+value, `isDeliveringOrNull` returns null, AAPS reports the pump suspended, and the loop is held off
+for the whole duration of every extended bolus. That would be the first new byte-0 value this project
+has found, and it would change §8.3.
+
+## 8g. With a temporary basal running
+
+Never tried together, and §8.4 item 1 has the standard-bolus version of this open too. A TBR running
+while an extended bolus is programmed: does either disturb the other, and do both still read back?
+
+## What cannot be tested here
+
+**A connection lost mid-extended-bolus.** The pump owns the delivery and will finish it whether or not
+the phone is there — that is the property §0 relies on — but what AAPS's *record* does in between is
+untested, exactly as it is for the standard bolus (§8.4 item 2). `ReconnectManager` is armed for the
+standard bolus only, and whether it should cover a 15-minute extended one is a design question this
+phase does not answer.
+
+## Phase 8 is passed when
+
+**8a's three timestamps are recorded and the queue was not blocked**; 8b's reservoir fell gradually
+**with at least two middle readings, not just the ends**; 8c lands in `extendedBoluses` and stays one
+record across a re-read; 8d and 8e both cancel cleanly with no delivery-error alarm; and 8f reads
+`suspendRecord=none`.
+
+**Then, and not before**, restore the capability — which for this driver means deleting
+`isExtendedBolusCapable = false` from `YpsoPlugin.pumpDescription`, **not** editing
+`PumpCapability.YpsomedCapabilities` in shared `core/data` (§9). `YpsoPluginTest` asserts the
+withdrawal, so that test is expected to be updated in the same change, and its failing is the
+reminder that this is a deliberate act rather than a tidy-up.

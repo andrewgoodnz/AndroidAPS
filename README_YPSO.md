@@ -116,6 +116,12 @@ extended-bolus button and its Treatments tab do not appear. The pump can do both
 never been asked to, and the standard bolus should soak first. `loadTDDs` is likewise refused and
 unadvertised, though the data exists in the pump's `type=23` entries and would not be hard.
 
+**The extended bolus has a procedure written for it** (`SALINE_TEST_PROCEDURE.md` Phase 8) and a
+reason to want it: the pump delivers at a fixed **~33 U/min**, so a 10 U bolus goes in over 18
+seconds where most pumps take minutes, and an extended bolus is the pump's own way to spread that out
+for comfort. The wire format already carries it and `YpsoBleManager.startBolus` implements it — what
+is missing is the hardware gate, not the code.
+
 ### AAPS learns of a pump alarm at the next poll, and that can be 20 minutes
 
 AAPS polls when its command queue has work and this driver disconnects when it is empty, which is
