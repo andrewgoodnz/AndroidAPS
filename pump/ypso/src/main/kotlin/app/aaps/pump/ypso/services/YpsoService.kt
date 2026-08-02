@@ -41,6 +41,7 @@ import com.pump.common.OperatingMode
 import com.pump.common.PumpConnectionState
 import com.pump.common.PumpHistoryEvent
 import com.pump.common.PumpStatus
+import com.ypsopump.sdk.HistorySyncDecision
 import com.ypsopump.sdk.YpsoEventTypes
 import com.ypsopump.sdk.YpsoPumpManagerImpl
 import dagger.android.DaggerService
@@ -617,14 +618,63 @@ class YpsoService : DaggerService() {
         // driver and not survivable for a loop issuing an SMB every five minutes (§8.5). Read and
         // import are timed apart because only the read scales with the window.
         val startedAt = System.currentTimeMillis()
-        val watermarkBefore = preferences.get(YpsoLongNonKey.LastSyncedSequence)
+        val watermark = preferences.get(YpsoLongNonKey.LastSyncedSequence)
         aapsLogger.info(
             LTag.PUMP,
-            "History sync: starting, watermark=" + if (watermarkBefore < 0) "unset ($watermarkBefore)" else "$watermarkBefore"
+            "History sync: starting, watermark=" + if (watermark < 0) "unset ($watermark)" else "$watermark"
         )
 
+        // Ask the cheap question first. Index 0 is the newest entry, so two entry reads say whether
+        // anything happened at all; the full window costs ~20 s and on most connections answers
+        // "nothing". See HistorySyncDecision for why skipping is equivalent rather than approximate.
+        val newestSeen = pumpManager.readNewestSequence()
+        val probeMillis = System.currentTimeMillis() - startedAt
+        if (newestSeen == null) {
+            aapsLogger.warn(LTag.PUMP, "History sync: the pump returned no entries at all; nothing to do")
+            return
+        }
+
+        when (HistorySyncDecision.decide(watermark, newestSeen)) {
+            HistorySyncDecision.TakeBaseline -> {
+                preferences.put(YpsoLongNonKey.LastSyncedSequence, newestSeen)
+                aapsLogger.info(
+                    LTag.PUMP,
+                    "History sync: no watermark yet, so taking sequence $newestSeen as the baseline and importing " +
+                        "nothing. Anything the pump does from here is synced. " +
+                        "(watermark unset -> $newestSeen, from a $probeMillis ms probe; no window was read)"
+                )
+                return
+            }
+
+            HistorySyncDecision.UpToDate  -> {
+                aapsLogger.info(
+                    LTag.PUMP,
+                    "History sync: newest sequence is $newestSeen, still at the watermark — nothing new, so the " +
+                        "window was not read. Probe took $probeMillis ms."
+                )
+                return
+            }
+
+            HistorySyncDecision.SequenceWentBackwards -> {
+                // Loud on purpose. The old code reached this silently and resumed from the lower
+                // watermark, losing up to a window of treatments with no warning of any kind.
+                aapsLogger.error(
+                    LTag.PUMP,
+                    "History sync: the pump's newest sequence is $newestSeen but the watermark is $watermark. " +
+                        "Sequences do not go backwards on this pump, so either the event log wrapped, this is a " +
+                        "different pump, or a backup was restored. Re-baselining at $newestSeen and importing " +
+                        "nothing — any treatment between the two will not appear in AAPS."
+                )
+                preferences.put(YpsoLongNonKey.LastSyncedSequence, newestSeen)
+                return
+            }
+
+            HistorySyncDecision.ReadFully -> Unit
+        }
+
+        val readStartedAt = System.currentTimeMillis()
         val result = pumpManager.readHistoryWithDump(preferences.get(YpsoIntKey.YpsoHistoryReadCount))
-        val readMillis = System.currentTimeMillis() - startedAt
+        val readMillis = System.currentTimeMillis() - readStartedAt
         val entriesRead = result.eventSequences.size + result.alertSequences.size
         aapsLogger.info(
             LTag.PUMP,
@@ -636,21 +686,14 @@ class YpsoService : DaggerService() {
                 if (entriesRead > 0) " (${readMillis / entriesRead} ms/entry)" else ""
         )
 
+        // The probe already said there is something above the watermark, so an empty window here is
+        // the pump contradicting itself between two reads seconds apart, not the ordinary quiet case.
         val newest = result.newestSequence
         if (newest == null) {
-            aapsLogger.warn(LTag.PUMP, "History sync: the pump returned no entries at all; nothing to do")
-            return
-        }
-
-        val watermark = watermarkBefore
-        if (watermark < 0) {
-            preferences.put(YpsoLongNonKey.LastSyncedSequence, newest)
-            aapsLogger.info(
+            aapsLogger.warn(
                 LTag.PUMP,
-                "History sync: no watermark yet, so taking sequence $newest as the baseline and importing nothing. " +
-                    "Anything the pump does from here is synced. " +
-                    "(${result.events.size} mapped event(s) were read and none was imported; " +
-                    "watermark unset -> $newest, in ${System.currentTimeMillis() - startedAt} ms)"
+                "History sync: the probe reported $newestSeen but the window read returned no entries at all. " +
+                    "Nothing imported."
             )
             return
         }
@@ -709,6 +752,7 @@ class YpsoService : DaggerService() {
         aapsLogger.info(
             LTag.PUMP,
             "History sync: imported ${fresh.size} event(s) above $watermark; watermark $watermark -> $newest. " +
+                "Probe $probeMillis ms. " +
                 "Took ${System.currentTimeMillis() - startedAt} ms for $entriesRead entr(ies) " +
                 "(read $readMillis ms, import ${System.currentTimeMillis() - importedAt} ms)"
         )

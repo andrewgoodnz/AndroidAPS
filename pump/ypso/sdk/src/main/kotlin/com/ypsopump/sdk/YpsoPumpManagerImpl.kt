@@ -86,6 +86,12 @@ class YpsoPumpManagerImpl private constructor(
     companion object {
 
         private const val TAG = "YpsoPumpManagerImpl"
+
+        /**
+         * Entries per log for [readNewestSequence]. One, because index 0 is the newest and that is
+         * the whole question.
+         */
+        private const val PROBE_ENTRIES = 1
         /**
          * Named for what it applies to now, which is the extended and combined bolus and the active
          * profile switch — not delivery in general, which this driver does.
@@ -751,6 +757,22 @@ class YpsoPumpManagerImpl private constructor(
      *
      * @param maxEntries how many of the most recent entries to fetch from each log.
      */
+    /**
+     * The newest sequence number in either log, read as cheaply as this pump allows.
+     *
+     * **Index 0 is the newest entry** (§5), so one entry per log is enough to answer "has anything
+     * happened since I last looked?" — about 0.4 s against ~20 s for a full window. Any append
+     * necessarily changes index 0, so this cannot miss one.
+     *
+     * Delegates to [readHistoryWithDump] rather than reaching into the BLE layer: `readHistory`
+     * already clamps to `min(maxEntries, count) - 1`, so a count of 1 reads index 0 alone, and
+     * reusing the verified path keeps one implementation of the index direction that upstream got
+     * backwards.
+     *
+     * @return the newest sequence across both logs, or null if the pump returned no entries.
+     */
+    suspend fun readNewestSequence(): Long? = readHistoryWithDump(PROBE_ENTRIES).newestSequence
+
     suspend fun readHistoryWithDump(maxEntries: Int): HistoryReadResult = withConnection {
         val events = suspendCancellableCoroutine<List<HistoryEntry>> { cont ->
             bleManager.readHistoryEvents(maxEntries) { cont.resume(it) }
