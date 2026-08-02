@@ -272,10 +272,10 @@ AAPS core ── YpsoPlugin  (Pump interface)              [shape: MedtrumPlugin
         YpsoBleManager (Nordic BLE) ── plaintext, no cryptor
 ```
 
-Outside `pump/ypso/` this branch changes **eight lines in six upstream files** — the Gradle includes,
-the app's dependency, Dagger's two component lists and the plugin map, and one version-catalogue
-entry. `PORTING_NOTES.md` §9 has the table, the rebase workflow, and the one command that says
-whether that surface has grown.
+Outside `pump/ypso/` this branch touches **seven files, 19 added lines and 2 changed** — the Gradle
+includes, the app's dependency, Dagger's two component lists and the plugin map, one
+version-catalogue entry and one `.gitignore` line. `PORTING_NOTES.md` §9 has the per-file table, the
+rebase workflow, and the one command that says whether that surface has grown.
 
 ---
 

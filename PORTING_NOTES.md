@@ -2465,11 +2465,23 @@ deliberately short, and each entry is here because it cannot be anywhere else:
 | `.gitignore` | +1 line: `/reference` | Keeps the vendor sources and decrypted exports out of the repo. Nothing under `reference/` is tracked |
 | `PORTING_NOTES.md`, `SALINE_TEST_PROCEDURE.md`, `README_YPSO.md` | new files | New files never conflict |
 
-**Eight lines of real conflict surface, in six upstream files** — down from 91 changed files before
-the donor module was deleted. Every one is an additive insertion into a list, which is the cheapest
-kind of conflict there is; and `PluginsListModule`, `AppComponent` and `TestAppComponent` are exactly
-the files upstream edits when *it* adds a pump, so those three are the ones that will actually
-conflict.
+**Seven files, 19 added lines and 2 changed** — down from 91 changed files before the donor module
+was deleted. `git diff --numstat` says so exactly:
+
+```
+1  0  .gitignore
+1  0  app/build.gradle.kts
+3  1  app/src/androidTest/kotlin/app/aaps/di/TestAppComponent.kt
+3  1  app/src/main/kotlin/app/aaps/di/AppComponent.kt
+7  0  app/src/main/kotlin/app/aaps/di/PluginsListModule.kt
+1  0  gradle/libs.versions.toml
+3  0  settings.gradle
+```
+
+The two "changed" lines are both a trailing list entry gaining a comma. Every other line is an
+additive insertion, which is the cheapest kind of conflict there is — and `PluginsListModule`,
+`AppComponent` and `TestAppComponent` are exactly the files upstream edits when *it* adds a pump, so
+those three are the ones that will actually conflict.
 
 **Three files came off this list on 2026-08-03**, by deleting the donor module (§1):
 
