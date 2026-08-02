@@ -10,15 +10,15 @@ Phase 6 has passed five of six steps, and Phases 7 and 7f have passed in full.**
 **on by default**, and a quiet poll costs ~580 ms rather than 20 s. What remains is observation, not
 capability — with one exception, and it is first in the list below.
 
-✅ **6b passed on 2026-08-03** — four renewal cycles, zero uncovered time, decided on the database.
-⚠ But on the **08-02 build**, which predates both today's refactor of that code and the
-`[ypso-suspend] LAPSED` detector. One two-hour stopped run on HEAD closes it properly.
+✅✅ **6b passed on 2026-08-03, and was re-confirmed the same day on HEAD after a flash** — seven
+renewal cycles across two builds, **zero uncovered time**, decided on the database. **Phase 6 is
+complete and no correctness gate remains open.**
 
 **Still to run, most valuable first:**
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
-| A | **6b re-confirm on HEAD** | ✅ **The renewal fix PASSED 2026-08-03** — 2h33m stopped, four renewal cycles, **zero uncovered time**, adjudicated on `temporaryBasals.duration` (~35–40 min, not 60.00). ⚠ **But on build 3.4.2.4 of 08-02, which predates the `SuspendRecordDecision` extraction now at HEAD** — and predates the `[ypso-suspend] LAPSED` detector, which has still never run on hardware. Flash HEAD, leave a stopped pump two hours, re-run the query | **6b-RERUN**, §8.6 |
+| A | ~~**6b — the renewal fix**~~ | ✅✅ **CLOSED 2026-08-03, verified twice.** 2h33m on the 08-02 build (4 cycles) and then re-confirmed on **HEAD 3.4.2.6** after a flash (3 cycles), with **zero uncovered time at every transition including across the reinstall**. Adjudicated on `temporaryBasals.duration`. The Hold→Renew boundary was seen on real polls (39 min left held, 20 min left renewed) | **6b**, §8.6 |
 | B | **Fix `insertAnnouncement`'s dedupe key** | It keys on `now()`, not `pumpId`, so it is the one sync path that is not idempotent. The watermark currently hides it. Worth fixing on its own terms rather than depending on the thing that hides it | §8.5 |
 | C | ~~**Phase 5c — cartridge out and priming**~~ | ✅ **CLOSED 2026-08-03.** Cartridge out reads `byte0=3` with the reservoir `FF FF FF FF` (−1) — the first sighting of reservoir `-1`, handled correctly. The *priming* row is recorded as **unreachable by this method**: liveness cannot be proved because the reservoir reads −1 throughout, so a mid-prime reading is byte-identical to one taken after it | **Phase 5c**, §8.3 |
 | D | ~~**Phase 5e — reservoir empty mid-delivery**~~ | ✅ **CLOSED 2026-08-03.** Reads `byte0=3` with the reservoir a **known `0`** — not the `-1` of a cartridge change, so the pump does distinguish empty from absent. Alert count 147 → 148, `104 Cartridge Empty`, urgent. **Phase 5's table is complete** | **Phase 5e**, §8.3 |
@@ -919,7 +919,7 @@ stopped for longer than an hour goes back to accruing phantom basal IOB.
   Look at AAPS, not only at the pump — §4h's TBR cancel passed every pump-side check and AAPS still
   disagreed, and the UI is what caught it.
 
-### 6b. It is re-asserted across polls ✅ **PASSED 2026-08-03 — on the renewal fix, not on today's refactor**
+### 6b. It is re-asserted across polls ✅✅ **PASSED 2026-08-03, twice — on the fix, then on HEAD**
 
 > **The renewal fix works.** 2h33m of continuous stopped-pump coverage, four renewal cycles, **zero
 > uncovered time**. Unattended, and not even deliberate — the cartridge ran dry during Phase 5e at
@@ -970,7 +970,49 @@ stopped for longer than an hour goes back to accruing phantom basal IOB.
 > `[ypso-suspend] LAPSED` detector and the minutes-remaining field, **neither of which has ever run
 > on hardware** — they were added the same day and this run predates them.
 
-#### 6b-RERUN — the procedure (still current; use it for the HEAD re-confirm)
+#### ✅✅ [verified] Re-confirmed on HEAD (3.4.2.6) — 2026-08-03, and it survived a reinstall
+
+The caveat above is now closed. HEAD was flashed at **10:12:56** onto the still-stopped pump and left
+to poll unattended. The record chain **across the reinstall**:
+
+```
+started    mins    expires
+09:01:22   40.00 → 09:41:22    ┐  old build
+09:41:22   32.14 → 10:13:30    │  ← truncated 34 s after the APK was replaced
+10:13:30   37.90 → 10:51:24    │  HEAD
+10:51:24   39.98 → 11:31:23    │
+11:31:23   60.00 → 12:31:23    ┘  (running)
+```
+
+**Zero gap at every transition, including across the reinstall.** The 09:41:22 record had 28 minutes
+left when HEAD's first poll found it — under the 30-minute threshold — so it was renewed immediately
+rather than left to lapse. The record survives an APK replacement because it lives in the database,
+and the refactored code did the right thing on its first hardware poll.
+
+**Three renewals on HEAD, zero `[ypso-suspend]` lines.** The denominator guard is met, so the empty
+grep is evidence rather than silence.
+
+**The Hold/Renew boundary was demonstrated on real polls**, which is what the morning's run could not
+do because that build lacked the field:
+
+```
+11:11:24  suspendRecord=open since 10:51 am (39min left of 60)     ← held, 39 > 30
+11:31:23  renewed the 0% basal with 20 min left, new=true          ← renewed, 20 < 30
+11:31:23  suspendRecord=open since 11:31 am (59min left of 60)
+```
+
+That is `SuspendRecordDecision.decide` returning `Hold` then `Renew` on hardware, matching the unit
+tests that pin the same boundary. **So the extraction preserved the behaviour**, which was the only
+open question.
+
+⚠ **One honest limit: the `LAPSED` detector has still never fired.** Its absence here proves no lapse
+occurred; it does not prove the detector works. That direction is pinned only by
+`SuspendRecordDecisionTest`, which covers `lapsedByMs` in all three of its states. A detector that has
+never triggered in the field is exactly the kind of thing this file keeps finding, and it is recorded
+rather than assumed away — though note that unlike the checks that *could not* fail, this one is a
+total function of three values and its inputs are examined by test.
+
+#### 6b-RERUN — the procedure (keep for any future re-confirm)
 
 > **This is the last correctness gate before an insulin trial.** The overnight run below was on a
 > **pre-fix build**: it reproduced the defect faithfully and proved nothing about the repair. Read

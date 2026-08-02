@@ -252,15 +252,11 @@ change to the framing code.
 
 Stated plainly, because this is the question the whole project is pointed at.
 
-**One correctness gate is all but closed:**
-
-- **Phase 6b passed on 2026-08-03** — 2h33m of stopped pump, four renewal cycles, **zero uncovered
-  time**. The 0% suspend record is held continuously while the pump is stopped, which is what stops
-  AAPS counting basal insulin that is not being delivered.
-- ⚠ **But it passed on the build from the day before**, which predates a refactor of that same code
-  now at HEAD. One two-hour stopped run on the current build closes it properly, and would also
-  exercise the lapse detector, which has never run on hardware either.
-  `SALINE_TEST_PROCEDURE.md` **6b-RERUN** is the procedure; it decides on the database, not the log.
+**No correctness gate is open.** Phase 6b — the last one — closed on 2026-08-03, verified twice:
+2h33m of stopped pump on one build (four renewal cycles), then re-confirmed on the current build
+after a flash (three more), with **zero uncovered time at every transition, including across the
+reinstall**. The 0% suspend record is held continuously while the pump is stopped, which is what
+stops AAPS counting basal insulin that is not being delivered.
 
 **Two things only time can answer:**
 

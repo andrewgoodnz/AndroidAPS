@@ -33,12 +33,11 @@ window when nothing has moved cut a quiet poll to **~580 ms**, verified in Phase
 
 **Two things stand between here and an insulin trial, and neither is a capability:**
 
-1. ✅ **6b's renewal fix has now run, and it works** — 2026-08-03, 2h33m of stopped pump, four
-   renewal cycles, **zero uncovered time**, decided on `temporaryBasals.duration` rather than on a log
-   line (§8.6). ⚠ **But on the 08-02 build**, which predates the same day's `SuspendRecordDecision`
-   extraction and the `[ypso-suspend] LAPSED` detector — so what shipped at HEAD has still not been
-   watched on hardware. **One two-hour stopped run on HEAD closes it**, and it is the last correctness
-   item.
+1. ✅✅ **6b is closed — verified twice on 2026-08-03, on the fix and then on HEAD.** 2h33m on the
+   08-02 build (four renewal cycles), then HEAD 3.4.2.6 flashed onto the still-stopped pump and left
+   to poll unattended (three more), with **zero uncovered time at every transition including across
+   the reinstall**. Decided on `temporaryBasals.duration`, not on a log line (§8.6). **No correctness
+   gate remains open.**
 2. **The 3000-entry log cap now has a date on it** — roughly three months at this user's rate of
    profile changes. What happens when it wraps is now traced rather than guessed at, and the probe
    makes it audible instead of silent (§8.5).
@@ -2167,7 +2166,43 @@ opposite of the four checks in this file that entailed neither.
 The procedure's denominator guard is met: it requires ≥ 2 renewals or the run never reached what it
 tested. There were four.
 
-##### ⚠⚠ …and it passed on a build that predates the refactor of the code it tested
+##### ✅✅ [verified] Re-confirmed on HEAD the same day, across a reinstall
+
+HEAD was flashed at **10:12:56** onto the still-stopped pump and left alone. The chain **across the
+APK replacement**:
+
+```
+09:01:22   40.00 → 09:41:22    ┐  old build
+09:41:22   32.14 → 10:13:30    │  ← truncated 34 s after the APK was replaced
+10:13:30   37.90 → 10:51:24    │  HEAD 3.4.2.6
+10:51:24   39.98 → 11:31:23    │
+11:31:23   60.00 → 12:31:23    ┘  (running)
+```
+
+**Zero gap anywhere, the reinstall included.** The 09:41:22 record had 28 minutes left when HEAD's
+first poll found it — under the threshold — so it was renewed at once instead of being left to lapse.
+The record survives an APK replacement because it lives in the database, and the refactored code did
+the right thing on its first hardware poll.
+
+**The Hold/Renew boundary was observed directly**, which the morning's build could not show because
+it lacked the field:
+
+```
+11:11:24  suspendRecord=open since 10:51 am (39min left of 60)   ← held,    39 > 30
+11:31:23  renewed the 0% basal with 20 min left, new=true        ← renewed, 20 < 30
+```
+
+`SuspendRecordDecision.decide` returning `Hold` then `Renew` on hardware, matching the unit tests
+that pin the same boundary. **The extraction preserved the behaviour**, which was the whole question.
+
+⚠ **The `LAPSED` detector has still never fired.** Its silence here proves no lapse occurred — the
+denominator is met, three renewals — but it does not prove the detector works. That direction rests on
+`SuspendRecordDecisionTest`, which pins `lapsedByMs` in all three of its states. Recorded rather than
+assumed away, though it differs from this file's four cautionary tales in the way that matters: it is
+a total function of three values, and its inputs are examined by test rather than supplied by
+whatever the hardware happened to do.
+
+##### ⚠⚠ It first passed on a build that predates the refactor of the code it tested
 
 The tested build is **3.4.2.4 of 2026-08-02 18:23**. HEAD is **3.4.2.6**, carrying the
 `SuspendRecordDecision` extraction written 2026-08-03 — same logic, lifted out so a test could reach
