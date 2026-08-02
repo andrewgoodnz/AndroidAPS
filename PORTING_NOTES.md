@@ -17,20 +17,21 @@ menu now becomes insulin on board (§8.5).
 test to date has been on **saline, off-body, cannula to air**, and §8.1 lists what must still be true
 before that changes.
 
-**Phase 7 passed 7a–7d on 2026-08-02.** The first enable took a baseline and imported nothing; a
+**Phase 7 passed in full on 2026-08-02.** The first enable took a baseline and imported nothing; a
 manual bolus arrived exactly once at the right amount and time; an AAPS bolus stayed one record
-across two re-reads; and a 24-entry burst reached no treatment and opened no gap. 7e — leave it idle
-and look for treatments with no cause — was still running when this was written.
+across two re-reads; a 24-entry burst reached no treatment and opened no gap; and four idle hours
+produced fourteen empty syncs and not one row in any treatment table.
 
 **Three things stand between here and an insulin trial, and none of them is a capability:**
 
 1. **The sync costs 20.4 s on every status read** — twice what this file predicted, because
-   `YpsoHistoryReadCount` applies to *each* log. Fine for a manually-driven pump, far too slow for a
-   loop issuing SMBs every five minutes. The fix is cheap and identified (§8.5).
+   `YpsoHistoryReadCount` applies to *each* log. A cheap probe that reads index 0 first is
+   **written and unverified**; Phase 7f is its gate (§8.5).
 2. **6b's renewal fix has never run.** The overnight test was on a pre-fix build, so it reproduced
    the defect and proved nothing about the repair (§8.6).
 3. **The 3000-entry log cap now has a date on it** — roughly three months at this user's rate of
-   profile changes. If sequences wrap there, the watermark stops being sound, silently (§8.5).
+   profile changes. What happens when it wraps is now traced rather than guessed at, and the probe
+   makes it audible instead of silent (§8.5).
 
 **Byte 0 of the system status is identified for two values out of 256, and that is the answer, not a
 gap** — every state reachable on hardware came back as one of those two. During a bolus it reads
@@ -1747,6 +1748,16 @@ answer — the pump's log is ground truth and the conservative record was only e
 — but it is a rewrite in the unsafe direction, arriving quietly, and nobody had noticed the two
 rules meet. It only did not happen here because the baseline sat above the record.
 
+#### ✅ [verified] 7e: four hours idle, nothing appeared — 2026-08-02
+
+Fourteen consecutive polls from 13:56 to 17:56, pump untouched, every one `imported 0 event(s)
+above 160710` with the watermark unmoved. **Zero rows created in any treatment table.** No phantom
+IOB, and nothing from Nightscout or the Lotus phone, both of which have produced that signature
+before.
+
+It also priced the idle case exactly: those fourteen polls spent **4.8 minutes of radio** reading
+1,400 entries to establish that nothing had happened.
+
 #### ⚠⚠ The real cost is **20.4 s per sync**, not 10 — because there are two windows
 
 Five syncs measured on 2026-08-02: **19.9–21.4 s, ~200 ms/entry**. The per-entry figure matches the
@@ -1758,13 +1769,60 @@ It runs at the end of every `readPumpStatus`, so **every status read now costs t
 That is survivable for a manually-driven pump and it is not survivable for a loop issuing an SMB
 every five minutes — it delays every command by that much.
 
-**The cheap fix is visible in the same numbers, and is the next thing to do.** The two logs fill at
-rates nothing like each other — this pump logged 24 event entries in one afternoon and has managed
-50 alerts since **2025**. Half of every sync is spent re-reading occlusion alerts from 2019.
-Splitting `YpsoHistoryReadCount` into separate event and alert counts — 50 and 5, say — would cut
-the sync to **~11 s** with no loss of coverage, because five alerts is already months of headroom.
-Not done this session: Phase 7 was a gate on one preference, and changing what the sync reads
-mid-run is exactly what the procedure forbids.
+#### ⏳ [built, unverified] Ask one question instead of reading a hundred entries
+
+Commit `5ac789dd8e`, written after Phase 7 passed and **not yet run on hardware** — Phase 7f is its
+gate.
+
+The fix is not "read fewer entries", it is "don't read at all unless something happened". **Index 0
+is always the newest entry** (§5), so two entry reads — one per log — answer *"has anything
+happened?"* in ~0.4 s. The full window is read only when the answer is yes. On 2026-08-02 the pump
+logged nothing on 13 of 17 connections, and 7e's four idle hours were 14 for 14.
+
+**The skip is equivalent, not approximate**, which is what makes it safe. If the newest sequence in
+both logs is at or below the watermark then `freshEvents` can only return empty and `missedSince`
+returns 0 from its own `newest <= watermark` guard in each window. Both answers are already
+determined; reading 100 entries to reach them is work with no output.
+
+A first enable no longer reads a window either: the baseline is the newest sequence across both
+logs, which is exactly what the probe returns, and nothing is imported either way. 7a would drop
+from ~21 s to ~0.4 s.
+
+**This is also what finally makes the watermark earn its keep.** Its dedupe role is thin — four of
+the five `PumpSync` paths are idempotent no-ops on re-offer, so re-importing costs nothing (only
+`insertAnnouncement` leaks, and that is a defect, see below). What the watermark is genuinely for is
+being **the number the cheap probe compares against**. That justification survives scrutiny; "it
+stops duplicates" mostly does not.
+
+A separate, still-worthwhile follow-up: the two logs need nothing like the same window. This pump
+logged 24 event entries in one afternoon and has managed 50 alerts since **2025**, so splitting
+`YpsoHistoryReadCount` into event and alert counts — 50 and 5 — would halve the cost of the reads
+the probe *does* let through. Not done; the probe is the bigger win and one change at a time is the
+rule.
+
+#### ⚠ `insertAnnouncement` dedupes on `now()`, not on `pumpId` — 2026-08-02
+
+Found while asking whether the watermark is load-bearing. It takes a `pumpId` and looks idempotent;
+it is not:
+
+```kotlin
+insertPumpTherapyEventIfNewByTimestamp(
+    therapyEvent = TE.asAnnouncement(error, pumpId, …),
+    timestamp = dateUtil.now(),      // ← not the pump's entry time
+)
+…
+findByTimestamp(therapyEvent.type, therapyEvent.timestamp)   // ← the dedupe key
+```
+
+The `pumpId` is stored on the record and never consulted. So without the watermark every alert in
+the 50-entry window would be re-inserted as a fresh announcement on every poll — ~150 an hour,
+mostly occlusions from 2019.
+
+The watermark currently hides this. It should be fixed on its own terms rather than depended on:
+the other four paths key on something stable, and this one should too. Bolus, TBR and therapy-event
+syncs are all genuine no-ops when nothing changed (`SyncPumpBolusTransaction` and
+`SyncPumpTemporaryBasalTransaction` compare fields before writing; therapy events key on the pump's
+own timestamp).
 
 #### ⏳ The log cap now has a date on it
 

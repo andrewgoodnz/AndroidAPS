@@ -6,15 +6,16 @@ which records what the pump has actually been observed to do.
 ## ⏳ Everything still to run — read this first
 
 As of 2026-08-02, **all four delivery phases have passed, Phase 5 is answered except two rows,
-Phase 6 has passed all six steps, and Phase 7 has passed 7a–7d with 7e running.** History sync is
-**switched on**. What remains is observation and one performance decision, not capability.
+Phase 6 has passed all six steps, and Phase 7 has passed in full.** History sync is **switched on**.
+What remains is observation and one unverified performance change, not capability.
 
 **Still to run, most valuable first:**
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
-| A | **Phase 6b re-confirm — the renewal fix** | ⚠ **Still unverified.** The overnight run of 08-01→02 was on a **pre-fix build** (`fca883077c` landed 08:46 on 08-02, the pump restarted at 08:49), so it reproduced the defect and tested nothing. **Do not test it by checking that every poll reads `suspendRecord=open`** — that check passed across a run containing two real gaps. Read `duration` out of `temporaryBasals`: pre-fix it is exactly 60.00 min every time, with the fix it should be ~40. **Opportunistic** — fold it into the next time the pump is stopped for other reasons | **Phase 6b**, §8.6 |
-| A2 | **Split the history read window, then re-measure** | ⚠ The sync costs **20.4 s on every connection** — double what §8.5 assumed, because both logs are read at 50. Half of it is re-reading alerts from 2019. This is the one thing standing between the driver and SMB-rate looping | §8.5 |
+| A | **Phase 7f — the cheap probe** | ⚠ **Built `5ac789dd8e`, never run.** It changes what the sync reads, so it does **not** inherit Phase 7's pass. 7e spent 4.8 minutes of radio across four idle hours to learn nothing had happened; the probe should make that ~5.6 s. Its failure mode is the quiet one — a probe that says "nothing new" when something happened stops IOB silently | **Phase 7f**, §8.5 |
+| B | **Phase 6b re-confirm — the renewal fix** | ⚠ **Still unverified.** The overnight run of 08-01→02 was on a **pre-fix build** (`fca883077c` landed 08:46 on 08-02, the pump restarted at 08:49), so it reproduced the defect and tested nothing. **Do not test it by checking that every poll reads `suspendRecord=open`** — that check passed across a run containing two real gaps. Read `duration` out of `temporaryBasals`: pre-fix it is exactly 60.00 min every time, with the fix it should be ~40. **Opportunistic** — fold it into the next time the pump is stopped for other reasons | **Phase 6b**, §8.6 |
+| C | **Fix `insertAnnouncement`'s dedupe key** | It keys on `now()`, not `pumpId`, so it is the one sync path that is not idempotent. The watermark currently hides it. Worth fixing on its own terms rather than depending on the thing that hides it | §8.5 |
 | C | **Phase 5c — cartridge out and priming** | The last two delivery-mode states never read. **Free at your next cartridge change** if you press Refresh while the cartridge is out and again while priming | **Phase 5c**, §8.3 |
 | D | **Phase 5e — reservoir empty mid-delivery** | Never seen. The pump does alert (`104 Cartridge Empty`, 37 in the log), but what byte 0 reads at that moment is unknown | **Phase 5e**, §8.3 |
 | E | **Reconnect mid-bolus** | Pull BLE range during a 2 U bolus. The pump finishes regardless; what is untested is whether AAPS's *record* settles. A provisional record goes in before sending and `ReconnectManager` chases the link back, armed for the bolus only | §4g |
@@ -1256,7 +1257,25 @@ alert logs, where the alert log always reaches back years, so it answered zero f
 input. It is now measured per log. That means 7d is the first time it has ever been able to fire,
 so a quiet run here is worth something it was not worth before.
 
-### 7e. Leave it running and look again ⏳ **RUNNING 2026-08-02**
+### 7e. Leave it running and look again ✅ **PASSED 2026-08-02**
+
+> **14 consecutive idle polls, 13:56 → 17:56**, pump untouched throughout. Every one:
+>
+> ```
+> History sync: imported 0 event(s) above 160710; watermark 160710 -> 160710.
+>               Took ~20.5 s for 100 entr(ies)
+> ```
+>
+> Durations 20374–20719 ms across the whole run — no drift, no degradation.
+>
+> **Database: zero rows created in any table** after 13:42 — boluses, TBRs, therapy events, carbs,
+> extended boluses, profile switches. Counts unchanged at 13 / 31 / 10, watermark still `160710` on
+> disk. Nothing arrived from Nightscout or the Lotus phone either, both of which have produced this
+> exact signature before.
+>
+> **It also priced the waste.** Those 14 polls spent **4.8 minutes of radio time** reading 1,400
+> entries to establish that nothing had happened — the workload of an idle pump, in full. See
+> Phase 7f.
 
 Leave the preference on with the pump idle for **an hour or two**, then check Treatments for
 anything that appeared without a cause. Phantom IOB is the failure mode, and it is quiet.
@@ -1274,9 +1293,9 @@ both before calling anything phantom.
 | 7b manual bolus arrives once | ✅ **PASS** | 1.5 U at 13:16:59, IOB −0.04 → 1.47 |
 | 7c AAPS bolus not duplicated | ✅ **PASS** | timestamp moved **−6.455 s**, of which ~4.3 s is delivery time and 2.35 s is skew |
 | 7d 24-entry burst | ✅ **PASS** | 24 imported, 0 to treatments, no gap, **20.4 s** per sync |
-| 7e nothing appears unbidden | ⏳ running | — |
+| 7e nothing appears unbidden | ✅ **PASS** | 14 idle polls over 4h20, 0 imported, 0 rows created |
 
-**`YpsoSyncHistoryToAaps` is ON** as of 2026-08-02 (`PORTING_NOTES` §8.5).
+**Phase 7 is passed. `YpsoSyncHistoryToAaps` is ON** as of 2026-08-02 (`PORTING_NOTES` §8.5).
 
 Three things the run found that the procedure had wrong, all of the same shape — a check whose
 inputs nobody had examined:
@@ -1295,3 +1314,72 @@ subtracted**, 7d is quiet, and 7e finds nothing unexplained.
 
 **If any of them fails, turn `YpsoSyncHistoryToAaps` back off** before doing anything else. It is a
 preference precisely so that it can be switched off in one action.
+
+---
+
+# Phase 7f — the cheap probe ⏳ **BUILT 2026-08-02, NOT YET RUN**
+
+**This is sync logic, so it does not inherit Phase 7's pass.** Commit `5ac789dd8e` changed what the
+sync reads: index 0 of each log first (~0.4 s), and the full 100-entry window **only** when the
+newest sequence has moved past the watermark. Phase 7 validated the driver *without* it.
+
+Why it exists: 7e spent 4.8 minutes of radio across four idle hours to learn nothing had happened.
+At AAPS's 20-minute idle cadence that is merely wasteful; at the 5-minute cadence of a loop issuing
+SMBs it delays every command behind a 20-second read.
+
+**Do not run this on the same session as anything else.** Install, then:
+
+### 7f-a. The quiet path skips the window
+
+1. Press **Refresh** with the pump untouched since the last sync.
+
+**Confirm:**
+
+```
+History sync: starting, watermark=<W>
+History sync: newest sequence is <W>, still at the watermark — nothing new, so the window
+              was not read. Probe took <N> ms.
+```
+
+- **`<N>` should be under ~1000 ms**, against ~20500 ms before. That number is the whole point.
+- **No `read 50 event(s)…` line at all.** Its presence means the probe did not short-circuit.
+- No treatments appear, and Treatments count is unchanged.
+
+### 7f-b. A bolus still arrives, through the probe path
+
+The risk is a probe that says "nothing new" when something happened — silently stopping IOB, which
+is the stacking direction and the quietest failure this driver has.
+
+1. Give a **1.0 U bolus from the pump's own menu**. Note the time.
+2. Press **Refresh**.
+
+**Confirm:**
+
+- The probe does **not** short-circuit: a full `read 50 event(s)…` line appears.
+- `importing BolusDelivered seq=<S>`, exactly one, right amount, right time.
+- IOB moves by ~1.0 U.
+- Press Refresh again: it must now take the quiet path (7f-a's line) and import nothing.
+
+### 7f-c. The 24-entry burst still crosses the probe
+
+1. Write a basal profile differing in **every slot** (see 7d — a flat rate appearing nowhere in the
+   current profile).
+2. Press **Refresh**.
+
+**Confirm:** full read, 24 `BasalRateChanged` imported, no gap warning, no treatments, watermark
+advances past all 24. Then put the profile back.
+
+### What cannot be tested here
+
+**The `SequenceWentBackwards` branch** — a log wrap, a pump swap, or a restored backup. It is not
+producible on demand and it is roughly three months away on this pump's log at the current rate of
+profile changes. It is pinned by unit tests instead (`HistorySyncDecisionTest`), and its behaviour
+is deliberately identical to the old code's; the only change is that it is now logged at **error**
+instead of happening in silence.
+
+### Phase 7f is passed when
+
+7f-a skips the window in under a second, 7f-b's bolus still arrives exactly once, and 7f-c's burst
+still crosses. **Then, and not before, flip `YpsoSyncHistoryToAaps` to default `true`** — the flip
+is a statement that the shipped build is ready, and it should not be made about a build carrying
+unverified sync logic.
