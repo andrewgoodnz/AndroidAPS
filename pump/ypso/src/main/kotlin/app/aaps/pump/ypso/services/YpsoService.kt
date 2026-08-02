@@ -342,99 +342,97 @@ class YpsoService : DaggerService() {
      */
     private fun syncSuspendedState(mode: OperatingMode, modeName: String) {
         val ourSuspendRecord = openSuspendRecord()
+        val now = dateUtil.now()
+        val remainingMs = ourSuspendRecord?.let { (it.timestamp + it.duration) - now }
 
-        if (mode == OperatingMode.UNKNOWN) {
-            aapsLogger.warn(
-                LTag.PUMP,
-                "Delivery mode '$modeName' has never been identified; the loop is held off but no suspend record is written. " +
-                    "Record what the pump's own display says against this mode — PORTING_NOTES §8.3"
-            )
-            // No record is maintained in this state on purpose, so one expiring here is the design
-            // rather than the Phase 6b failure. Stop watching, or the next stopped poll would
-            // report a lapse that this branch caused deliberately.
-            suspendRecordExpiryMs = null
-            return
-        }
+        // The arithmetic lives in SuspendRecordDecision, where a test can reach it. Everything
+        // below is the part that needs AAPS: records, notifications and log lines.
+        val decision = SuspendRecordDecision.decide(mode, remainingMs, T.mins(SUSPEND_TBR_RENEW_BELOW_MINUTES).msecs())
 
-        if (mode != OperatingMode.STARTED) {
-            // Did the record that was open at the previous poll survive to this one? This is the
-            // only place a lapse is observable: syncSuspendedState is about to open a replacement,
-            // and every line written after that reads `open` whether or not there was a hole.
-            //
-            // The width is measured rather than inferred — expiry was known, now() is known, and
-            // the difference is how long AAPS spent counting basal IOB for a stopped pump.
-            val expectedExpiry = suspendRecordExpiryMs
-            if (ourSuspendRecord == null && expectedExpiry != null) {
-                val holeMs = dateUtil.now() - expectedExpiry
+        // Did the record open at the previous poll survive to this one? This is the only moment a
+        // lapse is observable — a replacement is about to be opened, and every line written after
+        // that reads `suspendRecord=open` whether or not there was a hole. Asked before anything
+        // acts, and only while stopped: the record is *meant* to be gone once delivery resumes.
+        if (decision != SuspendRecordDecision.Close && decision != SuspendRecordDecision.Clear) {
+            SuspendRecordDecision.lapsedByMs(ourSuspendRecord != null, suspendRecordExpiryMs, now)?.let { holeMs ->
                 aapsLogger.error(
                     LTag.PUMP,
-                    "[ypso-suspend] LAPSED — the 0% record expired at ${dateUtil.dateAndTimeString(expectedExpiry)} and " +
+                    "[ypso-suspend] LAPSED — the 0% record expired at ${dateUtil.dateAndTimeString(suspendRecordExpiryMs!!)} and " +
                         "nothing replaced it for ${holeMs / 1000}s. AAPS counted basal IOB for a stopped pump for that long. " +
                         "This is the SALINE_TEST_PROCEDURE Phase 6b failure, and it is the only line that reports it"
                 )
             }
-
-            // ⚠ Renew *before* expiry, never after. Waiting for the record to lapse and then
-            // noticing leaves a hole the width of one poll interval, and the hole is not
-            // hypothetical: an unattended run on 2026-08-01 produced two of them, 19m48s and
-            // 19m59s, in thirteen hours (§8.6).
-            //
-            // The cause is that the record is opened *by* a poll, so its expiry falls exactly
-            // SUSPEND_TBR_MINUTES later — and AAPS polls every ~20 min (its own
-            // KeepAliveWorker.STATUS_UPDATE_FREQUENCY of 15 min, evaluated by a worker that ticks
-            // every 5). 60 is an exact multiple of 20, so a poll lands within *seconds* of every
-            // expiry and whether it renews is decided by drift. One observed miss was by a single
-            // second. Renewing early breaks that phase-lock as well as leaving margin.
-            val remainingMs = ourSuspendRecord?.let { (it.timestamp + it.duration) - dateUtil.now() }
-            if (remainingMs != null && remainingMs > T.mins(SUSPEND_TBR_RENEW_BELOW_MINUTES).msecs()) {
-                suspendRecordExpiryMs = ourSuspendRecord.timestamp + ourSuspendRecord.duration
-                return
-            }
-
-            val synced = pumpSync.syncTemporaryBasalWithPumpId(
-                timestamp = dateUtil.now(),
-                rate = 0.0,
-                duration = T.mins(SUSPEND_TBR_MINUTES).msecs(),
-                isAbsolute = true,
-                type = PumpSync.TemporaryBasalType.PUMP_SUSPEND,
-                pumpId = dateUtil.now(),
-                pumpType = PumpType.YPSOPUMP,
-                pumpSerial = pumpSerial()
-            )
-            suspendRecordExpiryMs = dateUtil.now() + T.mins(SUSPEND_TBR_MINUTES).msecs()
-
-            if (remainingMs != null) {
-                // Still the same suspension, just topped up. Not news, and not a second alarm:
-                // the user was told when it started and nothing has changed since.
-                aapsLogger.info(
-                    LTag.PUMP,
-                    "Pump still not delivering (mode '$modeName'); renewed the 0% basal with " +
-                        "${remainingMs / 60000} min left, new=$synced"
-                )
-            } else {
-                aapsLogger.warn(
-                    LTag.PUMP,
-                    "Pump is not delivering (mode '$modeName'); recorded a 0% basal so AAPS stops counting basal IOB, new=$synced"
-                )
-                uiInteraction.addNotification(
-                    Notification.PUMP_SUSPENDED, rh.gs(R.string.ypso_pump_suspended, modeName), Notification.URGENT
-                )
-            }
-            return
         }
 
-        // Delivering again. Close only a record this driver opened — a real temporary basal has a
-        // different type and duration, and closing one would tell AAPS basal resumed when it had not.
-        rxBus.send(EventDismissNotification(Notification.PUMP_SUSPENDED))
-        suspendRecordExpiryMs = null
-        if (ourSuspendRecord == null) return
-        val stopped = pumpSync.syncStopTemporaryBasalWithPumpId(
-            timestamp = dateUtil.now(),
-            endPumpId = dateUtil.now(),
-            pumpType = PumpType.YPSOPUMP,
-            pumpSerial = pumpSerial()
-        )
-        aapsLogger.info(LTag.PUMP, "Pump is delivering again (mode '$modeName'); closed the 0% suspend record, new=$stopped")
+        when (decision) {
+            SuspendRecordDecision.Ignore -> {
+                aapsLogger.warn(
+                    LTag.PUMP,
+                    "Delivery mode '$modeName' has never been identified; the loop is held off but no suspend record is written. " +
+                        "Record what the pump's own display says against this mode — PORTING_NOTES §8.3"
+                )
+                // No record is maintained in this state on purpose, so one expiring here is the
+                // design rather than the Phase 6b failure. Stop watching, or the next stopped poll
+                // would report a lapse this branch caused deliberately.
+                suspendRecordExpiryMs = null
+            }
+
+            SuspendRecordDecision.Hold   ->
+                suspendRecordExpiryMs = ourSuspendRecord!!.timestamp + ourSuspendRecord.duration
+
+            SuspendRecordDecision.Open,
+            SuspendRecordDecision.Renew  -> {
+                val synced = pumpSync.syncTemporaryBasalWithPumpId(
+                    timestamp = now,
+                    rate = 0.0,
+                    duration = T.mins(SUSPEND_TBR_MINUTES).msecs(),
+                    isAbsolute = true,
+                    type = PumpSync.TemporaryBasalType.PUMP_SUSPEND,
+                    pumpId = now,
+                    pumpType = PumpType.YPSOPUMP,
+                    pumpSerial = pumpSerial()
+                )
+                suspendRecordExpiryMs = now + T.mins(SUSPEND_TBR_MINUTES).msecs()
+
+                if (decision == SuspendRecordDecision.Renew) {
+                    // Still the same suspension, just topped up. Not news, and not a second alarm:
+                    // the user was told when it started and nothing has changed since.
+                    aapsLogger.info(
+                        LTag.PUMP,
+                        "Pump still not delivering (mode '$modeName'); renewed the 0% basal with " +
+                            "${remainingMs!! / 60000} min left, new=$synced"
+                    )
+                } else {
+                    aapsLogger.warn(
+                        LTag.PUMP,
+                        "Pump is not delivering (mode '$modeName'); recorded a 0% basal so AAPS stops counting basal IOB, new=$synced"
+                    )
+                    uiInteraction.addNotification(
+                        Notification.PUMP_SUSPENDED, rh.gs(R.string.ypso_pump_suspended, modeName), Notification.URGENT
+                    )
+                }
+            }
+
+            SuspendRecordDecision.Clear  -> {
+                rxBus.send(EventDismissNotification(Notification.PUMP_SUSPENDED))
+                suspendRecordExpiryMs = null
+            }
+
+            // Delivering again. Closes only a record this driver opened — openSuspendRecord()
+            // identifies it by type *and* duration, because closing a real temporary basal would
+            // tell AAPS basal resumed when it had not.
+            SuspendRecordDecision.Close  -> {
+                rxBus.send(EventDismissNotification(Notification.PUMP_SUSPENDED))
+                suspendRecordExpiryMs = null
+                val stopped = pumpSync.syncStopTemporaryBasalWithPumpId(
+                    timestamp = now,
+                    endPumpId = now,
+                    pumpType = PumpType.YPSOPUMP,
+                    pumpSerial = pumpSerial()
+                )
+                aapsLogger.info(LTag.PUMP, "Pump is delivering again (mode '$modeName'); closed the 0% suspend record, new=$stopped")
+            }
+        }
     }
 
     /**

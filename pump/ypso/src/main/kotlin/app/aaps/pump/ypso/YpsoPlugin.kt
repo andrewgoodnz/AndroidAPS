@@ -179,7 +179,38 @@ class YpsoPlugin @Inject constructor(
     override fun manufacturer(): ManufacturerType = ManufacturerType.Ypsomed
     override fun model(): PumpType = PumpType.YPSOPUMP
     override fun serialNumber(): String = ypsoPump.serialNumber.ifBlank { ypsoPump.pumpMac }
-    override val pumpDescription: PumpDescription get() = PumpDescription().fillFor(PumpType.YPSOPUMP)
+    /**
+     * What AAPS is told this driver can do — **narrower than `PumpType.YPSOPUMP` declares**.
+     *
+     * A capability is a promise AAPS acts on, not a note about the hardware. `YpsomedCapabilities`
+     * in `core/data` claims `ExtendedBolus`, `TDD` and `ManualTDDLoad`; all three reach a method
+     * here that returns a failed [PumpEnactResult] without contacting the pump. Left as declared,
+     * AAPS offers an extended-bolus button, a Treatments tab for extended boluses and a TDD reload
+     * that can only ever fail — the UI promises what the driver refuses.
+     *
+     * Cleared here rather than in `PumpCapability` for two reasons. `core/data` is shared upstream
+     * code and every line changed in it is future rebase conflict surface (§9); and the flags are
+     * only ever read back through `pump.pumpDescription`, which is this plugin's to answer. Every
+     * consumer — `LoopPlugin`, `ActionsFragment`, `TreatmentsActivity`, `TDDStatsActivity` — goes
+     * through this property. `VirtualPumpPlugin` adjusts its own description the same way.
+     *
+     * **Extended and combined bolus are refusals, not omissions** (§8.4, §0 item 2). The combined
+     * ("multiwave") bolus has no capability flag of its own — AAPS reaches it through the extended
+     * one — so clearing `isExtendedBolusCapable` withdraws both.
+     *
+     * **TDD is different: the data exists and nobody has wired it up.** The pump logs
+     * `23 Daily Total Insulin` with the total in `v1` as centi-units, and
+     * `PumpSync.createOrUpdateTotalDailyDose` takes that shape. Until [loadTDDs] does something,
+     * claiming the capability is a promise; when it does, delete these two lines rather than
+     * editing shared code.
+     *
+     * Built once. `fillFor` allocates and re-derives on every call, and this is read from the UI.
+     */
+    override val pumpDescription: PumpDescription = PumpDescription().fillFor(PumpType.YPSOPUMP).apply {
+        isExtendedBolusCapable = false
+        supportsTDDs = false
+        needsManualTDDLoad = false
+    }
     override val isFakingTempsByExtendedBoluses: Boolean = false
 
     /**
@@ -232,11 +263,20 @@ class YpsoPlugin @Inject constructor(
         })
     }
 
+    /**
+     * ⚠ The last line is a **safety statement, not a status field**, and it is deliberately not
+     * derived from anything.
+     *
+     * It used to read "profile write UNTESTED", which stopped being true on 2026-07-31 when Phase 4
+     * passed — a stale claim in the one string a user reads to decide what the build in their hand
+     * can do. What replaced it is the claim that is still true and will stay true until a human
+     * decides otherwise: every test to date has been on saline, off-body.
+     */
     override fun pumpSpecificShortStatus(veryShort: Boolean): String = buildString {
         append("Firmware: ${ypsoPump.firmwareVersion.ifBlank { "?" }}")
         if (!veryShort) {
             append("\nMode: ${ypsoPump.deliveryModeName.ifBlank { "?" }}")
-            append("\nSaline test build: profile write UNTESTED")
+            append("\nSaline test build — not for use with insulin")
         }
     }
 
@@ -493,12 +533,22 @@ class YpsoPlugin @Inject constructor(
 
     override fun loadTDDs(): PumpEnactResult = notImplemented("loadTDDs")
 
+    /**
+     * The comment used to be "Saline test build", which said the wrong thing twice: it named a
+     * temporary state as the reason for a permanent refusal, and it would have gone on being shown
+     * after the build stopped being a saline one. These methods are not refused because the driver
+     * is under test; they are refused because nothing behind them is implemented.
+     *
+     * Since [pumpDescription] no longer advertises these, reaching this method should now be rare —
+     * so it logs, because a call that arrives anyway means something is reading the capability from
+     * somewhere other than the description.
+     */
     private fun notImplemented(what: String): PumpEnactResult {
-        aapsLogger.warn(LTag.PUMP, "REFUSED $what: not implemented for this pump")
+        aapsLogger.warn(LTag.PUMP, "REFUSED $what: not implemented for this pump, and not advertised in pumpDescription")
         return pumpEnactResultProvider.get()
             .success(false)
             .enacted(false)
-            .comment(rh.gs(R.string.ypso_read_only_build))
+            .comment(rh.gs(R.string.ypso_not_supported))
     }
 
     // ==================== PREFERENCES ====================

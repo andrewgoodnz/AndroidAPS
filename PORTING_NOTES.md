@@ -1877,12 +1877,53 @@ number and never the slot index, which is the regression that would corrupt IOB.
 They earned their keep on the first run by failing: §4a's illustrative frame carried a CRC that is
 not the CRC of its payload. Prose drifts; a vector in a test does not.
 
-`:pump:ypso` itself is still untested — the plugin and service need Android test doubles, and the
-decodes were the valuable part.
+#### ✅ `:pump:ypso` now has **35 tests** — 2026-08-03
+
+It had none. Two files, and what they cover was decided by what could be reached rather than by what
+would be tidy:
+
+**`YpsoPluginTest` — 20 tests.** `YpsoPlugin` constructs under `TestBaseWithProfile` with a mocked
+`CommandQueue` and `UiInteraction`, which is enough to reach everything that does not need the bound
+service. The two things most worth pinning turned out to be reachable:
+
+- **What the driver tells AAPS it can do.** Extended bolus and TDD are withdrawn, bolus, TBR, basal
+  profile, refill and battery are not, and `PumpType.YPSOPUMP` is asserted to *still* declare
+  `ExtendedBolus` — so the test fails if someone withdraws it by editing shared `core/data` instead.
+- **That a refusal never reports success**, §0's oldest rule. `setExtendedBolus`,
+  `cancelExtendedBolus`, `loadTDDs`, and bolus and TBR with nothing paired, all assert
+  `success=false, enacted=false` — and the bolus asserts `bolusDelivered=0.0`, because the dangerous
+  version of this bug is a failed result carrying an amount.
+
+Also `isThisProfileSet` at its rounding boundary, in both directions: too strict and AAPS offers to
+rewrite a correct profile on every loop iteration, too loose and a wrong hour stays in the pump.
+
+**`SuspendRecordDecisionTest` — 15 tests**, and this one required a change to make possible. See
+below.
+
+`YpsoService` is still not directly testable: it is a `DaggerService`, there is no Robolectric in
+this project, and adding one for a single module is not proportionate. What *was* done is to lift
+the one piece of arithmetic in it that has been wrong four times.
+
+##### `SuspendRecordDecision` — the renewal logic, where a test can reach it
+
+`syncSuspendedState` decided the fate of the 0% `PUMP_SUSPEND` record inline, so the only thing that
+had ever exercised it was a fourteen-hour unattended hardware run — on a build that turned out to
+predate the fix. `SuspendRecordDecision.decide(mode, remainingMs, renewBelowMs)` is now a total
+function of three values and the service maps its answer onto records, notifications and log lines.
+Behaviour is unchanged; the extraction was mechanical.
+
+The tests are written in the run's own numbers — 60-minute record, ~20-minute poll, 30-minute
+threshold — and include the boundary that the phase-lock turned on, the negative-remaining case, and
+a nine-poll simulation asserting no lapse is ever reported across a clean run. `lapsedByMs` is
+pinned in all three of its states, including *no lapse on the first poll of a suspension*: reporting
+one there would fire every time the pump stopped and train the reader to ignore the line.
+
+⚠ **6b-RERUN must be run on a build that includes this extraction**, not on one from before it. That
+is the same trap the last run fell into, and it is worth saying twice.
 
 Also worth doing eventually, none of it blocking: a history screen (Medtronic's
-`MedtronicHistoryActivity` is the pattern), and deleting `:pump:ypsopump` once the last useful
-reference is mined out of it.
+`MedtronicHistoryActivity` is the pattern), and `loadTDDs` from the pump's type-23 entries.
+**`:pump:ypsopump` is gone** — deleted 2026-08-03, see §9.
 
 ---
 
@@ -2120,7 +2161,42 @@ so hitting it is logged as a fault rather than absorbed.
 It runs at the end of every `readPumpStatus`, so in practice: every status read AAPS asks for, and at
 worst every **20 minutes** when idle (§8.2).
 
-### ⚠ Still open: `YpsomedCapabilities` promises three things the driver refuses
+### ✅ [fixed] Closed: `YpsomedCapabilities` promised three things the driver refuses
+
+**Fixed 2026-08-03, in `YpsoPlugin.pumpDescription` rather than in `PumpCapability`.** The three
+flags are cleared where the plugin answers for itself:
+
+```kotlin
+override val pumpDescription: PumpDescription = PumpDescription().fillFor(PumpType.YPSOPUMP).apply {
+    isExtendedBolusCapable = false
+    supportsTDDs = false
+    needsManualTDDLoad = false
+}
+```
+
+Two reasons it went here and not into shared `core/data`. Every line changed outside `pump/ypso/` is
+future rebase conflict surface (§9), and this cost none. And **every consumer reads these back
+through `pump.pumpDescription`** — `LoopPlugin`, `ActionsFragment`, `TreatmentsActivity`,
+`TDDStatsActivity` — which is this plugin's property to answer; `VirtualPumpPlugin` adjusts its own
+description the same way. The `PumpCapability` entry is left as upstream ships it.
+
+The combined ("multiwave") bolus has no capability flag of its own — AAPS reaches it through the
+extended one — so clearing `isExtendedBolusCapable` withdraws both. Four tests pin it, including
+that the underlying `PumpType.YPSOPUMP` still declares `ExtendedBolus`, so the test fails if someone
+"fixes" this by editing shared code instead.
+
+**TDD stays a genuine opportunity, now stated as one rather than promised.** The data exists — the
+pump logs `23 Daily Total Insulin` with the total in `v1` as centi-units, and
+`createOrUpdateTotalDailyDose` takes that shape — so when `loadTDDs` is implemented, the fix is to
+delete two lines here, not to edit `core/data`.
+
+The refusal comment moved too. It read `ypso_read_only_build` → "Saline test build", which named a
+temporary state as the reason for a permanent refusal and would have gone on being shown after the
+build stopped being a saline one. It now reads "Not supported by this driver".
+
+#### The original entry
+
+⚠ **`YpsomedCapabilities` promises three things the driver refuses**
 
 ```kotlin
 YpsomedCapabilities(arrayOf(
@@ -2138,9 +2214,10 @@ cannot work.
 Medtrum shows the convention — its capability list carries the comment *"Technically the pump supports
 ExtendedBolus, but not implemented (yet)"* and simply **omits** it.
 
-**Not changed here, deliberately.** `PumpCapability` lives in shared `core/data` and `YpsomedCapabilities`
-is also used by the upstream `:pump:ypsopump` driver, so it is not this driver's to edit unilaterally.
-Two ways forward, and they point in opposite directions:
+**Not changed here, deliberately** — and this was right about the constraint and wrong about the
+conclusion. `PumpCapability` lives in shared `core/data` and is not this driver's to edit; what was
+missed is that it did not need editing, because `pumpDescription` is the plugin's own property and
+every consumer goes through it. Two ways forward were listed, and they point in opposite directions:
 
 - Drop `ExtendedBolus` until it is implemented and tested, matching Medtrum.
 - Implement `loadTDDs` instead of dropping the TDD capabilities — **the data already exists.** The

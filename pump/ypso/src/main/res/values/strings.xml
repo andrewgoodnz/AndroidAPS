@@ -6,7 +6,7 @@
     <string name="ypso_pump_description">Pump integration for Ypsomed YpsoPump (plaintext research pump)</string>
     <string name="ypso_pump_setting">YpsoPump settings</string>
 
-    <string name="ypso_read_only_build">Saline test build</string>
+    <string name="ypso_not_supported">Not supported by this driver</string>
     <string name="ypso_read_only_banner">SALINE TEST BUILD — bolus, temp basal and basal profile write are enabled and verified on saline. Not for use with insulin.</string>
 
     <string name="ypso_pairing_title">Pair YpsoPump</string>
