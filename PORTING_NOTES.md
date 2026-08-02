@@ -154,11 +154,17 @@ AAPS core ── YpsoPlugin  (Pump interface)              [shape: MedtrumPlugin
 | `:pump:ypso:sdk` | `com.ypsopump.sdk` | vicktor's ypso-sdk, vendored, minus `crypto/` and `keyexchange/` |
 | `:pump:ypso:sdk-common` | `com.pump.common` | vicktor's pump-common, vendored verbatim (the `PumpManager` contract) |
 
-`:pump:ypsopump` — session 1's forward-port of Andy Rozman's module — is **still in the tree but
-unregistered from the app**. It is the parts donor it was declared to be (Ypso domain enums,
-response-translator logic, config UI ideas). Registering both would have put two YpsoPump entries
-in the pump list, one of them backed by a dummy connector. It is gone from
-`app/build.gradle.kts`, `PluginsListModule`, `AppComponent` and `TestAppComponent`.
+`:pump:ypsopump` — session 1's forward-port of Andy Rozman's module — is **deleted, 2026-08-03**. It
+was the parts donor it was declared to be (Ypso domain enums, response-translator logic, config UI
+ideas), it had been unregistered from the app since session 2, and everything worth taking from it
+had been taken. It is in git history; `git show <sha>:pump/ypsopump/...` retrieves any of it.
+
+**Deleting it removed three changes to shared files as well**, which is why it was worth doing rather
+than leaving 78 dormant files in place. `PumpDriverState.Sleeping`,
+`PumpDriverState.ErrorCommunicatingWithPump` and their two strings in `pump/common`, and
+`Notification.YPSOPUMP_PUMP_ALARM = 95` in `core/interfaces`, existed **only** for the donor — nothing
+in `:pump:ypso` ever referenced them. All three files are now byte-identical to upstream, and each
+one was a rebase conflict waiting to happen (§9).
 
 ### Why the service is Medtrum-shaped but not Medtrum-internally
 
@@ -2391,7 +2397,94 @@ So index 3 is **mapped but not load-bearing**: worth knowing, and nothing needs 
 
 ---
 
-## 9. Build environment gotchas
+## 9. Tracking upstream, and the changed-file surface
+
+This driver lives on a long-running branch of a project that keeps moving. Everything below exists
+to make the next rebase cheap.
+
+### The remotes
+
+```
+origin     https://github.com/andrewgoodnz/AndroidAPS      the fork
+upstream   https://github.com/nightscout/AndroidAPS        the project
+```
+
+Work happens on **`ypso-integration`**, branched from `upstream/master`.
+
+### The rebase, step by step
+
+```bash
+git fetch upstream
+git log --oneline HEAD..upstream/master | wc -l        # how much has moved
+
+git checkout ypso-integration
+git checkout -b ypso-integration-rebase-$(date +%Y%m%d)   # ⚠ always. See below
+git rebase upstream/master
+```
+
+**Always rebase on a throwaway branch.** A rebase of this branch replays every ypso commit, and the
+commit messages *are* the record of why each change was made — several are the only place a
+hardware finding is written down at full length. A rebase that goes wrong and gets resolved by
+force is how that record is lost. If the throwaway branch comes out clean and builds, fast-forward
+`ypso-integration` onto it; if it does not, delete it and nothing was risked.
+
+Then, in order, and do not skip any of them:
+
+```bash
+./gradlew :pump:ypso:sdk:testFullDebugUnitTest     # 65 tests — the wire decodes
+./gradlew :pump:ypso:testFullDebugUnitTest         # 35 tests — the plugin and the suspend logic
+./gradlew :app:assembleFullDebug                   # the whole thing still builds
+```
+
+And then **read `SALINE_TEST_PROCEDURE.md` §0 before installing it on the test tablet.** A rebase
+onto a moved AAPS is not a no-op for a pump driver: `PumpSync`'s contract, `Pump`'s interface and
+the command queue's behaviour are all upstream's to change, and all three are load-bearing here.
+
+### The changed-file surface, audited 2026-08-03
+
+Every file this branch touches outside `pump/ypso/` is a place a rebase can conflict. The list is
+deliberately short, and each entry is here because it cannot be anywhere else:
+
+| File | Change | Why it cannot live in the module |
+|---|---|---|
+| `settings.gradle` | +3 lines: `:pump:ypso`, `:pump:ypso:sdk`, `:pump:ypso:sdk-common` | Gradle has to be told the modules exist |
+| `app/build.gradle.kts` | +1 line: `implementation(project(":pump:ypso"))` | The app has to depend on the driver |
+| `app/src/main/kotlin/app/aaps/di/AppComponent.kt` | +2 lines: `YpsoModule` | Dagger's component list is upstream's file |
+| `app/src/main/kotlin/app/aaps/di/PluginsListModule.kt` | +7 lines: `bindYpsoPlugin` at `@IntKey(175)` | The plugin map is upstream's file |
+| `gradle/libs.versions.toml` | +1 line: `no-nordicsemi-android-ble` | Version catalogue is central by design |
+| `.gitignore` | +1 line: `/reference` | Keeps the vendor sources and decrypted exports out of the repo. Nothing under `reference/` is tracked |
+| `PORTING_NOTES.md`, `SALINE_TEST_PROCEDURE.md`, `README_YPSO.md` | new files | New files never conflict |
+
+**Six lines of real conflict surface, in five upstream files.** All five are additive single-line
+insertions into lists, which is the cheapest possible kind of conflict to resolve — and it is worth
+knowing that `PluginsListModule` and `AppComponent` are exactly the files upstream edits when *it*
+adds a pump, so those two are the ones that will actually conflict.
+
+**Three files came off this list on 2026-08-03**, by deleting the donor module (§1):
+
+- `core/interfaces/.../Notification.kt` — `YPSOPUMP_PUMP_ALARM = 95`
+- `pump/common/.../defs/PumpDriverState.kt` — `Sleeping`, `ErrorCommunicatingWithPump`
+- `pump/common/src/main/res/values/strings.xml` — the two strings behind them
+
+All three were added for `:pump:ypsopump` and referenced by nothing in `:pump:ypso`. They are now
+byte-identical to upstream. `bash.exe.stackdump`, a crash artefact committed by accident, went too.
+
+**`PumpType.YPSOPUMP` and `PumpCapability.YpsomedCapabilities` are upstream's already** and are not
+modified here — which is why the extended-bolus and TDD capabilities are withdrawn in
+`YpsoPlugin.pumpDescription` instead (§8.6). Do not "fix" that by editing `core/data`; a test asserts
+the upstream declaration is still there.
+
+### Checking the surface has not grown
+
+```bash
+git diff --stat $(git merge-base HEAD upstream/master) HEAD -- . ':(exclude)pump/ypso'
+```
+
+Anything in that output not in the table above is new, and each new entry should have to justify
+itself. The question to ask is the one that took three files off the list: **is this here for the
+driver, or for something the driver no longer contains?**
+
+## 9a. Build environment gotchas
 
 Carried forward from session 1, all still true:
 

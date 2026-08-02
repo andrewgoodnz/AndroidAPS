@@ -12,8 +12,6 @@
     <string name="pump_status_busy">Busy</string>
     <string name="pump_status_suspended">Suspended</string>
     <string name="pump_status_executing_command">Executing Command</string>
-    <string name="pump_status_sleeping">Sleeping</string>
-    <string name="pump_status_error_communicating">Error communicating with pump</string>
 
     <!-- Commands -->
     <string name="pump_cmd_desc_get_settings">Get Settings</string>
