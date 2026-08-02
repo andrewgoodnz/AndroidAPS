@@ -2284,6 +2284,55 @@ every consumer goes through it. Two ways forward were listed, and they point in 
   basalAmount = 0.0` and only a total, which is all this pump offers. It needs a small SDK method to
   expose the entries, since `YpsoHistoryMapper` deliberately maps type 23 to null.
 
+### ⚠⚠ [open] `YpsoBolusSpeed` controls nothing, and its default was measured wrong — 2026-08-03
+
+**The preference never reaches the pump.** Its whole effect:
+
+```kotlin
+pumpManager.bolusSpeedUnitsPerMinute = configuredBolusSpeedUnitsPerMinute()   // YpsoService
+private fun expectedDeliveryMs(amount: Double) = ((amount / (speed / 60.0)) * 1000)
+```
+
+`expectedDeliveryMs` and `bolusTimeoutMs`, and nothing else. It is a **local timeout estimate**, while
+the plugin presents it as a three-way user choice and its own KDoc calls it *"the pump's own speed
+index"*. Nothing is written to the pump; the bolus command carries amount, duration and type, and no
+speed field.
+
+**And the default is wrong.** It came from the decrypted Lotus export — *"defaults to the 12 U/min the
+Lotus export had configured"* — an assumption with nothing to check it, because **this pump has no menu
+item for bolus speed at all** (its owner, 2026-08-03). Two boluses measured the same day rule 12 out:
+
+| | asked | sent → Idle | needs at 12 U/min | needs at 33.3 U/min |
+|---|---|---|---|---|
+| 06:45:17 | 0.3 U | **1.27 s** | 1.50 s | 0.54 s + overhead |
+| 06:53:09 | 3.92 U | **8.33 s** | 19.6 s | 7.06 s + overhead |
+
+The 0.3 U bolus is the one that settles it: it reached `Idle` in 1.27 s **including** the command
+round trip and up to 500 ms of poll granularity, and 12 U/min needs 1.50 s for the delivery alone.
+Both samples fit ~33 U/min with a consistent ~0.7 s overhead. **The pump appears to deliver at a
+fixed ~33 U/min.**
+
+**It fails in the safe direction, which is why nothing surfaced it.** The timeout is expected + slack,
+so believing the pump slower than it is makes the driver wait *longer*; it can never abandon a bolus
+still running. Nothing has been mis-dosed and nothing is at risk.
+
+**What is wrong is the claim.** A dropdown offering "3 / 12 / 33.3 U/min" tells the user they are
+configuring the pump. They are configuring a log line and a timeout. Same species as
+`YpsomedCapabilities` promising an extended bolus — and worse in one respect: the capability could be
+caught by pressing the button, whereas this one had no pump menu to contradict it and needed a
+stopwatch.
+
+⚠ **Do not map it to a settings index on the strength of the obvious candidate.** If speed index 2 =
+33.3 U/min then `index 8 = 2` from the §8.8 probe is a tempting fit — and that is exactly the shape of
+the near-miss that almost mapped the bolus increment to index 2, where *"the value agreed with the
+assumption, and the assumption was the thing that was wrong"*. Settle it the way index 3 was settled:
+change the speed from a controller that can, re-run `probeUnknownSettings()`, and require **one** index
+to move with the other eleven as the control. If nothing can change it, it is firmware-fixed and the
+preference should simply go.
+
+**Not changed during the hardware session** that found it — §8.6's rule. The fix when it happens is to
+relabel it as the timeout estimate it is, or delete it and hard-code a generous timeout.
+
 ### ✅ [verified] Closed: `bolusSize = 0.1` is safe — the increment is a menu setting only
 
 This section used to say that `PumpType.YPSOPUMP` hard-coding a 0.1 U step was a latent mis-dosing
