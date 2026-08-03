@@ -159,11 +159,36 @@ class YpsoPumpManagerImpl private constructor(
         private const val PROBE_POLL_INTERVAL_MS = 2_000L
 
         /**
-         * How long [probeExtendedBolus] keeps watching after the programmed duration has elapsed.
-         * The question it exists to answer is *when* the pump stops reporting the bolus, so the
-         * watch has to outlast the bolus or the answer is cut off at the interesting moment.
+         * How long [probeExtendedBolus] watches an accepted extended bolus before cancelling it.
+         *
+         * Long enough to see whether `slowInjected` moves at all, short enough that the bench is
+         * not tied up. It does **not** wait for the bolus to finish — the probe cancels instead,
+         * which answers Phase 8a's real question (does the pump report it as *running* or as
+         * *programmed*) without holding the command queue for the full duration.
          */
-        private const val PROBE_EXTRA_WATCH_MS = 45_000L
+        private const val PROBE_WATCH_MS = 30_000L
+
+        /** The smallest deliverable amount, used for the positive control. */
+        private const val PROBE_CONTROL_UNITS = 0.1
+
+        /** Long enough for a 0.1 U standard bolus to finish before the sweep starts. */
+        private const val PROBE_CONTROL_SETTLE_MS = 5_000L
+
+        /** Let the cancel take effect before reading back whether it did. */
+        private const val PROBE_CANCEL_SETTLE_MS = 3_000L
+
+        /** The amount used for each extended attempt. Only the accepted one delivers anything. */
+        private const val PROBE_EXTENDED_UNITS = 1.0
+
+        /**
+         * Durations tried in order, stopping at the first the pump accepts.
+         *
+         * 1 is known rejected (2026-08-03, GATT status 130) and is kept as the first step so the
+         * sweep carries its own control: 1 rejected + 15 accepted means the pump enforces a
+         * minimum duration. 15 is AAPS's declared step for this pump and the prime suspect; 30 and
+         * 60 are there so that a 15-minute rejection does not end the experiment prematurely.
+         */
+        private val PROBE_DURATIONS_MINUTES = listOf(1, 15, 30, 60)
 
         /** Re-reads of the log before giving up on finding the entry. */
         private const val BOLUS_HISTORY_ATTEMPTS = 3
@@ -1542,14 +1567,14 @@ class YpsoPumpManagerImpl private constructor(
      *
      * @return a human-readable report for the log and the dialog. Never throws.
      */
-    suspend fun probeExtendedBolus(amount: Double, durationMinutes: Int): String = withConnection {
+    suspend fun probeExtendedBolus(): String = withConnection {
         val report = StringBuilder()
         fun say(line: String) {
             log("[ypso-ext] $line")
             report.appendLine(line)
         }
 
-        say("PROBE extended bolus: ${amount}U over ${durationMinutes}min — bench instrument, writes no treatment record")
+        say("PROBE extended bolus — bench instrument, writes no treatment record")
 
         // Same rule as the standard bolus: without a baseline the pump's log cannot tell this
         // delivery from one already in it, and an unconfirmable delivery is not one this driver
@@ -1560,66 +1585,115 @@ class YpsoPumpManagerImpl private constructor(
             return@withConnection report.toString()
         }
         say("baseline newest event sequence = $baseline")
-
-        val before = suspendGetBolusStatus()
-        say("before: ${before?.describe() ?: "bolus status unreadable"}")
+        say("before: ${suspendGetBolusStatus()?.describe() ?: "bolus status unreadable"}")
 
         cancelRequested = false
-        if (!suspendStartBolus(amount, durationMinutes)) {
-            say("RESULT: the pump REFUSED the bolusType=2 command outright. Extended bolus is not available on this firmware.")
+
+        // ── The positive control, and it comes first for a reason ────────────────────────────
+        //
+        // The first run of this probe was rejected at the ATT layer and the natural reading was
+        // "this firmware has no extended bolus". Nothing in that run could distinguish it from
+        // "the pump refuses a bolus right now" or "1 minute is out of range" — three explanations,
+        // one observation. A standard bolus of the smallest deliverable amount rules out the first
+        // before anything else is tried, and a sweep of durations separates the other two.
+        //
+        // ⚠ Whether this pump can do an extended bolus **at all** is genuinely unknown. mylife
+        // Lotus is known to implement the *bolus speed* setting against this hardware, which is a
+        // different feature and is not evidence either way.
+        say("control: sending a standard ${PROBE_CONTROL_UNITS}U bolus (type=1) to prove the path works in this state")
+        if (!suspendStartBolus(PROBE_CONTROL_UNITS)) {
+            say("RESULT: even a STANDARD bolus was refused right now. This says nothing about the extended bolus — fix the pump's state and re-run.")
             return@withConnection report.toString()
         }
-        say("command accepted by the ATT layer — which proves nothing on this pump (§0). Watching the status instead.")
+        say("control accepted. Waiting for it to finish before sweeping durations.")
+        delay(PROBE_CONTROL_SETTLE_MS)
+        say("after control: ${suspendGetBolusStatus()?.describe() ?: "unreadable"}")
 
-        // Poll well past the programmed duration. The point is to see *when* the pump stops
-        // reporting the extended bolus as running: promptly means it treats the command as
-        // programmed and the queue is free, and only-at-the-end means a 15-minute bolus would hold
-        // the queue for 15 minutes, which is Phase 8a's stop condition.
-        val watchMs = (durationMinutes * 60_000L) + PROBE_EXTRA_WATCH_MS
-        val startedAt = System.currentTimeMillis()
+        // ── The duration sweep ───────────────────────────────────────────────────────────────
+        //
+        // **A rejected write delivers nothing**, so trying several durations costs no saline
+        // except for the one that is accepted — which is what makes a sweep the cheap experiment
+        // rather than the expensive one.
+        //
+        // 1 minute is known to be rejected (GATT status=130, an ATT application error, on
+        // 2026-08-03). It is kept as the first step so the sweep carries its own control: if 1 is
+        // rejected and 15 accepted, the constraint is a **minimum duration**, and AAPS's
+        // `extendedBolusSettings` 15-minute step turns out to have been describing the pump rather
+        // than the UI. If every duration is rejected while the control above succeeded, the
+        // payload is wrong for type=2 in some way that is not the duration.
+        var accepted = -1
+        for (minutes in PROBE_DURATIONS_MINUTES) {
+            say("trying ${PROBE_EXTENDED_UNITS}U over ${minutes}min (type=2)…")
+            if (suspendStartBolus(PROBE_EXTENDED_UNITS, minutes)) {
+                accepted = minutes
+                say("ACCEPTED at ${minutes}min — which proves only that the write was taken, not that anything is running (§0)")
+                break
+            }
+            say("  rejected at ${minutes}min — no insulin delivered by a refused write")
+        }
+
+        if (accepted < 0) {
+            say(
+                "RESULT: every duration was rejected while a standard bolus succeeded. So it is NOT the pump's state, " +
+                    "and NOT a minimum-duration limit. Either this firmware has no extended bolus, or the 13-byte payload " +
+                    "is wrong for bolusType=2 in a way the duration does not explain. Those two are NOT distinguished by " +
+                    "this probe and should not be written up as though they were."
+            )
+            return@withConnection report.toString()
+        }
+
+        // ── Watch it, then cancel it ─────────────────────────────────────────────────────────
         var sawRunning = false
         var mismatch: String? = null
+        val startedAt = System.currentTimeMillis()
 
-        while (System.currentTimeMillis() - startedAt < watchMs) {
+        while (System.currentTimeMillis() - startedAt < PROBE_WATCH_MS) {
             val status = suspendGetBolusStatus()
             val elapsed = (System.currentTimeMillis() - startedAt) / 1000
             say("t+${elapsed}s: ${status?.describe() ?: "unreadable"}")
 
-            if (status != null) {
-                if (status.slowTotal > 0f) {
-                    sawRunning = true
-                    if (abs(status.slowTotal - amount) > BOLUS_AMOUNT_EPSILON) {
-                        mismatch = "pump reports an extended total of ${status.slowTotal} U against ${amount} U requested"
-                    }
-                    if (status.totalDuration > 0 && status.totalDuration != durationMinutes) {
-                        mismatch = (mismatch?.plus("; ") ?: "") +
-                            "pump reports a duration of ${status.totalDuration} min against $durationMinutes min requested"
-                    }
-                    if (mismatch != null) {
-                        say("MISMATCH: $mismatch — cancelling immediately rather than letting it run")
-                        suspendCancelExtendedBolus()
-                        break
-                    }
+            if (status != null && status.slowTotal > 0f) {
+                sawRunning = true
+                if (abs(status.slowTotal - PROBE_EXTENDED_UNITS) > BOLUS_AMOUNT_EPSILON) {
+                    mismatch = "extended total reads ${status.slowTotal} U against ${PROBE_EXTENDED_UNITS} U requested"
                 }
-                // Stopped reporting an extended bolus after having reported one: it is over.
-                if (sawRunning && status.slowTotal == 0f && status.slowStatus == 0) {
-                    say("the pump stopped reporting an extended bolus at t+${elapsed}s")
+                if (status.totalDuration > 0 && status.totalDuration != accepted) {
+                    mismatch = (mismatch?.plus("; ") ?: "") +
+                        "duration reads ${status.totalDuration} min against $accepted min requested"
+                }
+                if (mismatch != null) {
+                    say("MISMATCH: $mismatch — cancelling now rather than letting it run")
                     break
                 }
             }
             delay(PROBE_POLL_INTERVAL_MS)
         }
 
+        // Always cancel. This is a bench probe and leaving a multi-minute delivery running after
+        // it would be leaving the instrument switched on. It also exercises `cancelBolus("extended")`
+        // — Phase 8d's safety half, which has never run, and which must work before the capability
+        // is ever advertised because `LoopPlugin.goToZeroTemp` calls it on every pump disconnect.
+        say("cancelling the extended bolus (this is also Phase 8d's first exercise of the extended cancel)")
+        val cancelAccepted = suspendCancelExtendedBolus()
+        delay(PROBE_CANCEL_SETTLE_MS)
         val after = suspendGetBolusStatus()
-        say("after: ${after?.describe() ?: "unreadable"}")
+        say("after cancel (write accepted=$cancelAccepted): ${after?.describe() ?: "unreadable"}")
+        val cancelConfirmed = after != null && after.slowTotal == 0f
 
         say(
             when {
-                mismatch != null -> "RESULT: the pump did NOT echo what was sent — $mismatch. The payload layout is wrong for bolusType=2."
-                !sawRunning      -> "RESULT: the command was accepted but the pump never reported an extended bolus. It was discarded silently, which is this pump's documented behaviour for a payload it cannot validate (§4f)."
-                else             -> "RESULT: the pump accepted and ran an extended bolus, echoing the amount and duration. Read the t+ lines for whether slowInjected climbed gradually, and for when it stopped reporting."
+                mismatch != null -> "RESULT: accepted at ${accepted}min but the pump did NOT echo what was sent — $mismatch. The payload is wrong for type=2."
+                !sawRunning      -> "RESULT: accepted at ${accepted}min but the pump never reported an extended bolus running. Taken and discarded — §4f's silent-discard behaviour."
+                else             -> "RESULT: the pump accepted and RAN a ${PROBE_EXTENDED_UNITS}U extended bolus over ${accepted}min, echoing amount and duration. " +
+                    "Cancel ${if (cancelConfirmed) "CONFIRMED by read-back" else "NOT confirmed — check the pump"}."
             }
         )
+        if (accepted > PROBE_DURATIONS_MINUTES.first()) {
+            say(
+                "NOTE: ${PROBE_DURATIONS_MINUTES.first()}min was rejected and ${accepted}min was accepted, so the pump enforces a " +
+                    "MINIMUM DURATION. AAPS's 15-minute extendedBolusSettings step was describing the pump, not the UI."
+            )
+        }
         say("Now press Read history, and check whether it landed in extendedBoluses or boluses (Phase 8c).")
         report.toString()
     }
