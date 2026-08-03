@@ -300,22 +300,51 @@ can be ignored; it is the whole reason step 2 exists. Do not "fix" it by adding 
 block: `app/build.gradle.kts` is one of the seven shared files this branch touches (§9), and signing
 does not need a build change.
 
-The key is `C:\Users\Andrew\StudioProjects\aaps_key` — **PKCS12, one entry, alias `key0`**, created
-2021-06-04.
+⚠⚠ **The two devices are signed with different keys, so one build needs two signatures.** This was
+measured on 2026-08-04, not assumed:
+
+| Device | Signed with | Certificate SHA-256 |
+|---|---|---|
+| **Main phone** (the therapy one) | `aaps_key`, alias `key0` | *needs the keystore password to read* |
+| **Test tablet** (`192.168.1.39:5555`) | Android **debug** key, `~/.android/debug.keystore` | `aea08c92…555b7b61` |
+
+The tablet's installed AAPS was pulled and read with `apksigner`: `CN=Android Debug`, matching this
+machine's `debug.keystore` exactly — so the tablet has been carrying `assembleFullDebug` builds. **The
+main phone uses `aaps_key`.** Sign the same unsigned APK twice rather than building twice; the build is
+identical either way, and only the signature differs.
+
+**Build type does not affect looping.** `Config.DEBUG` is declared and then used nowhere in the
+codebase, and the loop gates are the `full` flavour plus a version with no `-` (below). So a release
+build signed with the debug key is a legitimate tablet build, and this is the reason to prefer it over
+`assembleFullDebug`: the `debug` build type sets `enableAndroidTestCoverage`, which instruments the
+app's bytecode with JaCoCo — overhead nobody wants on a device being used to judge timing.
+
+The phone's key is `C:\Users\Andrew\StudioProjects\aaps_key` — **PKCS12, one entry, alias `key0`**,
+created 2021-06-04.
 
 ```bash
 APKSIGNER="/c/Users/Andrew/AppData/Local/Android/Sdk/build-tools/36.1.0/apksigner.bat"
 cd app/build/outputs/apk/full/release
 
+# --- the main phone: aaps_key ---
 "$APKSIGNER" sign --ks "C:\Users\Andrew\StudioProjects\aaps_key" --ks-key-alias key0 \
-    --out app-full-release-signed.apk app-full-release-unsigned.apk
+    --out app-full-release-PHONE-aapskey.apk app-full-release-unsigned.apk
+
+# --- the test tablet: the debug key (password is Android's public default) ---
+"$APKSIGNER" sign --ks "C:\Users\Andrew\.android\debug.keystore" \
+    --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android \
+    --out app-full-release-TESTTABLET-debugkey.apk app-full-release-unsigned.apk
 ```
 
-It prompts for the keystore password. **Leave it prompting** — do not pass `--ks-pass pass:…`, which
-puts the password in your shell history. Then:
+The first prompts for the keystore password. **Leave it prompting** — do not pass `--ks-pass pass:…`
+for `aaps_key`, which would put a real password in your shell history. The debug keystore's password is
+literally `android` on every Android install and is not a secret.
+
+Then check each one says the key you expect:
 
 ```bash
-"$APKSIGNER" verify --print-certs app-full-release-signed.apk
+"$APKSIGNER" verify --print-certs app-full-release-PHONE-aapskey.apk      # -> your own DN
+"$APKSIGNER" verify --print-certs app-full-release-TESTTABLET-debugkey.apk # -> CN=Android Debug
 ```
 
 ### 3. ⚠⚠ Check the signature matches the phone BEFORE you install
@@ -324,18 +353,35 @@ puts the password in your shell history. Then:
 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, and the only way through that is an uninstall — **which deletes
 the AAPS database**: all treatments, all history, the lot. Check first; the check is two commands.
 
-```bash
-# the certificate this APK is signed with
-"$APKSIGNER" verify --print-certs app-full-release-signed.apk | grep -i "SHA-256 digest\|SHA256"
+**The only reliable way to read the installed app's certificate is to pull the installed APK and read
+it with the same tool.** Both sides of the comparison then come from `apksigner`, in the same format:
 
-# the certificate the installed app is signed with
-adb shell dumpsys package info.nightscout.androidaps | grep -iA2 "signatures\|certificate"
+```bash
+# 1. the certificate the NEW APK is signed with
+"$APKSIGNER" verify --print-certs app-full-release-signed.apk | grep -i "SHA-256"
+
+# 2. the certificate the INSTALLED app is signed with — pull it, don't ask dumpsys
+adb shell pm path info.nightscout.androidaps          # -> package:/data/app/~~…/base.apk
+adb pull /data/app/~~…/base.apk installed-aaps.apk    # paste the path from above
+"$APKSIGNER" verify --print-certs installed-aaps.apk | grep -i "SHA-256"
 ```
 
-⚠ **Use `apksigner verify`, not `keytool -printcert -jarfile`.** `minSdk` is 31, so apksigner signs
-with **v2/v3 scheme only and skips v1 (JAR) signing** — and `keytool -printcert -jarfile` only
-understands v1. On a correctly signed APK it reports *"Not a signed jar file"*, which looks exactly
-like a signing failure and is not one. `apksigner verify` reads all the schemes.
+**The two `SHA-256` digests must be identical.** If they are, `adb install -r` will work. If they are
+not, stop — reaching for an uninstall here is how the database gets lost.
+
+Two traps at this step, both of which look like answers and are not:
+
+- ⚠ **`adb shell dumpsys package …` cannot do this.** It prints
+  `signatures:[a1b2c3d4]` — **truncated `hashCode()` values, not certificate fingerprints.** There is
+  nothing there that can be compared against a SHA-256, and the short hex string looks enough like a
+  digest to be mistaken for one.
+- ⚠ **Use `apksigner verify`, not `keytool -printcert -jarfile`.** `minSdk` is 31, so apksigner signs
+  with the **v2/v3 schemes and skips v1 (JAR) signing**, and `keytool -printcert -jarfile` only
+  understands v1. On a perfectly good APK it reports *"Not a signed jar file"*, which reads exactly
+  like a signing failure.
+
+If `pm path` returns several lines (a split install), `base.apk` is the one that carries the
+signature.
 
 ⚠ **The package is `info.nightscout.androidaps`, not `app.aaps`.** `app.aaps` is the Gradle
 *namespace*; the full flavour's `applicationId` is `info.nightscout.androidaps`, and
@@ -361,9 +407,18 @@ There is no undo for an app upgrade, so the rollback is a file.
 adb install -r app-full-release-signed.apk
 ```
 
-`-r` replaces the app and **keeps its data**. If you see
-`INSTALL_FAILED_VERIFICATION_FAILURE`, that is on-device install verification — Play Protect's "Verify
-apps over USB", or Samsung Auto Blocker — and not a signing problem. Turn it off and retry.
+`-r` replaces the app and **keeps its data**. Install the **`PHONE-aapskey`** APK on the phone and the
+**`TESTTABLET-debugkey`** one on the tablet; they are the same build and only the signature differs.
+
+Two failures, and they mean opposite things:
+
+- `INSTALL_FAILED_VERIFICATION_FAILURE` — on-device install verification (Play Protect's "Verify apps
+  over USB", or Samsung Auto Blocker). **Not** a signing problem. Turn it off and retry.
+- ⚠⚠ `INSTALL_FAILED_UPDATE_INCOMPATIBLE` — **a signature mismatch. You have the wrong APK for this
+  device.** The correct response is to go back and sign with the other key, **not** to uninstall.
+  Android will suggest uninstalling; an uninstall deletes the AAPS database, and this error is the one
+  case where the obvious remedy is the destructive one. Nothing has been damaged at this point — the
+  install simply did not happen.
 
 ### 6. ⚠ Verify the data survived — before going anywhere near the pump
 
