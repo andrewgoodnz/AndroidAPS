@@ -15,6 +15,12 @@ default** and cannot happen until the bolus speed is changed by hand.
 into a person. What stops it doing so is the cartridge, not the code — see
 [Before insulin](#before-insulin).
 
+⚠ **One gate is open and it is not about the pump.** Every phase that tests what the *pump* does has
+passed. **Phase 10 — what AAPS's database holds after a bolus is interrupted** by a dropped link or a
+killed app — is written and has never been run, and the code predicts it leaves a bolus counted
+twice. If this build is used for therapy before Phase 10 runs, an interrupted bolus is a record to
+check by hand. Read [Before insulin](#before-insulin) for the specifics, not just this paragraph.
+
 Three documents, and they have different jobs:
 
 | | |
@@ -194,8 +200,8 @@ landed, because they are two separate actions.
 
 ```bash
 export JAVA_HOME=/c/Program\ Files/Android/Android\ Studio/jbr    # or your own JDK
-./gradlew :pump:ypso:sdk:testFullDebugUnitTest      # 65 tests — the wire decodes
-./gradlew :pump:ypso:testFullDebugUnitTest          # 35 tests — the plugin and suspend logic
+./gradlew :pump:ypso:sdk:testFullDebugUnitTest      # 84 tests — the wire decodes
+./gradlew :pump:ypso:testFullDebugUnitTest          # 47 tests — the plugin, suspend and event policy
 ./gradlew :app:assembleFullDebug
 ```
 
@@ -253,6 +259,186 @@ change to the framing code.
 
 ---
 
+## Putting this build on a phone that loops
+
+The test tablet and the phone someone actually wears are different problems. This section is the
+second one. **Everything here is about the app; none of it selects the pump** — see the last step.
+
+### 1. Build the full flavour, from a clean tree
+
+```bash
+export JAVA_HOME=/c/Program\ Files/Android/Android\ Studio/jbr
+./gradlew --stop; ./gradlew :app:clean; ./gradlew :app:assembleFullRelease
+```
+
+**It must be the `full` flavour.** `pumpcontrol` and `aapsclient` are restricted builds — `APS` is
+`BuildConfig.FLAVOR == "full"`, so a closed loop is simply not present in the others.
+
+**`Versions.appVersion` must contain no `-`.** Two separate things turn on that:
+
+- At build time `isMaster()` is true, which enforces `allCommitted()` — **the build fails outright if
+  any tracked file is modified.** That is a feature here: it means a built APK corresponds to a commit
+  you can go back to.
+- At run time `Config.isDev()` is false, so `isEngineeringModeOrRelease()` is true and no
+  `engineering_mode` marker file is needed. `isDev()` trips on a `-` **or on any letter**, so do not
+  put a git hash in it.
+
+Confirm what came out, rather than assuming:
+
+```bash
+cat app/build/outputs/apk/full/release/output-metadata.json
+```
+
+This build: **`versionName 3.4.2.6`, `versionCode 1500`, applicationId `info.nightscout.androidaps`,
+variant `fullRelease`** — no suffix.
+
+### 2. ⚠ Sign it — Gradle does not
+
+**There is no release signing config in this project**, so the output is
+`app-full-release-unsigned.apk` and **Android will not install it at all**. This is not a warning that
+can be ignored; it is the whole reason step 2 exists. Do not "fix" it by adding a `signingConfigs`
+block: `app/build.gradle.kts` is one of the seven shared files this branch touches (§9), and signing
+does not need a build change.
+
+The key is `C:\Users\Andrew\StudioProjects\aaps_key` — **PKCS12, one entry, alias `key0`**, created
+2021-06-04.
+
+```bash
+APKSIGNER="/c/Users/Andrew/AppData/Local/Android/Sdk/build-tools/36.1.0/apksigner.bat"
+cd app/build/outputs/apk/full/release
+
+"$APKSIGNER" sign --ks "C:\Users\Andrew\StudioProjects\aaps_key" --ks-key-alias key0 \
+    --out app-full-release-signed.apk app-full-release-unsigned.apk
+```
+
+It prompts for the keystore password. **Leave it prompting** — do not pass `--ks-pass pass:…`, which
+puts the password in your shell history. Then:
+
+```bash
+"$APKSIGNER" verify --print-certs app-full-release-signed.apk
+```
+
+### 3. ⚠⚠ Check the signature matches the phone BEFORE you install
+
+**A different signing key cannot install over the existing app.** It fails with
+`INSTALL_FAILED_UPDATE_INCOMPATIBLE`, and the only way through that is an uninstall — **which deletes
+the AAPS database**: all treatments, all history, the lot. Check first; the check is two commands.
+
+```bash
+# the certificate this APK is signed with
+"$APKSIGNER" verify --print-certs app-full-release-signed.apk | grep -i "SHA-256 digest\|SHA256"
+
+# the certificate the installed app is signed with
+adb shell dumpsys package info.nightscout.androidaps | grep -iA2 "signatures\|certificate"
+```
+
+⚠ **Use `apksigner verify`, not `keytool -printcert -jarfile`.** `minSdk` is 31, so apksigner signs
+with **v2/v3 scheme only and skips v1 (JAR) signing** — and `keytool -printcert -jarfile` only
+understands v1. On a correctly signed APK it reports *"Not a signed jar file"*, which looks exactly
+like a signing failure and is not one. `apksigner verify` reads all the schemes.
+
+⚠ **The package is `info.nightscout.androidaps`, not `app.aaps`.** `app.aaps` is the Gradle
+*namespace*; the full flavour's `applicationId` is `info.nightscout.androidaps`, and
+`dumpsys package app.aaps` returns nothing at all — which reads as "no AAPS installed" and is
+wrong.
+
+**The SHA-256 fingerprints must match.** If they do not, stop and work out which key the phone's
+build used. Reaching for an uninstall at this point is how the database gets lost.
+
+### 4. Export first — this is the rollback
+
+There is no undo for an app upgrade, so the rollback is a file.
+
+1. In the **currently installed** AAPS: Maintenance → **Export settings**, then Maintenance →
+   **Export database**. These are **two separate actions** and people do one and think they did both.
+2. Check both files exist on the phone and note their timestamps.
+3. Copy them **off** the phone (`adb pull`). A backup that only exists on the device it is protecting
+   is not a backup.
+
+### 5. Install over the top
+
+```bash
+adb install -r app-full-release-signed.apk
+```
+
+`-r` replaces the app and **keeps its data**. If you see
+`INSTALL_FAILED_VERIFICATION_FAILURE`, that is on-device install verification — Play Protect's "Verify
+apps over USB", or Samsung Auto Blocker — and not a signing problem. Turn it off and retry.
+
+### 6. ⚠ Verify the data survived — before going anywhere near the pump
+
+Open AAPS and check, in this order:
+
+- **Profiles** are present and the active one is the one you expect.
+- **Treatments** — the last few days of boluses and carbs are there.
+- **CGM** is reading, with a current value on the home screen.
+- The loop is in the mode you left it in.
+
+If any of those is wrong, restore from step 4 now rather than continuing.
+
+### 7. Only then, and separately, select the pump
+
+**Carrying this build and using the Ypso driver are two different decisions**, and doing them in one
+step means a problem cannot be attributed to either. The phone can run this APK while still on
+**Virtual Pump** indefinitely — the driver is inert until it is selected.
+
+When the pump switch is the intended change: Config Builder → Pump → **YpsoPump**, tick its
+visibility box, then follow *Bringing one up* from step 3 (bond) — including the **parity check**,
+which is the step that catches a decode regression, and which nothing else will catch for you.
+
+⚠ Also read *Before insulin* below, in particular the open Phase 10 gate. It describes a record that
+can double-count after an interrupted bolus, and it is the one thing on this page that currently asks
+the user to check the driver's work by hand.
+
+---
+
+## Pulling a newer AAPS later
+
+This driver lives on `ypso-integration`, branched from `upstream/master`. Bringing it forward:
+
+```bash
+git fetch upstream
+git log --oneline HEAD..upstream/master | wc -l          # how much has moved
+
+git checkout ypso-integration
+git checkout -b ypso-integration-rebase-$(date +%Y%m%d)  # ⚠ always a throwaway branch
+git rebase upstream/master
+```
+
+**Always rebase on a throwaway branch.** A rebase replays every ypso commit, and those commit
+messages are the only place several hardware findings are written down at full length; a rebase that
+goes wrong and gets resolved by force is how that record is lost. If the throwaway builds clean,
+fast-forward `ypso-integration` onto it. If not, delete it and nothing was risked.
+
+Then, in order, and do not skip any:
+
+```bash
+./gradlew :pump:ypso:sdk:testFullDebugUnitTest     # 84 tests
+./gradlew :pump:ypso:testFullDebugUnitTest         # 47 tests
+./gradlew --stop; ./gradlew :app:clean; ./gradlew :app:assembleFullDebug
+```
+
+**A rebase is not a no-op for a pump driver.** `PumpSync`'s contract, the `Pump` interface and the
+command queue's behaviour are all upstream's to change and all three are load-bearing here. Re-run the
+**parity check** on the test pump afterwards, on saline, before that build goes near a body.
+`PORTING_NOTES.md` §9 has the per-file conflict table and the command that says whether the
+changed-file surface has grown.
+
+### This driver never talks to Nightscout
+
+**It contains no Nightscout code at all** — no upload call, no NSClient dependency. Everything it
+records goes into the local AAPS database through `PumpSync`, and that is the end of the driver's
+involvement.
+
+Anything that does reach Nightscout gets there because **the NSClient plugin syncs that local
+database**, which is AAPS's behaviour and not this driver's. That distinction matters in one direction
+in particular: during the saline phases, NSClient uploading had to be **off**, because a saline bolus
+synced to a shared Nightscout instance becomes a therapy record saying insulin was given that nobody
+received — and there is nothing in the record to say otherwise. On a phone doing real therapy that
+same upload is wanted. **The rule is about which instance and which fluid, not about the driver.**
+
+---
+
 ## Before insulin
 
 Stated plainly, because this is the question the whole project is pointed at.
@@ -293,24 +479,57 @@ things are worth knowing before turning it on:
 
 ---
 
-**No correctness gate is open.** Phase 6b — the last one — closed on 2026-08-03, verified twice:
-2h33m of stopped pump on one build (four renewal cycles), then re-confirmed on the current build
-after a flash (three more), with **zero uncovered time at every transition, including across the
-reinstall**. The 0% suspend record is held continuously while the pump is stopped, which is what
-stops AAPS counting basal insulin that is not being delivered.
+**Every gate about what the pump does is closed.** Phase 6b — the last of those — closed on
+2026-08-03, verified twice: 2h33m of stopped pump on one build (four renewal cycles), then
+re-confirmed on the current build after a flash (three more), with **zero uncovered time at every
+transition, including across the reinstall**. The 0% suspend record is held continuously while the
+pump is stopped, which is what stops AAPS counting basal insulin that is not being delivered.
+
+### ⚠⚠ One gate is open, it is about AAPS's own database, and the code predicts it will fail
+
+**Phase 10 — the interrupted bolus — is written and has never been run.** It is the last thing that
+could still change a record, and unlike every phase before it its subject is not a pump capability.
+The pump's part is not in question: **it owns a bolus once it has been told and finishes it whether or
+not the phone is still there.** What has never been tested is whether AAPS's *record* of that bolus
+settles when the phone is taken out of the loop partway through — the link dropping (10a/10c) or the
+app being killed (10b/10d).
+
+**Read the prediction before trusting the driver here.** `openPendingBolus` writes a committed row
+with `temporaryId` set, `pumpId` null and the amount *requested*; `settlePendingBolus` is the only
+thing that ever promotes it. Nothing else in AAPS consumes `temporaryId` on a bolus, and the history
+sync cannot rescue it — it looks rows up by `pumpId`, the orphan has none, so the sync **inserts a
+second row for the same physical insulin**. One bolus, two live rows, both counting:
+
+| | `amount` | `temporaryId` | `pumpId` |
+|---|---|---|---|
+| the orphaned provisional | what was **requested** | set | **null** |
+| the history-sync import | what the pump **gave** | null | set |
+
+A 10 U bolus would then read as ~20 U on board. **IOB wrong in that direction makes AAPS dose less,
+which is the safe side; but the same orphan mechanism with a *cancelled* bolus over-states insulin
+that was never given, and nothing reconciles it — ever.** Phase 9c already produced exactly one such
+permanent phantom row, which is why this is written as a prediction rather than a worry.
+
+Until Phase 10 has been run, treat a bolus that was interrupted — dropped link, killed app, phone
+rebooted mid-delivery — as **a record that must be checked by hand** against the pump's own history,
+and corrected in AAPS if it double-counts. This is the one thing on this page that asks the user to
+do the driver's job for it.
 
 **Two things only time can answer:**
 
-- **What the event log does at 3000 entries**, roughly three months out.
-- **How the driver behaves across a real DST transition.** The code is there and tested in unit
-  tests; no actual transition has happened while it was running.
+- **What the event log does at 3000 entries**, roughly three months out. That is where a monotonic
+  watermark stops being sound.
+- **How the driver behaves across a real DST or timezone change.** The path exists and is unit
+  tested; no actual transition has happened while it was running.
 
-**And two states never read**, both free at the next cartridge change: byte 0 with the cartridge out
-or priming, and with the reservoir empty.
+**Phase 5's delivery-mode table is complete** — cartridge-out and reservoir-empty both closed on
+2026-08-03. Only "during priming with fluid moving" is unfilled, and it is recorded as *unreachable by
+this method* rather than blank: the reservoir reads `-1` throughout a change, so a mid-prime reading
+is byte-identical to one taken after it.
 
-**None of the above is a capability gap.** The driver can do what it needs to do. What is missing is
-observation — and the decision to move from saline to insulin is a human one, taken by the person
-whose body it is, not a task in a checklist.
+**None of the pump-facing gaps is a capability gap.** The driver can do what it needs to do. What is
+missing is observation — and the decision to move from saline to insulin is a human one, taken by the
+person whose body it is, not a task in a checklist.
 
 ---
 

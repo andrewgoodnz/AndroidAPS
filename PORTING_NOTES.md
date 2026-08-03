@@ -7,7 +7,8 @@ Driver for an **unlocked plaintext research YpsoPump** on current AndroidAPS (3.
 > is the record of what the pump was observed doing and why the code is shaped the way it is,
 > including every wrong turn, because the wrong turns are the part that is expensive to rediscover.
 
-**Status, 2026-08-04: every phase, 1 to 9, has run on hardware and passed.** The driver bonds,
+**Status, 2026-08-04: every phase from 1 to 9 has run on hardware and passed. Phase 10 is written and
+has not run, and it is the only open gate.** The driver bonds,
 connects, authenticates in plaintext with no key exchange, reads every value it needs, and
 **writes** — the pump clock (§4e), a standard bolus with abort (§4f), a temporary basal with cancel
 (§4h), the 24-slot basal profile (§4i), and a **slow bolus delivered as a timed run of standard
@@ -51,16 +52,35 @@ shape appearing in the log rather than in the driver.
 Lotus's speeds but **defaults to the pump's own ~33 U/min — no chunking**, the exact path Phases 1–8
 ran. Passing Phase 9 licensed the option, not a change for anyone who has not picked one.
 
-**Two things stand between here and an insulin trial, and neither is a capability:**
+**Three things stand between here and an insulin trial, and none of them is a pump capability:**
 
 1. ✅✅ **6b is closed — verified twice on 2026-08-03, on the fix and then on HEAD.** 2h33m on the
    08-02 build (four renewal cycles), then HEAD 3.4.2.6 flashed onto the still-stopped pump and left
    to poll unattended (three more), with **zero uncovered time at every transition including across
-   the reinstall**. Decided on `temporaryBasals.duration`, not on a log line (§8.6). **No correctness
-   gate remains open.**
-2. **The 3000-entry log cap now has a date on it** — roughly three months at this user's rate of
+   the reinstall**. Decided on `temporaryBasals.duration`, not on a log line (§8.6).
+2. ⚠⚠ **Phase 10 is written, unrun, and the code says it will fail.** Every gate about what the
+   *pump* does is now closed; this one is about **what AAPS's own database holds after a bolus is
+   interrupted** — the link dropping, or the app being killed, mid-delivery. `openPendingBolus` writes
+   a committed row with `pumpId` null, `settlePendingBolus` is the only thing that promotes it, and
+   **nothing else in AAPS consumes `temporaryId` on a bolus** — so an unsettled provisional cannot be
+   found by the history sync, which looks up by `pumpId` and therefore inserts a *second* row for the
+   same insulin. One bolus, two live rows. 9c already produced exactly one such permanent phantom
+   record, which is why this is stated as a prediction and not a worry (§4g, Phase 10).
+3. **The 3000-entry log cap now has a date on it** — roughly three months at this user's rate of
    profile changes. What happens when it wraps is now traced rather than guessed at, and the probe
    makes it audible instead of silent (§8.5).
+
+**Session 8 closed the remaining tidying and built the therapy candidate.** Item B — the one sync path
+that was not idempotent — is fixed on its own terms rather than behind the watermark (§8.5); the
+capability surface is honest and pinned by tests that fail if someone "fixes" it by editing shared
+`core/data`; the donor module is gone and the changed-file surface outside `pump/ypso/` re-audited at
+**seven files, 19 added lines and 2 changed**; and `:pump:ypso` now carries **47 unit tests** against
+the SDK's 84. The release APK is `full`/`fullRelease` at **versionName 3.4.2.6, no suffix**, built
+from a clean tree because `isMaster()` enforces it. ⚠ **Gradle produces it unsigned** — there is no
+release signing config in this project — so it is signed separately with `apksigner`, and the
+signature must be checked against the phone's installed app *before* installing, because a mismatch
+can only be resolved by an uninstall and an uninstall deletes the database. `README_YPSO.md` has the
+procedure.
 
 **Byte 0 of the system status is identified for two values out of 256, and that is the answer, not a
 gap — Phase 5's table is now complete.** Every state reachable on hardware came back as one of those
@@ -114,6 +134,13 @@ reading top-down would otherwise take a delivering driver for an inert one.
    was being tested, which is the rule the procedure sets for itself. Session 6 removed refused
    capability *claims*, deleted the unregistered donor module and wrote documentation; it added no
    delivery path.
+
+   **Session 8 added none either, and it is the session that built the therapy candidate.** What it
+   changed: the alert-announcement dedupe key (a *narrowing* — it inserts fewer records, never more),
+   one user-facing string, the extraction of two decisions into `YpsoEventPolicy` with the behaviour
+   unchanged, and tests. ⚠ The thing to be clear-eyed about is that **it changed no delivery code and
+   that is exactly why the open gate is still open**: Phase 10 is a question about the database, and
+   nothing in session 8 answered it. Building an installable APK is not evidence about the driver.
 5. ⚠ **Session 7 did add one, and it is the first thing here that makes the phone a sequencer.** The
    chunked bolus issues a *run* of standard boluses on a timer instead of one command (§8.6). Three
    things bound it, and all three are properties of the code rather than intentions: it is **off by
