@@ -2166,11 +2166,85 @@ do not invent others.
 
 | Step | Speed to set | Bolus | Result |
 |---|---|---|---|
-| 9a two chunks | 12 U/min | 2 U | ⏳ not yet run |
+| 9a two chunks | 12 U/min | 2 U | ✅ **PASSED 2026-08-03** |
 | 9b cancel mid-sequence | 3 U/min | 6 U | ⏳ not yet run |
 | 9c connection lost | 3 U/min | 6 U | ⏳ not yet run |
-| 9d the record and IOB | — | — | ⏳ not yet run |
+| 9d the record and IOB | — | — | ⚠ **half passed** — live rows correct; the re-read is not yet done |
 | 9e a refused chunk | 3 U/min | 6 U | ⏳ not yet run |
+
+Run on build **3.4.2.6**, installed 17:06:32. (The labels on the speed dropdown were corrected
+afterwards; the delivery code is byte-identical, so these results stand for HEAD.)
+
+### ✅ 9a PASSED — 2026-08-03 17:09:32
+
+2 U at 12 U/min. **Two entries, five seconds apart, 2.00 U.**
+
+```
+CHUNKED: asked 2.0U at 12.0 U/min -> 2 chunks of [1.0, 1.0] U every 5s
+CHUNKED: chunk 1/2 1.0U sent +0.001s, seq=160910 -> 1.0U
+CHUNKED: chunk 2/2 1.0U sent +5.001s, seq=160911 -> 1.0U, pump entry +5s
+CHUNKED: 2/2 confirmed, 2.0U of 2.0U, phone starts [0.001, 5.001]s,
+         pump entries [5]s apart, seqs [160910, 160911]
+deliverTreatment done: asked 2.0U, pump delivered 2.0U, success=true
+```
+
+**Adjudicated on the count and the spacing, which is the whole point of the step** — the total was
+never going to distinguish anything. The spacing quoted is between the **pump's own entry
+timestamps**, not the phone's send offsets.
+
+**Step 2 — nothing else reached the pump while it ran.** The 35-second window of the 3 U/min run
+below contains 91 log lines and every one is the bolus machinery itself: bolus writes, bolus-status
+frames, history reads. No status read, no temporary basal, no alert check, no history sync. The
+sequence held `withConnection` exactly as designed.
+
+**The delivery-mode probe fired once per sequence, not once per chunk** — `probeDeliveryModeOnce`
+working, and worth confirming because five extra round trips inside an eight-second budget would
+have shown up as spacing drift.
+
+#### ✅ And a second run that was not asked for: 2 U at 3 U/min reproduced Lotus exactly
+
+Run at 17:08:18, before 9a. Five entries `160905`–`160909`, **8, 8, 8, 8 seconds apart**, 2.00 U:
+
+```
+CHUNKED: asked 2.0U at 3.0 U/min -> 5 chunks of [0.4, 0.4, 0.4, 0.4, 0.4] U every 8s
+CHUNKED: 5/5 confirmed, 2.0U of 2.0U, phone starts [0.0, 8.001, 16.002, 24.004, 32.001]s,
+         pump entries [8, 8, 8, 8]s apart, seqs [160905 … 160909]
+```
+
+Set beside the capture from mylife Lotus on the same pump earlier the same day — five `type=2`
+entries eight seconds apart summing to exactly 2.00 U — **the driver produced the same chunk count
+at the same cadence for the same total.** The only difference is where the trim lands: Lotus split it
+`0.41 0.41 0.41 0.41 0.36`, this splits it `0.40 ×5`, which is the deliberate choice not to scale the
+chunk by how long the previous cycle actually took.
+
+**Reservoir: 107.39 → 105.38 across it = 2.01 U**, the extra 0.01 being basal at 0.3 U/h over the
+sequence. ⚠ **No reservoir reading has been taken after 9a's own run** — the pump disconnected at
+17:09:49 before the next poll — so 9a's reservoir check is carried by the run above it rather than by
+itself.
+
+**Phone-side scheduling held to the millisecond**: starts at +0.0, +8.001, +16.002, +24.004, +32.001.
+Confirmation fits comfortably inside the slot, so the "due at sequence start + k × interval"
+scheduling never had to fall behind. The upper-bound property was therefore **not** exercised — a run
+where a chunk overruns its slot has not happened yet, and the ceiling has not been reached either.
+
+### ⚠ 9d — the live rows are right; the re-read has not happened
+
+```
+17:09:41  1.0  pumpId=160911     17:08:53  0.4  pumpId=160909
+17:09:36  1.0  pumpId=160910     17:08:45  0.4  pumpId=160908
+                                 17:08:37  0.4  pumpId=160907
+                                 17:08:29  0.4  pumpId=160906
+                                 17:08:20  0.4  pumpId=160905
+```
+
+Queried on the database, not the log. **Run 1: five live rows summing 2.0 U. 9a: two live rows
+summing 2.0 U.** No duplicate `pumpId` among live rows, and — the check that matters for the
+per-chunk provisional design — **zero live rows with a null `pumpId`**, meaning every provisional
+opened before a chunk was settled to that chunk's own pump sequence. The rows carrying a
+`referenceId` are the superseded provisionals, which is 7c's finding and not duplication.
+
+⚠ **The second half of 9d is not done.** Nothing has re-read history across `160905`–`160911` yet, so
+idempotency across a chunked bolus is still unproven. It needs one status read and a re-query.
 
 ⚠ **Do not change the logic mid-run to make a step pass.** Record the failure, stop, and fix it
 deliberately — that is the rule the earlier phases were run under and it is what makes their results
