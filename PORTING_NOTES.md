@@ -3162,6 +3162,15 @@ Carried forward from session 1, all still true:
     ```
     It costs one daemon start-up and removes a failure that otherwise lands on roughly every second
     build. The `:app:clean` remedy below is for the *KSP* failure and does not help with this one.
+  - **In practice the two chain**, and the recipe that worked every time in session 7 is all three
+    steps in order — the KSP failure tends to surface on the first assemble after a `--stop`,
+    which is also the first assemble after the driver's shape changed:
+    ```
+    ./gradlew --stop; ./gradlew :app:clean; ./gradlew :app:assembleFullDebug
+    ```
+  - ⚠ **Do not edit a tracked file while an assemble is configuring.** The guard is evaluated during
+    configuration, so a doc edit landing mid-build fails it with *"There are uncommitted changes"* —
+    which looks like the build being broken and is you.
 - `JAVA_HOME` must be set for `gradlew.bat`; the Android Studio JBR
   (`C:\Program Files\Android\Android Studio\jbr`) works.
 - `:app:kspFullDebugKotlin` can fail spuriously with `ComponentProcessingStep was unable to
