@@ -1,14 +1,14 @@
 # YpsoPump driver — porting notes
 
-Driver for an **unlocked plaintext research YpsoPump** on current AndroidAPS (3.4.2.4).
+Driver for an **unlocked plaintext research YpsoPump** on current AndroidAPS (3.4.2.6).
 
 > **New here? Read `README_YPSO.md` first.** It is the handover document — what the driver is, what
 > it has been verified to do, what it cannot do, and how to bring one up from nothing. **This** file
 > is the record of what the pump was observed doing and why the code is shaped the way it is,
 > including every wrong turn, because the wrong turns are the part that is expensive to rediscover.
 
-**Status, 2026-08-02: every phase has now run on hardware, and what is left is one performance
-decision and two things only time can answer.** The driver bonds, connects, authenticates in
+**Status, 2026-08-03: Phases 1–8 have all run on hardware and passed, and one new delivery
+behaviour is built and waiting for the bench.** The driver bonds, connects, authenticates in
 plaintext with no key exchange, reads every value it needs, and **writes** — the pump clock (§4e), a
 standard bolus with abort (§4f), a temporary basal with cancel (§4h), and the 24-slot basal profile
 (§4i). Each was gated behind its own saline test and each is confirmed by reading the pump back,
@@ -31,11 +31,18 @@ produced fourteen empty syncs and not one row in any treatment table.
 because `YpsoHistoryReadCount` applies to *each* log. A probe that reads index 0 first and skips the
 window when nothing has moved cut a quiet poll to **~580 ms**, verified in Phase 7f (§8.5).
 
-**The next piece of work is the chunked bolus — `SALINE_TEST_PROCEDURE.md` Phase 9, written and not
-yet built.** "Bolus speed" turned out to be a loop in the phone rather than a pump setting: Lotus
-issues ordinary `type=2` boluses on a timer (1 U/5 s = 12 U/min), confirmed in the pump's own log.
-It needs no new pump capability, and it is the answer to slow delivery for comfort that the extended
-bolus is not (§8.6).
+**The chunked bolus is built and unrun — `SALINE_TEST_PROCEDURE.md` Phase 9.** "Bolus speed" turned
+out to be a loop in the phone rather than a pump setting: Lotus issues ordinary `type=2` boluses on a
+timer (1 U/5 s = 12 U/min), confirmed in the pump's own log. The driver now does the same. It needs
+no new pump capability, and it is the answer to slow delivery for comfort that the extended bolus is
+not (§8.6). Six design decisions were settled and written down before any of it was coded, because
+each one changes what the tests must check; they are in §8.6 and the tests are not free to
+re-open them.
+
+⚠ **Nothing about delivery changes until somebody chooses it.** `YpsoBolusSpeed` defaults to the
+pump's own ~33 U/min — no chunking, the exact path Phases 1–8 ran — on Phase 7's precedent that
+flipping a default is a statement that the shipped build is ready, held until the phase says so.
+**No chunked bolus has been delivered to any pump by this driver.**
 
 **Two things stand between here and an insulin trial, and neither is a capability:**
 
@@ -100,6 +107,19 @@ reading top-down would otherwise take a delivering driver for an inert one.
    was being tested, which is the rule the procedure sets for itself. Session 6 removed refused
    capability *claims*, deleted the unregistered donor module and wrote documentation; it added no
    delivery path.
+5. ⚠ **Session 7 did add one, and it is the first thing here that makes the phone a sequencer.** The
+   chunked bolus issues a *run* of standard boluses on a timer instead of one command (§8.6). Three
+   things bound it, and all three are properties of the code rather than intentions: it is **off by
+   default** and unreachable until `YpsoBolusSpeed` is changed by hand; **every chunk is an ordinary
+   `type=2` bolus** the pump owns and logs, so the worst a dead phone can do is stop issuing them,
+   which is under-delivery; and **any chunk that does not confirm from the log ends the sequence**,
+   with nothing resuming even if the link comes back. It has **not been run against a pump**, and
+   `SALINE_TEST_PROCEDURE.md` Phase 9 is where that happens.
+
+   ⚠ The genuinely new hazard is not the insulin, it is the **held command queue**: for the length
+   of a sequence nothing else reaches the pump, including the alert check that notices an occlusion
+   (§4g). That is deliberate — it is what stops another command interleaving between two chunks —
+   and it is capped at five minutes.
 
 **A successful GATT write proves nothing on this pump.** It does not NAK a bad write — the
 wrong auth password produced a perfectly successful write and only failed on the *next read*
@@ -138,6 +158,13 @@ were written years apart without anyone noticing they meet. A live example is in
 This matters here because **the pump owns the bolus once it has been told**: delivery continues
 whether or not the phone is still there. See §4g's temporary-id record, which is how the window
 between sending and confirming stops being a window in which AAPS knows nothing.
+
+⚠ **In a chunked bolus the pump owns one *chunk*, not the dose**, and that changes which way the
+conservative record points. Insulin in chunks the phone never issued will not be delivered by
+anything, so recording the full requested amount when a sequence stopped after two chunks would not
+be erring high on an unknown outcome — that outcome is known. The provisional record is therefore
+opened per chunk, immediately before that chunk is sent, which covers exactly the window this rule
+exists for (§8.6).
 
 **Remove refusals one at a time, each with its own saline test.** Never in a batch. The
 procedures are in `SALINE_TEST_PROCEDURE.md`, one phase per refusal, each naming the read-back

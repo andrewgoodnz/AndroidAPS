@@ -1,11 +1,15 @@
 # YpsoPump driver for AndroidAPS
 
-An AndroidAPS pump driver for an **unlocked plaintext research YpsoPump**, built on AAPS 3.4.2.4.
+An AndroidAPS pump driver for an **unlocked plaintext research YpsoPump**, built on AAPS 3.4.2.6.
 
 It bonds, connects, authenticates in plaintext with no key exchange, reads everything it needs, and
 writes the pump clock, a standard bolus, a temporary basal and the 24-slot basal profile. Every one
 of those was gated behind its own hardware test on saline, and every one is confirmed by reading the
 pump back rather than by the write callback.
+
+One thing is built and **has never run against a pump**: the slow ("chunked") bolus, which delivers a
+large dose as several small ones for comfort. It is off by default and cannot happen until the bolus
+speed is changed by hand — see [Before insulin](#before-insulin).
 
 **Every test to date has been on saline, off-body, cannula to air.** Nothing here has moved insulin
 into a person. What stops it doing so is the cartridge, not the code — see
@@ -116,11 +120,12 @@ extended-bolus button and its Treatments tab do not appear. The pump can do both
 never been asked to, and the standard bolus should soak first. `loadTDDs` is likewise refused and
 unadvertised, though the data exists in the pump's `type=23` entries and would not be hard.
 
-**The extended bolus has a procedure written for it** (`SALINE_TEST_PROCEDURE.md` Phase 8) and a
-reason to want it: the pump delivers at a fixed **~33 U/min**, so a 10 U bolus goes in over 18
-seconds where most pumps take minutes, and an extended bolus is the pump's own way to spread that out
-for comfort. The wire format already carries it and `YpsoBleManager.startBolus` implements it — what
-is missing is the hardware gate, not the code.
+**The extended bolus works and is still refused, which is now a decision rather than a gap.** Phase
+8a ran it on saline (`PORTING_NOTES` §8.6): the pump accepts one, enforces a **15-minute minimum**,
+and logs it under its own event type 3 carrying **no duration**, so it cannot be reconstructed from
+history alone. It was wanted for comfort on large boluses, and at a 15-minute floor a 10 U dose is
+0.67 U/min — far slower than the ~12 U/min asked for. The chunked bolus is the answer to that
+question instead, so the extended bolus stays refused and unadvertised with nothing depending on it.
 
 ### AAPS learns of a pump alarm at the next poll, and that can be 20 minutes
 
@@ -252,9 +257,9 @@ change to the framing code.
 
 Stated plainly, because this is the question the whole project is pointed at.
 
-### Next up: the chunked bolus (Phase 9)
+### Next up: the chunked bolus (Phase 9) — **built, and never run against a pump**
 
-**The one piece of work with a written procedure and no code yet.** The pump delivers a commanded
+**The one piece of work with code written and no hardware behind it.** The pump delivers a commanded
 bolus at a fixed ~33 U/min, so 10 U goes in over 18 seconds — uncomfortable for large doses where
 other pumps take minutes.
 
@@ -269,9 +274,16 @@ interval, not a pump setting. Confirmed in the pump's own log on 2026-08-03 — 
 ```
 
 So this needs **no new pump capability, no new wire format and no new event type** — every chunk is
-the standard bolus this driver has delivered and confirmed since Phase 2.
-`SALINE_TEST_PROCEDURE.md` **Phase 9** has the procedure and, more importantly, the design decisions
-to settle before writing any code.
+the standard bolus this driver has delivered and confirmed since Phase 2. The driver now does the
+same thing, built on 2026-08-03 to six design decisions written down first (`PORTING_NOTES` §8.6),
+with `SALINE_TEST_PROCEDURE.md` **Phase 9** holding the procedure that has yet to be run.
+
+⚠ **Nothing chunks unless it is switched on.** *Preferences → YpsoPump → Bolus speed* defaults to
+the pump's own 33 U/min, which is one command and is exactly what every hardware phase so far ran.
+6 U/min is deliberately missing from the list until Phase 9 passes. Two properties are worth knowing
+before turning it on: the connection is held for the whole sequence, so nothing else — including the
+alert check — reaches the pump while it runs (capped at five minutes); and a 10 U bolus becomes ten
+treatment records, which is noisy but accurate, because the insulin genuinely went in as ten pulses.
 
 ---
 
