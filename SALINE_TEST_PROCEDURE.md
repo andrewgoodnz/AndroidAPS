@@ -2378,8 +2378,28 @@ success=false`), so §0's reporting rule held. The IOB record did not.
 
 §4g says an unconfirmed bolus is left recorded in full because *"deleting it would assert that
 nothing was delivered, which is the one thing not known."* **Here it is known.** The failure was in
-`newestEventSequence()` — the baseline read, which happens *before* `suspendStartBolus`. The driver's
-own message says so: **"nothing was sent"**. No bolus command was ever written for chunk 2.
+`newestEventSequence()` — the baseline read, which happens *before* `suspendStartBolus`.
+
+⚠ **And that is established from the BLE traffic, not from the driver's own message.** "Nothing was
+sent" is the code's account of itself, which is the class of evidence this file distrusts on
+principle. The raw log settles it independently — the entire 9c run contains **one** bolus write:
+
+```
+19:16:20.858  Starting bolus: 0.40U (scaled=40), duration=0min, type=1, layout=UPSTREAM
+19:16:20.860  bolus: writing 15B to …e18b… as payload+CRC: 28 00 …           ← chunk 1, the only one
+19:16:28.513  Provisionally recorded 0.4U under temporaryId=1785741388482    ← chunk 2's provisional
+19:16:29.918  readHistoryCount(…cb3b…): 3000                                  ← baseline read begins
+19:16:35.441  GLB write to …cc3b… failed (GATT status=133)                    ← and dies, 5.5 s later
+19:16:35.442  Bolus refused: … nothing was sent
+```
+
+No second `Starting bolus`, no second `bolus: writing`. For comparison the 9e run shows **eight**
+writes for its eight attempted chunks. **No bolus command was ever written for chunk 2**, and the
+0.4 U in the database corresponds to no insulin that ever existed.
+
+Worth noting the shape of the failure too: the provisional was opened on time at +8.0 s, then the
+GLB index write **hung for 5.5 seconds** before GATT gave up with status 133. The slot was consumed
+by a dying link, not by slow confirmation.
 
 So this is a case §4g's rule does not actually cover — it was written for *unknown* outcomes, and
 this branch has a **known** one. Three things make it worth fixing rather than tolerating:
