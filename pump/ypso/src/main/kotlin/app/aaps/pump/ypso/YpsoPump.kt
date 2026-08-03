@@ -97,6 +97,15 @@ class YpsoPump @Inject constructor(
     var lastHistoryDump: List<String> = emptyList()
 
     /**
+     * Report from the last Phase 8a extended-bolus probe, in memory only.
+     *
+     * A bench instrument's output, held so the YPSO tab can show it without the fragment having to
+     * reach into the service. Empty until the probe has been run, which on a shipped build is
+     * never — nothing runs it but a button press.
+     */
+    var lastExtendedBolusProbe: String = ""
+
+    /**
      * Outcome of the last clock write: true only when the pump's clock was read back and agreed
      * with the phone's, false when it did not, null when the clock has never been written.
      *

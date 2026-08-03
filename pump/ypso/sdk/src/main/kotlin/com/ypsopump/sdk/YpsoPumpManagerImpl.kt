@@ -151,6 +151,20 @@ class YpsoPumpManagerImpl private constructor(
          */
         private const val TBR_SEARCH_ENTRIES = 12
 
+        /**
+         * How often [probeExtendedBolus] samples the bolus status. Slower than the delivery poll
+         * on purpose: this is watching a bolus measured in minutes, and the readings are meant to
+         * be read by a human afterwards rather than acted on.
+         */
+        private const val PROBE_POLL_INTERVAL_MS = 2_000L
+
+        /**
+         * How long [probeExtendedBolus] keeps watching after the programmed duration has elapsed.
+         * The question it exists to answer is *when* the pump stops reporting the bolus, so the
+         * watch has to outlast the bolus or the answer is cut off at the interesting moment.
+         */
+        private const val PROBE_EXTRA_WATCH_MS = 45_000L
+
         /** Re-reads of the log before giving up on finding the entry. */
         private const val BOLUS_HISTORY_ATTEMPTS = 3
 
@@ -1499,6 +1513,135 @@ class YpsoPumpManagerImpl private constructor(
     override suspend fun deliverExtendedBolus(amount: Double, durationMinutes: Int): BolusDeliveryResult =
         refuseDelivery("deliverExtendedBolus($amount, $durationMinutes)")
 
+    /**
+     * **A saline-bench instrument, not a delivery path**, and the distinction is the whole design.
+     *
+     * `SALINE_TEST_PROCEDURE.md` Phase 8a asks four questions that only the pump can answer, and
+     * every one of them needs a `bolusType = 2` command to have actually been sent: does this
+     * firmware accept an extended bolus at all; does it honour a **one-minute** duration or round
+     * it away; does `BolusStatus` report *busy for the whole duration* — which would mean a
+     * 15-minute extended bolus blocks the AAPS command queue for 15 minutes — and does the pump
+     * echo back what it understood.
+     *
+     * It is deliberately **not** `deliverExtendedBolus`, which stays refused above. That method is
+     * the `PumpManager` contract and reaching it means AAPS believes this pump does extended
+     * boluses — which switches on `LoopPlugin`, `TreatmentsActivity` and `goToZeroTemp`'s automatic
+     * `cancelExtended`, all before anything has been observed. This one can only be reached from a
+     * button on the YPSO tab, with hard-coded arguments, so nothing in AAPS's model of the pump
+     * changes.
+     *
+     * **It observes and reports; it decides nothing.** No treatment record is written here — the
+     * history sync will import whatever the pump logged on the next poll, which is exactly Phase
+     * 8c's question and is better answered by watching the real mechanism than by hand-coding one.
+     *
+     * The echo check is the same safety pattern as the standard bolus, on the field that
+     * corresponds: that one compares `fastTotal` against the amount and cancels on disagreement,
+     * and this one has `slowTotal` and `totalDuration` to compare against amount and duration. A
+     * mismatch means the payload was not parsed the way this code laid it out, and it is cancelled
+     * immediately rather than left running.
+     *
+     * @return a human-readable report for the log and the dialog. Never throws.
+     */
+    suspend fun probeExtendedBolus(amount: Double, durationMinutes: Int): String = withConnection {
+        val report = StringBuilder()
+        fun say(line: String) {
+            log("[ypso-ext] $line")
+            report.appendLine(line)
+        }
+
+        say("PROBE extended bolus: ${amount}U over ${durationMinutes}min — bench instrument, writes no treatment record")
+
+        // Same rule as the standard bolus: without a baseline the pump's log cannot tell this
+        // delivery from one already in it, and an unconfirmable delivery is not one this driver
+        // makes (§0). Refusing here costs nothing; guessing costs a dose nobody can account for.
+        val baseline = newestEventSequence()
+        if (baseline == null) {
+            say("REFUSED: the event log could not be read, so nothing could be confirmed. Nothing was sent.")
+            return@withConnection report.toString()
+        }
+        say("baseline newest event sequence = $baseline")
+
+        val before = suspendGetBolusStatus()
+        say("before: ${before?.describe() ?: "bolus status unreadable"}")
+
+        cancelRequested = false
+        if (!suspendStartBolus(amount, durationMinutes)) {
+            say("RESULT: the pump REFUSED the bolusType=2 command outright. Extended bolus is not available on this firmware.")
+            return@withConnection report.toString()
+        }
+        say("command accepted by the ATT layer — which proves nothing on this pump (§0). Watching the status instead.")
+
+        // Poll well past the programmed duration. The point is to see *when* the pump stops
+        // reporting the extended bolus as running: promptly means it treats the command as
+        // programmed and the queue is free, and only-at-the-end means a 15-minute bolus would hold
+        // the queue for 15 minutes, which is Phase 8a's stop condition.
+        val watchMs = (durationMinutes * 60_000L) + PROBE_EXTRA_WATCH_MS
+        val startedAt = System.currentTimeMillis()
+        var sawRunning = false
+        var mismatch: String? = null
+
+        while (System.currentTimeMillis() - startedAt < watchMs) {
+            val status = suspendGetBolusStatus()
+            val elapsed = (System.currentTimeMillis() - startedAt) / 1000
+            say("t+${elapsed}s: ${status?.describe() ?: "unreadable"}")
+
+            if (status != null) {
+                if (status.slowTotal > 0f) {
+                    sawRunning = true
+                    if (abs(status.slowTotal - amount) > BOLUS_AMOUNT_EPSILON) {
+                        mismatch = "pump reports an extended total of ${status.slowTotal} U against ${amount} U requested"
+                    }
+                    if (status.totalDuration > 0 && status.totalDuration != durationMinutes) {
+                        mismatch = (mismatch?.plus("; ") ?: "") +
+                            "pump reports a duration of ${status.totalDuration} min against $durationMinutes min requested"
+                    }
+                    if (mismatch != null) {
+                        say("MISMATCH: $mismatch — cancelling immediately rather than letting it run")
+                        suspendCancelExtendedBolus()
+                        break
+                    }
+                }
+                // Stopped reporting an extended bolus after having reported one: it is over.
+                if (sawRunning && status.slowTotal == 0f && status.slowStatus == 0) {
+                    say("the pump stopped reporting an extended bolus at t+${elapsed}s")
+                    break
+                }
+            }
+            delay(PROBE_POLL_INTERVAL_MS)
+        }
+
+        val after = suspendGetBolusStatus()
+        say("after: ${after?.describe() ?: "unreadable"}")
+
+        say(
+            when {
+                mismatch != null -> "RESULT: the pump did NOT echo what was sent — $mismatch. The payload layout is wrong for bolusType=2."
+                !sawRunning      -> "RESULT: the command was accepted but the pump never reported an extended bolus. It was discarded silently, which is this pump's documented behaviour for a payload it cannot validate (§4f)."
+                else             -> "RESULT: the pump accepted and ran an extended bolus, echoing the amount and duration. Read the t+ lines for whether slowInjected climbed gradually, and for when it stopped reporting."
+            }
+        )
+        say("Now press Read history, and check whether it landed in extendedBoluses or boluses (Phase 8c).")
+        report.toString()
+    }
+
+    private suspend fun suspendCancelExtendedBolus(): Boolean =
+        suspendCancellableCoroutine { cont -> bleManager.cancelBolus("extended") { cont.resume(it) } }
+
+    /**
+     * Every field of the bolus status on one line, including the ones this driver has never used.
+     *
+     * The `slow*` fields have been decoded since the SDK was vendored and **nothing has ever read
+     * them**, so what they actually contain during an extended bolus is unknown. Printing the
+     * decode alone would answer only the question I already thought I knew the answer to — the
+     * same mistake as reading `byte0` without the payload behind it (§8.3), which is what let the
+     * cartridge-out and reservoir-empty states be told apart in the end.
+     */
+    private fun BolusStatusData.describe(): String =
+        "fast[status=$fastStatus seq=$fastSequence injected=$fastInjected total=$fastTotal] " +
+            "slow[status=$slowStatus seq=$slowSequence injected=$slowInjected total=$slowTotal " +
+            "fastPart=$slowFastPartInjected/$slowFastPartTotal] " +
+            "duration=$actualDuration/$totalDuration min"
+
     override suspend fun deliverMultiwaveBolus(
         immediateAmount: Double,
         extendedAmount: Double,
@@ -1544,8 +1687,15 @@ class YpsoPumpManagerImpl private constructor(
     private suspend fun suspendGetBolusStatus(): BolusStatusData? =
         suspendCancellableCoroutine { cont -> bleManager.getBolusStatus { cont.resume(it) } }
 
-    private suspend fun suspendStartBolus(amount: Double): Boolean =
-        suspendCancellableCoroutine { cont -> bleManager.startBolus(amount.toFloat()) { cont.resume(it) } }
+    /**
+     * [durationMinutes] defaults to 0, which is what makes it a **standard** bolus: `startBolus`
+     * sets `bolusType = 1` for a zero duration and `2` otherwise. Only [probeExtendedBolus] passes
+     * anything else, so every delivery path in this driver still sends type 1.
+     */
+    private suspend fun suspendStartBolus(amount: Double, durationMinutes: Int = 0): Boolean =
+        suspendCancellableCoroutine { cont ->
+            bleManager.startBolus(amount.toFloat(), durationMinutes) { cont.resume(it) }
+        }
 
     private suspend fun suspendCancelBolus(): Boolean =
         suspendCancellableCoroutine { cont -> bleManager.cancelBolus("fast") { cont.resume(it) } }

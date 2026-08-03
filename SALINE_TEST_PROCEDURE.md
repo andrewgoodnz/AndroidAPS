@@ -1722,23 +1722,49 @@ busy for its full programmed duration, then **a 15-minute extended bolus blocks 
 minutes** — no status read, no temporary basal, no alert check, nothing. That would be a far worse
 regression than the feature is worth, and it is a property of the pump nobody can predict.
 
-**The cheapest possible exposure: 1 U over 1 minute.**
+**The cheapest possible exposure: 1 U over 1 minute, and it has its own button.**
 
-1. Note the time. Send an extended bolus of **1 U over 1 min**.
-2. **While it is running, press Refresh on the YPSO tab.**
-3. Watch the log for `Pump bolus status reached Idle`, and for whether the Refresh produced an
-   `[ypso-state]` line.
+⚠ **Do not do this by enabling the capability and using AAPS's extended-bolus dialog.** That flag
+tells `LoopPlugin`, `TreatmentsActivity`, `ActionsFragment` and `goToZeroTemp` that this pump does
+extended boluses — including 8d's automatic `cancelExtended`, which raises an audible delivery-error
+alarm while cancel still refuses. All of that would be live before anyone had seen the pump answer a
+single `bolusType = 2` command.
 
-**Confirm:**
+Instead there is **EXTENDED BOLUS PROBE (BENCH TEST)** on the YPSO tab. It is confirmation-gated,
+its amount and duration are constants in `YpsoService` rather than dialog input, it writes **no**
+treatment record, and `isExtendedBolusCapable` stays **false** throughout, so nothing in AAPS's model
+of the pump changes. It reaches `YpsoPumpManagerImpl.probeExtendedBolus`; the contract method
+`deliverExtendedBolus` stays refused.
 
-| Outcome | What it means |
+1. Pump on saline, off-body, cannula to air. Reservoir reading noted.
+2. Press the button and confirm the dialog. It runs for about **two minutes** and blocks the command
+   queue for that time — deliberately, because watching *when* the pump stops reporting the bolus is
+   the measurement.
+3. Read the report it shows, and `grep "\[ypso-ext\]"` in the log for the same lines.
+
+**Every reading prints all twelve `BolusStatusData` fields**, `slow*` included — those have been
+decoded since the SDK was vendored and **nothing has ever read them**, so what they contain during an
+extended bolus is genuinely unknown. Printing only the decode would answer the question the reader
+already thinks they know, which is §8.3's lesson about `byte0` and the payload behind it.
+
+**Four outcomes, and the report names which one it saw:**
+
+| What the report says | What it means |
 |---|---|
-| `Idle` within a few seconds, and the Refresh gets through | ✅ The pump reports the bolus as *programmed*, not *running*. Continue |
-| `Idle` only at ~60 s, and the Refresh lands after it | ❌ **Stop.** The queue is blocked for the duration. The driver must return once the pump has accepted the command, and that is a design change to `deliverBolus`, not a test result |
+| *"the pump REFUSED the bolusType=2 command outright"* | The ATT layer rejected it. Extended bolus is unavailable on this firmware. Phase 8 ends here |
+| *"accepted but the pump never reported an extended bolus"* | Silently discarded — this pump's documented behaviour for a payload it cannot validate (§4f). The 13-byte layout is wrong for `bolusType = 2` |
+| *"the pump did NOT echo what was sent"* | It parsed the payload differently from how this code laid it out. Cancelled automatically. **Do not retry without changing the layout** |
+| *"accepted and ran an extended bolus, echoing the amount and duration"* | ✅ Continue — then read the `t+Ns` lines for the two things that decide 8a |
 
-⚠ **A one-minute duration is short enough that both outcomes look similar if you only watch the
-ends.** Record three timestamps — the Refresh press, the `[ypso-state]` line it produced, and
-`reached Idle`. **Their ordering is the answer**, not any one of them.
+**From the `t+Ns` lines, two separate questions:**
+
+- **Did `slowInjected` climb gradually?** If it jumps to 1.0 immediately the pump ignored the duration
+  and delivered at ~33 U/min, and the whole feature is pointless on this firmware.
+- **When did it stop reporting the bolus?** At **~60 s** means the pump treats an extended bolus as
+  *running* for its duration — so a 15-minute one would hold the AAPS command queue for fifteen
+  minutes and `deliverExtendedBolus` must be written to return once programmed rather than reusing
+  the standard bolus's wait. Promptly after acceptance means the queue is free and the normal
+  pattern transfers.
 
 ## 8b. Does the pump actually spread the delivery? — **read the MIDDLE**
 

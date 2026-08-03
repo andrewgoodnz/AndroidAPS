@@ -845,6 +845,26 @@ class YpsoService : DaggerService() {
         pumpManager.readBasalProfile(profileId)?.blocks?.map { it.basalRate }
     }
 
+    /**
+     * `SALINE_TEST_PROCEDURE.md` **Phase 8a** — the extended-bolus probe. A bench instrument.
+     *
+     * ⚠ **This moves fluid.** Saline, off-body, cannula to air.
+     *
+     * The amount and duration are **constants here, not parameters**, and that is the safety
+     * property: there is no call path that can ask this for anything but the bench dose. One unit
+     * over one minute is the smallest exposure that can answer Phase 8a's questions — whether the
+     * pump accepts `bolusType = 2` at all, whether it honours a one-minute duration, and whether
+     * `BolusStatus` reports busy for the full duration, which would mean a real 15-minute extended
+     * bolus blocks the AAPS command queue for fifteen minutes.
+     *
+     * **No treatment record is written.** The history sync will import whatever the pump logged on
+     * the next status read, which is Phase 8c's question — and watching the real mechanism answer
+     * it is worth more than hand-coding a record and then checking the record.
+     */
+    fun probeExtendedBolus(): String = awaitResult("probeExtendedBolus", "The probe could not run") {
+        pumpManager.probeExtendedBolus(PROBE_EXTENDED_BOLUS_UNITS, PROBE_EXTENDED_BOLUS_MINUTES)
+    }
+
     // ==================== WRITES ====================
 
     /**
@@ -1407,6 +1427,19 @@ class YpsoService : DaggerService() {
 
         /** Beyond this the difference is not drift, and a human should look before anything is written. */
         private const val CLOCK_IMPLAUSIBLE_HOURS = 24L
+
+        /**
+         * The Phase 8a bench dose — see [probeExtendedBolus]. Constants rather than parameters so
+         * that no caller can ask the probe for anything larger.
+         *
+         * One unit is the smallest amount the pump's centi-unit wire format represents comfortably,
+         * and one minute is the shortest duration the wire field can carry — which is also the
+         * duration under test, since nobody knows whether this firmware honours it or rounds it
+         * away.
+         */
+        private const val PROBE_EXTENDED_BOLUS_UNITS = 1.0
+
+        private const val PROBE_EXTENDED_BOLUS_MINUTES = 1
 
     }
 }

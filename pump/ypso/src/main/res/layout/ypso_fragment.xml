@@ -234,5 +234,17 @@
                 android:layout_weight="1"
                 android:text="@string/ypso_set_clock" />
         </LinearLayout>
+
+        <!--
+            Phase 8a bench instrument. On its own row and away from the others because it MOVES
+            FLUID, and because it should be obvious that it is not one of the read buttons.
+        -->
+        <Button
+            android:id="@+id/extended_bolus_probe"
+            style="@style/GrayButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/ypso_ext_probe" />
     </LinearLayout>
 </ScrollView>

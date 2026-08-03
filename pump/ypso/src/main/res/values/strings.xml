@@ -7,6 +7,15 @@
     <string name="ypso_pump_setting">YpsoPump settings</string>
 
     <string name="ypso_not_supported">Not supported by this driver</string>
+
+    <string name="ypso_ext_probe">EXTENDED BOLUS PROBE (BENCH TEST)</string>
+    <string name="ypso_ext_probe_confirm_title">Extended bolus probe — saline only</string>
+    <string name="ypso_ext_probe_confirm_message">This DELIVERS 1.0 U over 1 minute as an extended bolus, to find out whether the pump accepts one at all.
+
+SALINE ONLY, OFF-BODY, CANNULA TO AIR.
+
+It writes no treatment record; the history sync will pick up whatever the pump logs. Do not run this with insulin in the cartridge.</string>
+    <string name="ypso_ext_probe_running">Probe running — this takes about two minutes. Watch the log.</string>
     <string name="ypso_read_only_banner">SALINE TEST BUILD — bolus, temp basal and basal profile write are enabled and verified on saline. Not for use with insulin.</string>
 
     <string name="ypso_pairing_title">Pair YpsoPump</string>
