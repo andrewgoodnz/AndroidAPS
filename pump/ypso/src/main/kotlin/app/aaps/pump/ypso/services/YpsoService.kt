@@ -944,11 +944,14 @@ class YpsoService : DaggerService() {
 
     /** One command to the pump — the path every hardware phase from 1 to 8 ran. */
     private suspend fun deliverWhole(detailedBolusInfo: DetailedBolusInfo, insulin: Double): YpsoPumpManagerImpl.ConfirmedBolus {
-        // ⚠ Recorded BEFORE the pump is told, at the amount requested. See [openPendingBolus].
-        val temporaryId = dateUtil.now()
-        openPendingBolus(detailedBolusInfo, insulin, temporaryId)
-        val result = pumpManager.deliverBolusConfirmed(insulin)
-        settlePendingBolus(detailedBolusInfo, result, temporaryId)
+        // ⚠ Recorded BEFORE the pump is told, at the amount requested — but *after* the driver has
+        // read its baseline, because a baseline read that fails means nothing is sent and there is
+        // nothing to cover. See [openPendingBolus] and 9c.
+        var temporaryId: Long? = null
+        val result = pumpManager.deliverBolusConfirmed(insulin) { requested ->
+            temporaryId = dateUtil.now().also { openPendingBolus(detailedBolusInfo, requested, it) }
+        }
+        temporaryId?.let { settlePendingBolus(detailedBolusInfo, result, it) }
         return result
     }
 
@@ -967,6 +970,11 @@ class YpsoService : DaggerService() {
      * N the history sync produces from the same N log entries, resolving to one set rather than two
      * (§8.5). A single synthetic record filed under one chunk's sequence would be rewritten down to
      * that chunk's amount by the first sync to reach it.
+     *
+     * ⚠ **A chunk whose baseline read failed opens no provisional at all**, so `onChunkSettled` can
+     * arrive with nothing to settle. That is 9c: the link died mid-baseline, no command went out,
+     * and the record left behind was 0.4 U of insulin that never existed and that no sync could ever
+     * reconcile away. [pendingTemporaryId] being null is how that case is recognised here.
      */
     private suspend fun deliverChunked(
         detailedBolusInfo: DetailedBolusInfo,

@@ -714,7 +714,8 @@ Implemented as `openPendingBolus` / `settlePendingBolus`. The confirmation logic
 this adds the missing first half rather than replacing the second. Three details worth keeping:
 
 - **A bolus the pump never logged is left alone**, at the requested amount, still counting. Deleting
-  it would assert that nothing was delivered, which is the one thing not known.
+  it would assert that nothing was delivered, which is the one thing not known. ⚠ **Unless it was
+  never sent** — see the amendment below, which Phase 9c found the hard way.
 - **If the provisional record cannot be found to settle** — an app restart in the middle would do it —
   the confirmed amount is written under the pump's sequence instead, rather than being lost.
 - **The reported result is unchanged.** `success` still comes only from the pump's own log, so
@@ -741,6 +742,52 @@ Three rules, each chosen for a reason:
   the timestamp**, so the pump's entry time wins on the next poll. That is deliberate (§8.5) — one
   authority rather than two — and it is why the pump's clock is now actively held within 10 s (§8.6)
   rather than merely watched.
+
+#### ⚠⚠ [fixed] The provisional record covered the baseline read, and recorded insulin that never existed — 2026-08-03
+
+Found by **Phase 9c**, and it is a hole in the rule above rather than a slip in the code.
+
+The provisional was opened *before* `deliverBolusConfirmed` was called, so it covered the **baseline
+event-log read** as well as the write. On 9c the link died exactly there: the GLB index write hung
+5.5 s and failed with GATT 133, `newestEventSequence()` returned null, and the driver returned
+*"nothing was sent"* without ever writing a bolus command. The provisional stayed, and AAPS held
+**0.8 U of records for 0.4 U of delivery** — confirmed against the reservoir, which moved 0.41 U.
+
+**Established from the BLE traffic, not from the driver's own message.** "Nothing was sent" is the
+code's account of itself, and this file has four separate records of checks that read back the thing
+that wrote them. The raw log is independent: the whole 9c run contains **one** `Starting bolus` /
+`bolus: writing` pair, for its one delivered chunk, against eight for the eight chunks of the 9e run.
+
+**Why the rule did not cover it.** *"Deleting it would assert that nothing was delivered, which is
+the one thing not known"* is written for an **unknown** outcome — a command that went out and whose
+result never came back. A command that was never written has a **known** outcome. Three things make
+the difference matter:
+
+- **It is permanent.** No pump entry will ever exist, so no history sync can reconcile it away. The
+  transient over-estimate §4g describes becomes a fixed error in the database.
+- **Chunking multiplies the chances.** Every chunk re-runs the baseline read, so a fifteen-chunk
+  bolus has fifteen opportunities where a single bolus has one.
+- **It is silent.** IOB is wrong and nothing says so.
+
+It fails in the **safe** direction — over-stated IOB makes AAPS dose less — and is capped at one
+chunk (0.4 U at 3 U/min, 1.0 U at 12). Nothing was mis-dosed. That is why it survived, not a reason
+to keep it.
+
+⚠ **The same defect was on the unchunked path all along, rarer but larger**: a baseline-read failure
+there left a provisional at the **full** bolus amount. Chunking made each instance smaller and far
+more frequent, which is the only reason anyone saw it. It has been there since the temporary-id
+record was introduced.
+
+**The fix narrows a window rather than adding a retraction.** `deliverOneBolus` now takes a
+`beforeSend` callback and invokes it **after the baseline read succeeds and immediately before
+`suspendStartBolus`**. Nothing then sits between the record and the write except the write itself,
+which is precisely the window §4g exists to cover. Both delivery paths use it; a chunk whose baseline
+fails opens no record at all, and `YpsoService` recognises that case by its temporary id still being
+null when the settle callback arrives.
+
+**A *failed write* still keeps the record**, deliberately. §3 established that this pump does not NAK
+a bad write and a write result proves nothing — so a failed `suspendStartBolus` genuinely is an
+unknown outcome, and §4g's original rule applies to it unchanged.
 
 **The amount stays a `Double` end to end.** `BolusDeliveryResult.deliveredUnits` is a `Float`, and
 widening 1.82f gives 1.8200000524520874 — §4d's trap, on a figure that becomes a treatment record.

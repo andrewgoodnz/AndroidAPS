@@ -1026,7 +1026,10 @@ class YpsoPumpManagerImpl private constructor(
      * (the pump's figure is exact centi-units, and squeezing it through a `Float` turns 1.82 into
      * 1.8200000524520874) and it carries the sequence number needed to record the bolus.
      */
-    suspend fun deliverBolusConfirmed(amount: Double): ConfirmedBolus = withConnection {
+    suspend fun deliverBolusConfirmed(
+        amount: Double,
+        beforeSend: (Double) -> Unit = {}
+    ): ConfirmedBolus = withConnection {
         if (amount <= 0.0) {
             return@withConnection bolusFailure(amount, "Bolus amount must be greater than zero")
         }
@@ -1043,7 +1046,11 @@ class YpsoPumpManagerImpl private constructor(
         // cannot leave it armed for ever, which the previous straight-line version could.
         reconnectManager.enable()
         val outcome = try {
-            deliverOneBolus(amount, HISTORY_SEARCH_ENTRIES, alreadyDelivered = 0.0, sequenceTotal = amount, probeDeliveryModeOnce = true)
+            deliverOneBolus(
+                amount, HISTORY_SEARCH_ENTRIES,
+                alreadyDelivered = 0.0, sequenceTotal = amount,
+                probeDeliveryModeOnce = true, beforeSend = beforeSend
+            )
         } finally {
             reconnectManager.disable()
         }
@@ -1073,13 +1080,17 @@ class YpsoPumpManagerImpl private constructor(
      *   against [sequenceTotal] rather than restarting from zero on every chunk.
      * @param probeDeliveryModeOnce only the first chunk answers §8.3's question; the rest would be N
      *   extra round trips inside a timing budget measured in seconds.
+     * @param beforeSend runs **after the baseline read has succeeded and immediately before the
+     *   bolus command is written**, which is where the caller opens its provisional IOB record. The
+     *   ordering is load-bearing — see the call site.
      */
     private suspend fun deliverOneBolus(
         amount: Double,
         searchEntries: Int,
         alreadyDelivered: Double,
         sequenceTotal: Double,
-        probeDeliveryModeOnce: Boolean
+        probeDeliveryModeOnce: Boolean,
+        beforeSend: (Double) -> Unit
     ): ConfirmedBolus {
         // Baseline the event log first. This is what lets the bolus we are about to start be told
         // apart from every bolus already in the log, and without it a stale entry could be read
@@ -1091,6 +1102,25 @@ class YpsoPumpManagerImpl private constructor(
                 "The pump's event log could not be read, so a bolus could not be confirmed — nothing was sent"
             )
         log("Bolus $amount U requested. Newest event sequence before sending: $baselineSequence")
+
+        // ⚠ The provisional IOB record opens **here**, not before the baseline read — and 9c is why.
+        //
+        // On 2026-08-03 the link died *during* the baseline read of a chunk: the GLB index write
+        // hung 5.5 s and failed with GATT 133, so no bolus command was ever written (proven from the
+        // BLE traffic — the run contains one `bolus: writing` line for its one delivered chunk). The
+        // provisional had already been opened, and it recorded 0.4 U of insulin that never existed.
+        //
+        // §4g's rule — leave an unconfirmed bolus recorded, because "deleting it would assert that
+        // nothing was delivered, which is the one thing not known" — does not cover that case. It is
+        // written for *unknown* outcomes, and a bolus that was never commanded is a **known** one.
+        // Worse, it is permanent: no pump entry will ever exist, so no history sync can reconcile it
+        // away, unlike the transient window §4g describes.
+        //
+        // Opening after the baseline is a strictly smaller window rather than a compensating
+        // retraction: nothing now sits between the record and the write except the write itself,
+        // which is exactly the window §4g exists to cover. A *failed* write still keeps the record,
+        // because on this pump a failed write does **not** prove non-delivery (§3).
+        beforeSend(amount)
 
         if (!suspendStartBolus(amount)) {
             return bolusFailure(amount, "The pump refused the bolus command")
@@ -1182,12 +1212,16 @@ class YpsoPumpManagerImpl private constructor(
      * alarmed and stopped delivering must not be sent ten more boluses (9e), and a link that came
      * back after dropping should not restart insulin after an unpredictable gap (9c).
      *
-     * @param onChunkStarting called immediately before a chunk is sent, with its amount. The caller
-     *   opens the provisional IOB record here — per chunk, because the pump has only been told about
-     *   one chunk, and insulin in chunks that were never commanded will never be delivered by
-     *   anything (§0's err-high rule is about outcomes that are *unknown*; these are known).
-     * @param onChunkSettled called for **every** chunk that was started, with whatever the pump's
-     *   log said about it, so the caller can settle that provisional to the pump's own sequence.
+     * @param onChunkStarting called immediately before a chunk is **written to the pump**, with its
+     *   amount. The caller opens the provisional IOB record here — per chunk, because the pump has
+     *   only been told about one chunk, and insulin in chunks that were never commanded will never
+     *   be delivered by anything (§0's err-high rule is about outcomes that are *unknown*; these are
+     *   known). ⚠ **Not called if the chunk's baseline read fails**, because then no command goes
+     *   out and there is nothing to cover; that is 9c's finding and [deliverOneBolus] has the detail.
+     * @param onChunkSettled called for **every** chunk that was attempted, with whatever the pump's
+     *   log said about it, so the caller can settle that provisional to the pump's own sequence. May
+     *   therefore arrive for a chunk that [onChunkStarting] was never called for — the caller must
+     *   cope, and `YpsoService` does by keying on the temporary id it last handed out.
      *
      * @return the sequence as one result. `pumpSequence` is deliberately **null**: a sequence has no
      *   single identity, its N identities went out through [onChunkSettled], and returning one of
@@ -1250,7 +1284,6 @@ class YpsoPumpManagerImpl private constructor(
 
                 val offsetMs = System.currentTimeMillis() - sequenceStartedAt
                 startOffsetsMs += offsetMs
-                onChunkStarting(chunkUnits)
 
                 val result = runCatching {
                     deliverOneBolus(
@@ -1258,7 +1291,10 @@ class YpsoPumpManagerImpl private constructor(
                         searchEntries = CHUNK_HISTORY_SEARCH_ENTRIES,
                         alreadyDelivered = deliveredCentiUnits / 100.0,
                         sequenceTotal = total,
-                        probeDeliveryModeOnce = index == 0
+                        probeDeliveryModeOnce = index == 0,
+                        // Not called at all if this chunk's baseline read fails, which is what stops
+                        // a chunk that was never sent from leaving a record behind. See 9c.
+                        beforeSend = onChunkStarting
                     )
                 }.getOrElse { error ->
                     if (error is CancellationException) throw error
