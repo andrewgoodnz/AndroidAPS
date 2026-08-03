@@ -28,7 +28,8 @@ complete and no correctness gate remains open.**
 | H | **A bolus while a TBR runs** | Never tried together; both are identified by sequence | — |
 | I | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
 | J | **Restore a profile you care about** | A write you cannot reverse is not finished | Phase 4 |
-| K | **The extended bolus** | ⚠ Still refused, and **now scoped**: the goal is comfort on large boluses, because the pump delivers at a fixed ~33 U/min so a 10 U bolus goes in over 18 s. The wire format already carries it (`duration > 0, type=2`) and `YpsoBleManager.startBolus` implements it — what is missing is the gate, not the code. **Procedure written: Phase 8.** Do 6b first | **Phase 8**, §8.6 |
+| K | **Chunked bolus for comfort** | ✅ **Mechanism solved 2026-08-03, not yet implemented.** "Bolus speed" is a loop in the phone, not a pump setting: Lotus sends ordinary `type=2` boluses on a timer — **1 U/5 s = 12 U/min, 0.5 U/5 s = 6, 0.4 U/8 s = 3** — confirmed in the pump's log (five entries, 8 s apart, summing to 2.00 U). Needs its own phase: the bolus flow settles against **one** log entry and would need N | §8.6 |
+| L | **The extended bolus** | ⚠ Works, 15-min minimum, lands in `boluses` as NORMAL and its log entry carries no duration (8a/8c passed/found 2026-08-03). Superseded as the comfort route by K, which hits 12 U/min where this floors at 0.67 | **Phase 8**, §8.6 |
 
 **Closed on 2026-08-02, no longer on the list:**
 

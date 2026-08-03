@@ -2454,6 +2454,61 @@ configuring the pump. They are configuring a log line and a timeout. Same specie
 caught by pressing the button, whereas this one had no pump menu to contradict it and needed a
 stopwatch.
 
+#### ✅✅ [verified] SOLVED — "bolus speed" is a loop in the phone, and the parameters are known
+
+2026-08-03. Lotus's own settings screen labels its four options:
+
+```
+unlimited              (33.3 U/min, the pump's native rate)
+12 U/min   =  1 U   per 5 s
+ 6 U/min   =  0.5 U per 5 s
+ 3 U/min   =  0.4 U per 8 s
+```
+
+**It is not a speed. It is a chunk size and an interval, executed by the phone.** Confirmed in the
+pump's own event log — a 2 U bolus issued from Lotus with the setting on 3 U/min:
+
+```
+seq=160875 type=2(Bolus Immediate) v1=41   -> 0.41 U
+seq=160876 type=2(Bolus Immediate) v1=41   -> 0.41 U   +8 s
+seq=160877 type=2(Bolus Immediate) v1=41   -> 0.41 U   +8 s
+seq=160878 type=2(Bolus Immediate) v1=41   -> 0.41 U   +8 s
+seq=160879 type=2(Bolus Immediate) v1=36   -> 0.36 U   +8 s
+                                              = 2.00 U exactly
+```
+
+**Five ordinary standard boluses, eight seconds apart**, the last trimmed so the total lands exactly.
+The pump's display showed it as "multiple small boluses with short breaks", which is literally what
+it is. **There is no pump-side speed at all** — which is why nothing moved in indices 2–13, why an
+AAPS-commanded bolus was unaffected, and why the settings hunt was always going to come back empty.
+Four independent observations, one explanation.
+
+**⚠ This reverses a recommendation made earlier the same day.** When asked whether the driver could
+emulate a slower bolus, this file's author argued **against** chunking on §0 grounds — *"the pump owns
+the bolus once it has been told"*, and chunking makes the phone the sequencer. That objection is
+weaker than it was stated, and the evidence moved:
+
+- **Each chunk is a complete, pump-owned bolus** that the pump logs as `type=2`. A phone that dies
+  mid-sequence stops issuing chunks; the pump finishes only the one in flight. The result is
+  **under**-delivery, and the driver can report exactly what went in because every chunk is in the
+  log — which is what §4f's partial-bolus path already does.
+- **The manufacturer's own app does this**, with these parameters, on this pump.
+- **The history sync handles the result correctly**, demonstrated here without being asked to: all
+  five chunks imported as separate records totalling 2.00 U, and AAPS's own 2 U bolus stayed a single
+  live row alongside them (the extra rows carry `referenceId`, so they are historic versions, not
+  duplicates — 7c's finding holds under a five-entry burst).
+
+**What implementing it would cost**, stated so the decision is made with open eyes: the bolus flow
+opens a provisional record and settles it against **one** log entry, and would need to settle against
+N; the command queue would be held for the whole delivery (50 s for 10 U at 12 U/min, against 15
+minutes for the extended-bolus route); and a 10 U bolus becomes ten treatment records — noisy, but
+*accurate*, because the insulin genuinely went in as ten pulses.
+
+**Recommendation: this, not the extended bolus, is the way to slow delivery for comfort.** It hits
+exactly the requested 12 U/min, needs no new pump capability, keeps every delivery a confirmed
+standard bolus, and the parameters come from the manufacturer rather than from a guess. It is a new
+delivery behaviour and wants its own saline phase.
+
 #### ✅ [verified] It is not a pump setting AAPS can reach — tested 2026-08-03
 
 The settings-index hunt was run and came back negative, decisively.
