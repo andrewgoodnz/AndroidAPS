@@ -2169,7 +2169,7 @@ do not invent others.
 | 9a two chunks | 12 U/min | 2 U | ✅ **PASSED 2026-08-03** |
 | 9b cancel mid-sequence | 3 U/min | 6 U | ⏳ not yet run |
 | 9c connection lost | 3 U/min | 6 U | ⏳ not yet run |
-| 9d the record and IOB | — | — | ⚠ **half passed** — live rows correct; the re-read is not yet done |
+| 9d the record and IOB | — | — | ✅ **PASSED 2026-08-03** |
 | 9e a refused chunk | 3 U/min | 6 U | ⏳ not yet run |
 
 Run on build **3.4.2.6**, installed 17:06:32. (The labels on the speed dropdown were corrected
@@ -2218,16 +2218,16 @@ at the same cadence for the same total.** The only difference is where the trim 
 chunk by how long the previous cycle actually took.
 
 **Reservoir: 107.39 → 105.38 across it = 2.01 U**, the extra 0.01 being basal at 0.3 U/h over the
-sequence. ⚠ **No reservoir reading has been taken after 9a's own run** — the pump disconnected at
-17:09:49 before the next poll — so 9a's reservoir check is carried by the run above it rather than by
-itself.
+sequence. **9a's own run is confirmed separately: 105.38 → 103.30 = 2.08 U**, the bolus plus 0.07 U
+of basal across the fifteen minutes between the two readings. The second reading only arrived at
+17:24, after a reinstall brought AAPS back and it reconnected on its own.
 
 **Phone-side scheduling held to the millisecond**: starts at +0.0, +8.001, +16.002, +24.004, +32.001.
 Confirmation fits comfortably inside the slot, so the "due at sequence start + k × interval"
 scheduling never had to fall behind. The upper-bound property was therefore **not** exercised — a run
 where a chunk overruns its slot has not happened yet, and the ceiling has not been reached either.
 
-### ⚠ 9d — the live rows are right; the re-read has not happened
+### ✅ 9d PASSED — the live rows are right, and they survived a re-read
 
 ```
 17:09:41  1.0  pumpId=160911     17:08:53  0.4  pumpId=160909
@@ -2243,8 +2243,42 @@ per-chunk provisional design — **zero live rows with a null `pumpId`**, meanin
 opened before a chunk was settled to that chunk's own pump sequence. The rows carrying a
 `referenceId` are the superseded provisionals, which is 7c's finding and not duplication.
 
-⚠ **The second half of 9d is not done.** Nothing has re-read history across `160905`–`160911` yet, so
-idempotency across a chunked bolus is still unproven. It needs one status read and a re-query.
+#### The re-read, and why it was a stronger test than the one that was specified
+
+The reinstall at 17:23 restarted AAPS, which reconnected on its own and ran a sync with
+**`watermark=160904`** — *below every chunk entry*. So the sync did not merely re-offer entries it had
+already handled; it saw all seven **for the first time** and imported them:
+
+```
+History sync: importing BolusDelivered seq=160905 … 160911   (7 in a row)
+History sync: imported 7 event(s) above 160904; watermark 160904 -> 160911
+```
+
+Seven imports onto seven existing records is the case that produces fourteen boluses if the identity
+scheme is wrong. **It produced seven.** Re-queried afterwards:
+
+```
+17:08:18  0.4  160905        17:09:31  1.0  160910
+17:08:26  0.4  160906        17:09:36  1.0  160911
+17:08:34  0.4  160907
+17:08:42  0.4  160908
+17:08:50  0.4  160909
+```
+
+Same counts, same totals, no duplicate `pumpId`, no live row with a null one. `syncBolusWithPumpId`
+upserted, exactly as §8.5 says it does, across a chunked bolus and not merely across a single one.
+
+⚠ **And the timestamps moved** — from the phone's settle time to the pump's own entry time, which is
+also §8.5's documented behaviour. That turns out to matter here for a reason nobody planned: the
+rows now record **8, 8, 8, 8 seconds and 5 seconds** in AAPS's own database. The cadence is therefore
+attested by three independent things — the driver's log line, the pump's entry timestamps, and the
+treatment records — rather than only by the driver's account of itself.
+
+**Two incidental confirmations from the same reconnect.** The profile write AAPS makes after a
+reinstall (`[0.30 ×24]`, identical to what the pump held) appended **nothing** to the event log — the
+watermark went straight to 160911 — which is §8.5's "a profile write of the *same* profile appends
+nothing", holding for a fourth time. And the sync cost **22.3 s for 100 entries behind a 634 ms
+probe**, which is §8.5's own pricing.
 
 ⚠ **Do not change the logic mid-run to make a step pass.** Record the failure, stop, and fix it
 deliberately — that is the rule the earlier phases were run under and it is what makes their results
