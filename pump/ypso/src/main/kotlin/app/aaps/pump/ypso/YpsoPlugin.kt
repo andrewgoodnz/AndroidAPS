@@ -269,16 +269,24 @@ class YpsoPlugin @Inject constructor(
      * ⚠ The last line is a **safety statement, not a status field**, and it is deliberately not
      * derived from anything.
      *
-     * It used to read "profile write UNTESTED", which stopped being true on 2026-07-31 when Phase 4
-     * passed — a stale claim in the one string a user reads to decide what the build in their hand
-     * can do. What replaced it is the claim that is still true and will stay true until a human
-     * decides otherwise: every test to date has been on saline, off-body.
+     * It has now been wrong twice in the same way, which is the thing worth recording. It read
+     * "profile write UNTESTED" until Phase 4 passed on 2026-07-31, then "Saline test build — not for
+     * use with insulin" until this build was made for a phone that will carry insulin. Both were
+     * true when written; both were **verdicts about a moment** in a string nobody re-reads, and a
+     * safety line that is visibly false is worse than none because it teaches the reader to skip it.
+     *
+     * What is here now is a **fact about the driver's history**, not a verdict about its use.
+     * "Verified on saline only" stays true no matter what anybody decides to put in the cartridge —
+     * the verification is what it is — and it says the thing a reader actually needs, which is that
+     * nothing here has ever been checked against a person. "Research pump" says the other one: this
+     * build cannot talk to a standard YpsoPump at all (§0), so seeing this line against the wrong
+     * pump means something is badly wrong.
      */
     override fun pumpSpecificShortStatus(veryShort: Boolean): String = buildString {
         append("Firmware: ${ypsoPump.firmwareVersion.ifBlank { "?" }}")
         if (!veryShort) {
             append("\nMode: ${ypsoPump.deliveryModeName.ifBlank { "?" }}")
-            append("\nSaline test build — not for use with insulin")
+            append("\nResearch pump — verified on saline only")
         }
     }
 
@@ -412,7 +420,8 @@ class YpsoPlugin @Inject constructor(
     }
 
     /**
-     * Delivers a standard bolus. **Under saline test — see SALINE_TEST_PROCEDURE.md phase 2.**
+     * Delivers a standard bolus. Confirmed on hardware in Phase 2 and again, chunked, in Phase 9;
+     * ⚠ what an **interrupted** bolus leaves in the database is Phase 10 and is not yet run.
      *
      * `bolusDelivered` is what the pump reported injecting, not what was asked for, and `success`
      * is only true when the two agree. A cancelled or short bolus therefore reports failure while

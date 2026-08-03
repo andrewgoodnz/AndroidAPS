@@ -1,14 +1,19 @@
 package app.aaps.pump.ypso
 
+import androidx.preference.ListPreference
+import androidx.preference.Preference
+import androidx.preference.PreferenceGroup
 import app.aaps.core.data.pump.defs.PumpType
 import app.aaps.core.interfaces.pump.DetailedBolusInfo
 import app.aaps.core.interfaces.queue.CommandQueue
 import app.aaps.core.interfaces.ui.UiInteraction
 import app.aaps.pump.ypso.keys.YpsoDoubleNonKey
 import app.aaps.pump.ypso.keys.YpsoLongNonKey
+import app.aaps.pump.ypso.keys.YpsoStringKey
 import app.aaps.pump.ypso.keys.YpsoStringNonKey
 import app.aaps.shared.tests.TestBaseWithProfile
 import com.google.common.truth.Truth.assertThat
+import com.ypsopump.sdk.BolusSpeed
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -46,6 +51,10 @@ class YpsoPluginTest : TestBaseWithProfile() {
         whenever(rh.gs(anyInt(), anyOrNull(), anyOrNull())).thenReturn("mocked")
         whenever(preferences.get(YpsoStringNonKey.MacAddress)).thenReturn("")
         whenever(preferences.get(YpsoLongNonKey.LastConnection)).thenReturn(0L)
+        // `YpsoPump.firmwareVersion` is a non-null String backed by a preference read, so an
+        // unstubbed mock hands `null` to `ifBlank` and NPEs inside pumpSpecificShortStatus rather
+        // than returning the "?" the code is written to show.
+        whenever(preferences.get(YpsoStringNonKey.FirmwareVersion)).thenReturn("")
 
         ypsoPump = YpsoPump(aapsLogger, preferences, dateUtil)
         plugin = YpsoPlugin(
@@ -229,5 +238,102 @@ class YpsoPluginTest : TestBaseWithProfile() {
         val screen = preferenceManager.createPreferenceScreen(context)
         plugin.addPreferenceScreen(preferenceManager, screen, context, null)
         assertThat(screen.preferenceCount).isGreaterThan(0)
+    }
+
+    // ==================== the bolus speed list ====================
+
+    /** Every preference in the tree, depth first. The driver nests its own under a category. */
+    private fun PreferenceGroup.flatten(): List<Preference> =
+        (0 until preferenceCount).map { getPreference(it) }.flatMap { child ->
+            listOf(child) + if (child is PreferenceGroup) child.flatten() else emptyList()
+        }
+
+    private fun bolusSpeedPreference(): ListPreference {
+        val screen = preferenceManager.createPreferenceScreen(context)
+        plugin.addPreferenceScreen(preferenceManager, screen, context, null)
+        val all = screen.flatten()
+        // Walked rather than `findPreference`d: that matches on the key, and a preference whose key
+        // did not get set would come back null with nothing to say about why. The dump names what
+        // is actually on the screen.
+        return all.filterIsInstance<ListPreference>().singleOrNull { it.key == YpsoStringKey.YpsoBolusSpeed.key }
+            ?: error(
+                "No ListPreference keyed '${YpsoStringKey.YpsoBolusSpeed.key}' on the screen. Found: " +
+                    all.joinToString { "${it::class.simpleName}(key=${it.key})" }
+            )
+    }
+
+    @Test
+    fun `the bolus speed list offers all four of Lotus's speeds`() {
+        // 6 U/min was held out of this list until Phase 9 passed on 2026-08-04, and its absence was
+        // how the list came to be missing a rate from the middle of its own range in the first
+        // place. Four options, and the values are the enum's own.
+        val preference = bolusSpeedPreference()
+        assertThat(preference.entryValues.map { it.toString() })
+            .containsExactly("unlimited", "12", "6", "3")
+            .inOrder()
+        assertThat(BolusSpeed.entries).hasSize(4)
+    }
+
+    @Test
+    fun `each label describes the value stored beside it`() {
+        // ⚠ This is the one part of the mapping that is not correct by construction. The values come
+        // from `BolusSpeed.storedValue`, so they cannot drift; the labels are hand-written strings
+        // whose ONLY link to them is list position. Reordering one array and not the other would
+        // silently offer "3 U/min" and store 12 — a four-fold error in the direction of a faster
+        // bolus than the user asked for, and nothing in the UI would look wrong.
+        val preference = bolusSpeedPreference()
+        assertThat(preference.entries).hasLength(preference.entryValues.size)
+
+        preference.entryValues.forEachIndexed { index, value ->
+            val speed = BolusSpeed.from(value.toString())
+            val label = preference.entries[index].toString()
+            assertThat(label).contains(
+                if (speed == BolusSpeed.Unlimited) "Unlimited" else "${speed.unitsPerMinute.toInt()} U/min"
+            )
+        }
+    }
+
+    @Test
+    fun `every offered value resolves to a real speed, and an unknown one is the pump's own`() {
+        // `from` falls back to Unlimited for anything unrecognised, which is the path eight hardware
+        // phases ran. That is the safe fallback for a *comfort* setting: it delivers, at the rate
+        // the pump has always used, rather than refusing or picking a rate nobody chose.
+        bolusSpeedPreference().entryValues.forEach { value ->
+            assertThat(BolusSpeed.from(value.toString()).storedValue).isEqualTo(value.toString())
+        }
+        assertThat(BolusSpeed.from(null)).isEqualTo(BolusSpeed.Unlimited)
+        assertThat(BolusSpeed.from("")).isEqualTo(BolusSpeed.Unlimited)
+        assertThat(BolusSpeed.from("33.3")).isEqualTo(BolusSpeed.Unlimited)
+
+        // ⚠ And the old index-valued list: `0 -> 3 U/min, 1 -> 12, 2 -> 33.3`. A stored `1` from
+        // that list lands here as Unlimited rather than as 12 U/min, which is deliberate — under
+        // the old code the preference set a timeout estimate and a log line and did not chunk at
+        // all, so Unlimited *is* the delivery behaviour that value already produced.
+        assertThat(BolusSpeed.from("0")).isEqualTo(BolusSpeed.Unlimited)
+        assertThat(BolusSpeed.from("1")).isEqualTo(BolusSpeed.Unlimited)
+        assertThat(BolusSpeed.from("2")).isEqualTo(BolusSpeed.Unlimited)
+    }
+
+    @Test
+    fun `the shipped default does not chunk`() {
+        // Passing Phase 9 licensed the option, not a change for anyone who has not picked one.
+        assertThat(YpsoStringKey.YpsoBolusSpeed.defaultValue).isEqualTo(BolusSpeed.Unlimited.storedValue)
+        assertThat(BolusSpeed.from(YpsoStringKey.YpsoBolusSpeed.defaultValue).chunks).isFalse()
+    }
+
+    // ==================== what the user is told the build is ====================
+
+    @Test
+    fun `the short status does not claim a verification that has not happened`() {
+        // This line has been stale twice — "profile write UNTESTED" after Phase 4 passed, then
+        // "Saline test build — not for use with insulin" once a build was made for a phone that
+        // will carry insulin. It is now a fact about the driver's history rather than a verdict
+        // about its use, so it cannot go stale the same way; this pins that it stays one.
+        val status = plugin.pumpSpecificShortStatus(false)
+        assertThat(status).contains("saline only")
+        assertThat(status).doesNotContain("UNTESTED")
+
+        // veryShort is the home-screen field and carries the firmware alone.
+        assertThat(plugin.pumpSpecificShortStatus(true)).doesNotContain("saline")
     }
 }

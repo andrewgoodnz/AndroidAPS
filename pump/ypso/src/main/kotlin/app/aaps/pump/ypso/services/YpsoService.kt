@@ -500,7 +500,7 @@ class YpsoService : DaggerService() {
      * Everything else the pump logs as an alert is still worth saying, at a lower level.
      */
     private fun raisePumpAlert(alert: PumpHistoryEvent.Alert) {
-        val urgent = alert.code in URGENT_ALERT_CODES
+        val urgent = YpsoEventPolicy.isUrgent(alert.code)
         val text = rh.gs(R.string.ypso_pump_alert, alert.message)
         aapsLogger.warn(LTag.PUMP, "Pump alert ${alert.code} (${alert.message}), urgent=$urgent")
 
@@ -1346,28 +1346,26 @@ class YpsoService : DaggerService() {
      * actually filled a line — a small prime is a top-up, not a set change.
      */
     private fun syncConsumableChange(event: PumpHistoryEvent.Unknown, serial: String) {
-        when (event.eventType) {
-            YpsoEventTypes.CANNULA_PRIMING_FINISHED -> insertTherapyEvent(TE.Type.CANNULA_CHANGE, event, serial)
+        val primed = YpsoEventTypes.primedUnits(event.rawData)
+        val type = YpsoEventPolicy.consumableEventFor(event.eventType, primed)
 
-            YpsoEventTypes.BATTERY_REMOVED          -> insertTherapyEvent(TE.Type.PUMP_BATTERY_CHANGE, event, serial)
+        if (type != null) {
+            insertTherapyEvent(type, event, serial)
+            return
+        }
 
-            YpsoEventTypes.PRIMING_FINISHED         -> {
-                val primed = YpsoEventTypes.primedUnits(event.rawData)
-                if (primed > YpsoEventTypes.TUBE_CHANGE_PRIME_THRESHOLD_UNITS) {
-                    insertTherapyEvent(TE.Type.TUBE_CHANGE, event, serial)
-                } else {
-                    aapsLogger.info(
-                        LTag.PUMP,
-                        "Prime of ${primed}U at seq=${event.position} below tube-change threshold, not recorded"
-                    )
-                }
-            }
-
-            else                                    ->
-                aapsLogger.info(
-                    LTag.PUMP,
-                    "Unmapped pump event type ${event.eventType} at seq=${event.position}, skipped"
-                )
+        // Two different nothings, and they read differently in a log. A prime below the threshold
+        // is a decision that was taken; anything else is an event type nobody has mapped.
+        if (event.eventType == YpsoEventTypes.PRIMING_FINISHED) {
+            aapsLogger.info(
+                LTag.PUMP,
+                "Prime of ${primed}U at seq=${event.position} below tube-change threshold, not recorded"
+            )
+        } else {
+            aapsLogger.info(
+                LTag.PUMP,
+                "Unmapped pump event type ${event.eventType} at seq=${event.position}, skipped"
+            )
         }
     }
 
@@ -1454,19 +1452,6 @@ class YpsoService : DaggerService() {
     companion object {
 
         private const val YPSOPUMP_NAME_PREFIX = "YpsoPump_"
-
-        /**
-         * Alert codes that mean insulin is not being delivered. These get an urgent, audible
-         * notification; the rest of the pump's alerts are informational by comparison.
-         */
-        private val URGENT_ALERT_CODES = setOf(
-            YpsoEventTypes.A_OCCLUSION,
-            YpsoEventTypes.A_CARTRIDGE_EMPTY,
-            YpsoEventTypes.A_NO_CARTRIDGE,
-            YpsoEventTypes.A_AUTO_STOP,
-            YpsoEventTypes.A_BATTERY_EMPTY,
-            YpsoEventTypes.A_REUSABLE_ERROR
-        )
 
         /**
          * Length of the 0% temporary basal that stands for a stopped pump — see [syncSuspendedState].

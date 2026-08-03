@@ -15,7 +15,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:paddingBottom="6dp"
-            android:text="@string/ypso_read_only_banner"
+            android:text="@string/ypso_research_pump_banner"
             android:textStyle="bold" />
 
         <TableLayout

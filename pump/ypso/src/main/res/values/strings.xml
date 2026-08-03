@@ -16,7 +16,15 @@ SALINE ONLY, OFF-BODY, CANNULA TO AIR.
 
 It writes no treatment record; the history sync will pick up whatever the pump logs. Do not run this with insulin in the cartridge.</string>
     <string name="ypso_ext_probe_running">Probe running — this takes about two minutes. Watch the log.</string>
-    <string name="ypso_read_only_banner">SALINE TEST BUILD — bolus, temp basal and basal profile write are enabled and verified on saline. Not for use with insulin.</string>
+
+    <!--
+      The banner at the top of the YPSO tab. Both sentences are facts about the driver rather than
+      verdicts about how it may be used, because the sentence this replaced ("SALINE TEST BUILD …
+      Not for use with insulin") was a verdict, and it went stale the moment a build was made for a
+      phone that will carry insulin. A safety line that is visibly false teaches the reader to skip
+      the next one. "Verified on saline only" stays true whatever anybody puts in the cartridge.
+    -->
+    <string name="ypso_research_pump_banner">RESEARCH PUMP DRIVER — verified on saline only, never against a person. This build talks plaintext and cannot connect to a standard YpsoPump.</string>
 
     <string name="ypso_pairing_title">Pair YpsoPump</string>
     <string name="ypso_pairing_summary">Scan for your pump and bond to it. Confirm the code shown on the pump.</string>
