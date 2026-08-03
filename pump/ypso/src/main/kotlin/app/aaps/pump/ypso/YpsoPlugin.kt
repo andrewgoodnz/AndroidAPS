@@ -585,10 +585,8 @@ class YpsoPlugin @Inject constructor(
                 }
             )
             addPreference(
-                // ⚠ 6 U/min is missing on purpose. Phase 9 says the fourth option appears only once
-                // 9a–9e have passed; 9a needs 12 and 9b needs 3, so nothing is blocked by holding
-                // it. BolusSpeed knows the parameters either way — the duration ceiling steps
-                // through 6 U/min whether or not it is offered here.
+                // 6 U/min was held out of this list until 9a–9e had all passed, which they did on
+                // 2026-08-04. It is the four options mylife Lotus offers, with Lotus's parameters.
                 AdaptiveListPreference(
                     ctx = context,
                     stringKey = YpsoStringKey.YpsoBolusSpeed,
@@ -600,10 +598,16 @@ class YpsoPlugin @Inject constructor(
                     // and a label saying otherwise puts it straight back. Every option here
                     // describes what the *phone* will do, and the chunk parameters are shown so it
                     // is obvious that is what is being configured.
-                    entries = arrayOf("Unlimited — no splitting (~33 U/min)", "12 U/min — 1 U every 5 s", "3 U/min — 0.4 U every 8 s"),
+                    entries = arrayOf(
+                        "Unlimited — no splitting (~33 U/min)",
+                        "12 U/min — 1 U every 5 s",
+                        "6 U/min — 0.5 U every 5 s",
+                        "3 U/min — 0.4 U every 8 s"
+                    ),
                     entryValues = arrayOf(
                         BolusSpeed.Unlimited.storedValue,
                         BolusSpeed.Twelve.storedValue,
+                        BolusSpeed.Six.storedValue,
                         BolusSpeed.Three.storedValue
                     )
                 )

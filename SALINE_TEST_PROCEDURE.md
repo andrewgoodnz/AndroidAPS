@@ -2168,12 +2168,13 @@ do not invent others.
 |---|---|---|---|
 | 9a two chunks | 12 U/min | 2 U | ✅ **PASSED 2026-08-03** |
 | 9b cancel mid-sequence | 3 U/min | 6 U | ✅ **PASSED 2026-08-03** |
-| 9c connection lost | 3 U/min | 2 U | ⚠ **PARTIAL** — delivery correct, **recording defective** |
+| 9c connection lost | 3 U/min | 2 U | ✅ **PASSED 2026-08-04** on the re-run after the fix |
 | 9d the record and IOB | — | — | ✅ **PASSED 2026-08-03** |
 | 9e a refused chunk | 3 U/min | 4 U | ✅ **PASSED 2026-08-03** |
 
-⚠ **Phase 9 is therefore NOT passed**, and `YpsoBolusSpeed`'s fourth option stays out. 9c found a real
-defect — see below. The gate says *all* of 9a–9e.
+✅ **Phase 9 is PASSED, 2026-08-04.** 9c failed first time, found a real defect, and passed on the
+re-run after the fix — which is the phase working rather than the phase being lucky. `YpsoBolusSpeed`
+is now a real four-option preference, 6 U/min included.
 
 **Every run was checked against the reservoir, not against the driver's own account of itself:**
 
@@ -2418,7 +2419,55 @@ why it was not noticed, not a reason to keep it.
 failure there leaves a provisional at the **full** bolus amount. Chunking made each occurrence
 smaller and more frequent, and that is what made it visible.
 
-**Not fixed during the run** — §8.6's rule. 9c must be re-run after the fix.
+**Not fixed during the run** — §8.6's rule. Fixed afterwards and re-run.
+
+#### ✅ 9c re-run PASSED — 2026-08-04 05:14
+
+2 U at 3 U/min, pump pulled out of range. **The link died in the same place**, during chunk 4's
+baseline read — `readHistoryCount` at 05:14:44.1, GLB write failing with GATT 133 at 05:14:49.3 after
+a 5.2 s hang, the same shape as the first run's 5.5 s. That was not guaranteed: the branch left
+deliberately unchanged is the one where the *write* dies, and pulling the pump catches whatever is in
+flight.
+
+The same failure at the same point, before and after:
+
+| | Pre-fix, 08-03 19:16 | Post-fix, 08-04 05:14 |
+|---|---|---|
+| `Provisionally recorded` for the failed chunk | present | **absent** |
+| `Starting bolus` for the failed chunk | absent | absent |
+| Provisionals opened | 2, for 1 sent chunk | **3, for 3 sent chunks** |
+| New live row with null `pumpId` | yes | **none** |
+
+```
+05:14:49.294  Bolus refused: The pump's event log could not be read … nothing was sent
+CHUNKED: 3/5 confirmed, 1.2U of 2.0U … seqs [160975, 160976, 160977]
+deliverBolus: asked 2.0U, pump delivered 1.2U, success=false
+```
+
+Database: three live rows, `160975`–`160977`, 0.4 U each. **Reservoir 93.50 → 92.28 = 1.22 U**
+against 1.20 U claimed plus 0.006 U of basal — agreement inside the pump's own 0.01 U resolution.
+
+⚠ **The control that makes this convincing is the old phantom.** The 0.4 U null-`pumpId` row from
+19:16:28 on 08-03 is still in the database, so the query demonstrably finds such rows when they
+exist. None was created this time under the same failure.
+
+#### ⚠ [fixed] And the re-run caught the instrument lying
+
+```
+CHUNKED: chunk 4/5 0.4U sent +24.0s, seq=null -> 0.0U, pump entry +8s — … nothing was sent
+                                                       ^^^^^^^^^^^^^^
+```
+
+Chunk 4 produced **no** pump entry, and the line reported a gap of 8 s — stale, carried over from
+chunks 2→3. The test asked whether the *list* held two entries rather than whether **this** chunk had
+contributed one.
+
+**It did not corrupt any result**: the summary line's `seqs` list, the confirmed count, the database
+and the reservoir are all independent of it and all agree. But this is a phase adjudicated on entry
+spacing, and a per-chunk line that invents a spacing for a chunk with no entry is precisely the
+failure this file keeps recording — a check reading back something other than what it claims to
+measure — this time in the instrument rather than in the driver. Fixed: the gap prints only when the
+chunk being logged produced an entry and a previous one exists.
 
 ### ⚠ Unexplained: sequence numbers that appear in neither log
 
@@ -2446,3 +2495,16 @@ and survive a re-read; and 9e stops on a refused chunk.
 
 **Then, and not before**, `YpsoBolusSpeed` becomes a real preference for the first time — and it needs
 its fourth option, **6 U/min**, which the current three-way list is missing (§8.6).
+
+### ✅ All five passed, 2026-08-04 — and the gate has been opened
+
+`YpsoBolusSpeed` now offers all four of Lotus's options with Lotus's parameters, and is a real
+preference for the first time since it was introduced.
+
+⚠ **The default is still `unlimited`.** Passing Phase 9 licenses the *option*, not a change to how
+the driver behaves for someone who has not chosen one. Nothing chunks unless it is asked to.
+
+**9c is the reason to trust the rest.** It failed on the first attempt, and it failed on the one
+condition of the five that no amount of watching a successful run would have exposed — the record
+left behind by a chunk that was never sent. Four steps passing on the first attempt is what a phase
+looks like when it is not asking hard enough; this one asked.

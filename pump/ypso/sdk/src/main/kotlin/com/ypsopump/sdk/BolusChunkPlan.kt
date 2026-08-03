@@ -46,10 +46,10 @@ enum class BolusSpeed(
     /**
      * Lotus: 0.5 U per 5 s.
      *
-     * ⚠ **Deliberately not offered in the UI yet.** It is the option the old three-way list was
-     * missing, and Phase 9 says it appears only once 9a–9e have passed. It is defined here because
-     * the ceiling in [plan] steps *through* it, and because leaving a known parameter out of the
-     * table to keep it out of a dropdown is how the list came to be missing it in the first place.
+     * The option the old three-way list was missing. It was defined here but kept out of the UI
+     * until Phase 9 passed, which it did on 2026-08-04; the ceiling in [plan] steps *through* it
+     * either way, and leaving a known parameter out of the table to keep it out of a dropdown is how
+     * the list came to be missing it in the first place.
      */
     Six("6", 6.0, 50, 5),
 

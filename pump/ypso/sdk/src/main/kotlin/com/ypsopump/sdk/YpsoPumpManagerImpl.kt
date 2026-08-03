@@ -1316,11 +1316,21 @@ class YpsoPumpManagerImpl private constructor(
                 onChunkSettled(result)
                 deliveredCentiUnits += (result.deliveredUnits * 100).roundToInt()
                 result.pumpSequence?.let { sequences += it }
-                result.timestampMillis?.let { pumpEntrySeconds += it / 1000 }
                 if (result.complete) confirmedChunks++
 
-                val pumpGap = if (pumpEntrySeconds.size >= 2)
-                    ", pump entry +${pumpEntrySeconds.last() - pumpEntrySeconds[pumpEntrySeconds.size - 2]}s"
+                // ⚠ The gap is only printed when **this** chunk produced an entry. The first version
+                // asked whether the *list* had two entries, so a chunk that logged nothing reprinted
+                // the gap between the previous two — and 9c's re-run duly produced
+                // `seq=null -> 0.0U, pump entry +8s` for a chunk that was never sent. In a phase
+                // adjudicated on entry spacing, an instrument that invents a spacing for a chunk
+                // with no entry is the failure mode this file keeps recording, in the log rather
+                // than in the driver.
+                val previousEntrySeconds = pumpEntrySeconds.lastOrNull()
+                val entrySeconds = result.timestampMillis?.div(1000)
+                if (entrySeconds != null) pumpEntrySeconds += entrySeconds
+
+                val pumpGap = if (entrySeconds != null && previousEntrySeconds != null)
+                    ", pump entry +${entrySeconds - previousEntrySeconds}s"
                 else ""
                 log(
                     "CHUNKED: chunk ${index + 1}/${chunks.size} ${chunkUnits}U sent +${offsetMs / 1000.0}s, " +
