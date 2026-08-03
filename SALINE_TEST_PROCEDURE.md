@@ -2713,6 +2713,31 @@ for f in androidaps.db androidaps.db-wal androidaps.db-shm; do
 done
 ```
 
+### ⚠⚠ This needs a DEBUG build on the tablet — a release build cannot be read
+
+`run-as` only works on a **debuggable** package, and `debuggable` comes from the build *type*, not from
+the signing key. On a release build the command above fails with:
+
+```
+run-as: package not debuggable: info.nightscout.androidaps
+```
+
+**Found the hard way on 2026-08-04**, by installing the release APK on the tablet and discovering the
+instrumentation had gone. There is no way around it from the host side — not root, not `exec-out`, not a
+different `adb` flag; the platform simply refuses. So:
+
+- **The test tablet must carry `:app:assembleFullDebug`** for any phase adjudicated on the database,
+  which is Phase 10 and in practice all of them. This is not a preference, it is what makes the arbiter
+  readable.
+- **The phone should carry the release build** — not debuggable is the right answer for a device doing
+  therapy, and no test is adjudicated there.
+- The two are signed with different keys anyway (`README_YPSO.md`), so they were never going to be the
+  same file.
+
+If a phase has to be run against a release build, the only way to get the database out is AAPS's own
+**Export database** from the Maintenance menu, which is a different artefact in a different format and
+is not what the SQL above expects. Reinstall the debug build instead.
+
 ```sql
 select id,
        datetime(timestamp/1000,'unixepoch','localtime') as ts,

@@ -314,10 +314,21 @@ main phone uses `aaps_key`.** Sign the same unsigned APK twice rather than build
 identical either way, and only the signature differs.
 
 **Build type does not affect looping.** `Config.DEBUG` is declared and then used nowhere in the
-codebase, and the loop gates are the `full` flavour plus a version with no `-` (below). So a release
-build signed with the debug key is a legitimate tablet build, and this is the reason to prefer it over
-`assembleFullDebug`: the `debug` build type sets `enableAndroidTestCoverage`, which instruments the
-app's bytecode with JaCoCo — overhead nobody wants on a device being used to judge timing.
+codebase, and the loop gates are the `full` flavour plus a version with no `-` (below). A release build
+signed with the debug key therefore runs perfectly well on the tablet.
+
+⚠⚠ **But do not put a release build on the test tablet, because it cannot be instrumented.** `run-as`
+— which is how every hardware phase pulls `androidaps.db`, the arbiter the log is explicitly not —
+works only on a **debuggable** package, and `debuggable` comes from the build *type*, not the signing
+key. On a release build it fails with `run-as: package not debuggable`, and nothing on the host side
+gets around it. Measured on 2026-08-04 by doing exactly this and losing the instrumentation.
+
+So the split is:
+
+| Device | Build | Why |
+|---|---|---|
+| **Test tablet** | `:app:assembleFullDebug` | `run-as` works, so the database can be read. This is what makes a phase adjudicable |
+| **Main phone** | `:app:assembleFullRelease` | Not debuggable, which is right for a therapy device. Nothing is adjudicated here |
 
 The phone's key is `C:\Users\Andrew\StudioProjects\aaps_key` — **PKCS12, one entry, alias `key0`**,
 created 2021-06-04.
