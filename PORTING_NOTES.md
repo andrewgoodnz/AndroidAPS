@@ -3152,6 +3152,16 @@ Carried forward from session 1, all still true:
     Android Studio **closed**: invoking `gradlew` alternately from PowerShell and from Git Bash
     starts a second daemon, because the differing environment doesn't match the first daemon's
     JVM args. Pick one shell for Gradle in this repo and stay in it.
+  - ⚠ **"Pick one shell" is not sufficient — session 7 hit it four times from PowerShell alone.**
+    The reproducible shape is running a module task (`:pump:ypso:compileFullDebugKotlin`, the ypso
+    test tasks) and then `:app:assembleFullDebug`; the assemble fails on
+    `core/interfaces/…/classes.jar`. Treat `--stop` as a **routine prefix to the assemble**, not as
+    a recovery step:
+    ```
+    ./gradlew --stop; ./gradlew :app:assembleFullDebug
+    ```
+    It costs one daemon start-up and removes a failure that otherwise lands on roughly every second
+    build. The `:app:clean` remedy below is for the *KSP* failure and does not help with this one.
 - `JAVA_HOME` must be set for `gradlew.bat`; the Android Studio JBR
   (`C:\Program Files\Android\Android Studio\jbr`) works.
 - `:app:kspFullDebugKotlin` can fail spuriously with `ComponentProcessingStep was unable to
