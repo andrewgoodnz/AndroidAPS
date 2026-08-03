@@ -595,7 +595,12 @@ class YpsoPlugin @Inject constructor(
                     title = R.string.ypso_bolus_speed_title,
                     summary = R.string.ypso_bolus_speed_summary,
                     dialogTitle = R.string.ypso_bolus_speed_title,
-                    entries = arrayOf("Pump's own speed (33 U/min)", "12 U/min", "3 U/min"),
+                    // ⚠ The first option is "no splitting", NOT "the pump's speed setting". The pump
+                    // has no speed setting — that fiction is what §8.6 spent a session disproving,
+                    // and a label saying otherwise puts it straight back. Every option here
+                    // describes what the *phone* will do, and the chunk parameters are shown so it
+                    // is obvious that is what is being configured.
+                    entries = arrayOf("Unlimited — no splitting (~33 U/min)", "12 U/min — 1 U every 5 s", "3 U/min — 0.4 U every 8 s"),
                     entryValues = arrayOf(
                         BolusSpeed.Unlimited.storedValue,
                         BolusSpeed.Twelve.storedValue,
