@@ -1714,7 +1714,50 @@ is already gentler than Omnipod. **The granularity is not the problem and does n
 - ⚠ **Do not enable the multiwave/combined bolus in the same change.** It is a separate refusal and
   gets its own gate. One at a time, as always.
 
-## 8a. The queue-blocking question — **do this first, and stop if it fails**
+## 8a. The queue-blocking question ✅ **PASSED 2026-08-03**
+
+> **The pump does extended boluses, and it enforces a minimum duration.** Run at 14:19 on saline,
+> 115 U in the cartridge, driven from `adb`.
+>
+> ```
+> control: standard 0.1U (type=1)            -> accepted
+> trying 1.0U over 1min  (type=2)            -> REJECTED
+> trying 1.0U over 15min (type=2)            -> ACCEPTED
+> t+0s   slow[status=1 seq=160798 injected=0.0  total=1.0] duration=0/15 min
+> t+2s   slow[status=1 seq=160798 injected=0.17 total=1.0] duration=0/15 min
+> t+30s  slow[status=1 seq=160798 injected=0.17 total=1.0] duration=0/15 min
+> cancel -> slow[status=0 injected=0.0 total=0.0] duration=0/0    CONFIRMED by read-back
+> ```
+>
+> **1 minute rejected, 15 accepted.** AAPS's `extendedBolusSettings` 15-minute step was describing
+> **the pump**, not the UI — the same figure mylife Lotus offers. The earlier single-shot probe's
+> report said *"Extended bolus is not available on this firmware"*; that was an over-claim from one
+> observation with three possible explanations, and this is the run that disproves it.
+>
+> **The echo is exact**: `slowTotal = 1.0` against 1.0 U asked, `totalDuration = 15` against 15 min
+> asked, and the pump assigned its own sequence `160798`.
+>
+> **Delivery is genuinely spread, and it is PULSED rather than continuous.** `slowInjected` went to
+> **0.17 U within 2 s and then held there for the remaining 28 s**. 0.167 U is exactly 1/6 of 1 U, so
+> a 15-minute bolus appears to be six pulses ~2.5 min apart. At the pump's normal ~33 U/min the whole
+> 1 U would have been gone in 1.8 s, so the duration is unambiguously being honoured.
+>
+> **Cancel works and was confirmed by read-back** — Phase 8d's safety half, exercised here for the
+> first time anywhere.
+
+> ⚠⚠ **The queue-blocking answer is "yes it would block", and that decides how the real method must
+> be written.** `slowStatus` stayed **1** for the whole 30 s — the pump reports an extended bolus as
+> *running* for its duration, not as *programmed*. So `deliverExtendedBolus` must **not** reuse
+> `deliverBolusConfirmed`'s wait-for-`Idle` loop, or a 15-minute bolus would hold the AAPS command
+> queue for fifteen minutes.
+>
+> What it must do instead is exactly what this probe did: send, then **confirm by read-back that
+> `slowTotal` and `totalDuration` echo what was asked**, and return. That satisfies §0 — success is a
+> claim the pump has confirmed — while redefining what is being claimed: *an extended bolus of this
+> amount and duration is running*, not *the insulin has been delivered*. Write that distinction down
+> at the call site when the method is implemented.
+
+## 8a — the original procedure
 
 **The question:** `deliverBolus` waits for the pump's `BolusStatus` to reach `Idle`, and the AAPS
 command queue is blocked behind that call for its whole duration (§8.3). If an extended bolus reports
@@ -1786,7 +1829,54 @@ reports a pass has measured that 5 U left the cartridge, which was never in ques
 This is the same evidence §8.3 used to prove the bolus probe was live: the reservoir in the payload,
 partway through, sitting between the start and end figures.
 
-## 8c. What it logs, and whether it reaches AAPS as the right kind of record
+## 8c. What it logs ⚠ **RUN 2026-08-03 — it lands in the WRONG TABLE**
+
+> **The failure this step existed to catch, caught.** After the 8a probe, the database says:
+>
+> ```
+> extendedBoluses:  (empty)
+>
+> boluses:
+>   14:19:17   0.17   NORMAL   160798    <- the EXTENDED bolus
+>   14:19:12   0.10   NORMAL   160797    <- the control, correctly NORMAL
+> ```
+>
+> Sequence 160798 is the one `BolusStatus` reported for the extended bolus, so there is no ambiguity
+> about which delivery this is. **It was recorded as a normal bolus.**
+>
+> The raw entry shows why, and shows that the fix is reachable:
+>
+> ```
+> [history] idx=1 seq=160797 type=2(Bolus Immediate) v1=10 v2=0 v3=0
+> [history] idx=0 seq=160798 type=3(Bolus Delayed)   v1=17 v2=0 v3=0
+> ```
+>
+> **The pump gives the extended bolus its own event type — 3, "Bolus Delayed" — distinct from the
+> standard bolus's type 2.** `YpsoHistoryMapper` maps both to `BolusDelivered`, which is why it
+> reached `syncBolusWithPumpId` and landed in `boluses`. So the driver *can* tell them apart and
+> currently does not.
+>
+> ⚠⚠ **But the entry carries no duration.** `v2` and `v3` are both zero where a standard bolus has
+> nothing to put there anyway. `PumpSync.syncExtendedBolusWithPumpId` needs amount **and** duration,
+> so **an extended bolus cannot be reconstructed from the pump's history alone.** The duration has to
+> come from the driver's own record made at delivery time — the same shape as the bolus settle path,
+> where a provisional record is opened before sending and settled against the log afterwards.
+>
+> That is a design constraint on implementing this properly, and it is worth having found before
+> writing the code rather than after.
+>
+> **Why the wrong table matters, in the direction that bites.** A completed 15-minute extended bolus
+> logged as a single `NORMAL` bolus would put all of its insulin at one instant. If the pump writes
+> that entry when the bolus *ends* — which is what §4f established for the standard bolus — then for
+> the whole 15 minutes AAPS sees **no IOB for insulin that is going in**, and may dose on top of it.
+> That is the stacking direction.
+>
+> **Still unknown, and needs a completed rather than cancelled bolus:** whether a bolus that runs to
+> completion logs its duration in `v2`, and whether `v1` is then the programmed or the delivered
+> amount. This run was cancelled at 30 s, and `v1=17` was the **delivered** 0.17 U, not the programmed
+> 1.0 U — which is the right convention and matches §4f, but says nothing about the completed case.
+
+## 8c — the original procedure
 
 1. After 8b, press **Read history** and record every entry the extended bolus produced — `seq=`,
    `type=`, `v1=`, `v2=`.

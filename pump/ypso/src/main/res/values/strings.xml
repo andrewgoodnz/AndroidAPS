@@ -10,7 +10,7 @@
 
     <string name="ypso_ext_probe">EXTENDED BOLUS PROBE (BENCH TEST)</string>
     <string name="ypso_ext_probe_confirm_title">Extended bolus probe — saline only</string>
-    <string name="ypso_ext_probe_confirm_message">This DELIVERS 1.0 U over 1 minute as an extended bolus, to find out whether the pump accepts one at all.
+    <string name="ypso_ext_probe_confirm_message">This DELIVERS up to 1.1 U: a 0.1 U standard bolus as a control, then 1.0 U as an extended bolus at the first duration the pump accepts (1, 15, 30 or 60 min). Rejected attempts deliver nothing. The extended bolus is cancelled after 30 seconds.
 
 SALINE ONLY, OFF-BODY, CANNULA TO AIR.
 

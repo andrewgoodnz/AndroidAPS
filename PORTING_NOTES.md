@@ -2462,6 +2462,79 @@ preference should simply go.
 **Not changed during the hardware session** that found it — §8.6's rule. The fix when it happens is to
 relabel it as the timeout estimate it is, or delete it and hard-code a generous timeout.
 
+### ✅ [verified] The extended bolus works, needs ≥15 min, and lands in the wrong table — 2026-08-03
+
+Phase 8a, run on saline behind the YPSO tab's bench probe. **The pump does extended boluses.**
+
+```
+control: standard 0.1U (type=1)      -> accepted
+1.0U over 1min  (type=2)             -> REJECTED   (GATT status 130, ATT application error)
+1.0U over 15min (type=2)             -> ACCEPTED
+t+0s   slow[status=1 seq=160798 injected=0.0  total=1.0] duration=0/15
+t+2s   slow[status=1 seq=160798 injected=0.17 total=1.0] duration=0/15
+t+30s  slow[status=1 seq=160798 injected=0.17 total=1.0] duration=0/15
+cancel -> slow[status=0 total=0.0] duration=0/0          CONFIRMED by read-back
+```
+
+**Four results.**
+
+**The pump enforces a minimum duration.** 1 minute refused, 15 accepted — and AAPS's
+`extendedBolusSettings` 15-minute step, which this file dismissed the same morning as UI
+granularity, turns out to have been describing the pump. The first probe run rejected at 1 minute
+was written up as *"extended bolus is not available on this firmware"*; that was one observation
+with three possible explanations and the conclusion was an over-claim. The sweep separated them.
+
+**Delivery is spread, and pulsed rather than continuous.** `slowInjected` reached **0.17 U within
+2 s and held there for 28 more**. 0.167 is exactly 1/6 of 1 U, so a 15-minute bolus looks like six
+pulses ~2.5 min apart. At the pump's ~33 U/min the whole unit would have gone in 1.8 s, so the
+duration is unambiguously honoured.
+
+**Cancel works**, `cancelBolus("extended")`, confirmed by read-back — Phase 8d's safety half,
+exercised for the first time.
+
+**⚠⚠ And it reaches AAPS as the wrong kind of record.** `extendedBoluses` is empty; the delivery is
+in `boluses` as `NORMAL`, `pumpId=160798`. The raw entry says why:
+
+```
+seq=160797 type=2(Bolus Immediate) v1=10   <- the control
+seq=160798 type=3(Bolus Delayed)   v1=17 v2=0 v3=0
+```
+
+The pump gives an extended bolus **its own event type, 3 "Bolus Delayed"**, and `YpsoHistoryMapper`
+maps both 2 and 3 to `BolusDelivered`. So the driver can tell them apart and does not.
+
+**⚠ The entry carries no duration** — `v2` and `v3` are zero — and
+`syncExtendedBolusWithPumpId` needs one. **An extended bolus therefore cannot be reconstructed from
+history alone**; the duration has to come from a record the driver makes at delivery time, the same
+shape as the bolus settle path. That is a design constraint worth having found before writing the
+code rather than after.
+
+**Why the table matters, in the direction that bites.** A *completed* 15-minute extended bolus
+logged as one `NORMAL` bolus would place all its insulin at a single instant. If the pump writes the
+entry when the bolus ends — which §4f established for the standard bolus — then for fifteen minutes
+AAPS sees no IOB for insulin that is going in, and may dose on top of it. The stacking direction.
+
+#### ⚠⚠ What this means for the queue, and for how the method must be written
+
+`slowStatus` stayed **1** for the whole 30 s: the pump reports an extended bolus as *running* for its
+duration, not as *programmed*. So `deliverExtendedBolus` must **not** reuse `deliverBolusConfirmed`'s
+wait-for-`Idle` loop, or a 15-minute bolus would hold the AAPS command queue for fifteen minutes —
+no status read, no temporary basal, no alert check.
+
+What it must do instead is what the probe did: send, confirm by read-back that `slowTotal` and
+`totalDuration` echo what was asked, and return. That satisfies §0 while changing what `success`
+claims: *an extended bolus of this amount and duration is running*, not *the insulin has been
+delivered*. That distinction has to be written at the call site, because every other delivery method
+in this driver means the second thing.
+
+#### ⚠ And the comfort goal is not served by this at 12 U/min
+
+The motivation was comfort on large boluses at around 12 U/min. With a **15-minute minimum**, an
+extended bolus gives 10 U over 15 min = **0.67 U/min** — far slower than asked for, and slower than
+Omnipod's 1.5. There is no way to ask this pump for 12 U/min through the extended bolus: that would
+need a 15-minute bolus of 180 U. **If ~12 U/min specifically is the target, the bolus-speed setting
+is the mechanism, not this** — see the settings-index route in §8.8, still unmapped.
+
 ### ✅ [verified] Closed: `bolusSize = 0.1` is safe — the increment is a menu setting only
 
 This section used to say that `PumpType.YPSOPUMP` hard-coding a 0.1 U step was a latent mis-dosing
