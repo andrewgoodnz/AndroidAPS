@@ -1326,12 +1326,7 @@ class YpsoService : DaggerService() {
 
             is PumpHistoryEvent.CartridgeChanged -> insertTherapyEvent(TE.Type.INSULIN_CHANGE, event, serial)
 
-            is PumpHistoryEvent.Alert          -> pumpSync.insertAnnouncement(
-                error = event.message,
-                pumpId = event.position,
-                pumpType = PumpType.YPSOPUMP,
-                pumpSerial = serial
-            )
+            is PumpHistoryEvent.Alert          -> insertAlertAnnouncement(event, serial)
 
             is PumpHistoryEvent.Unknown        -> syncConsumableChange(event, serial)
 
@@ -1374,6 +1369,47 @@ class YpsoService : DaggerService() {
                     "Unmapped pump event type ${event.eventType} at seq=${event.position}, skipped"
                 )
         }
+    }
+
+    /**
+     * Records a pump alert as an AAPS announcement, keyed on the **pump's own entry timestamp**.
+     *
+     * `PumpSync.insertAnnouncement` cannot be used here, and this is the one sync path where that
+     * matters (§8.5). It takes a `pumpId` and looks idempotent, but the record it builds is stamped
+     * `System.currentTimeMillis()` and the transaction underneath dedupes on
+     * `findByTimestamp(type, timestamp)` — the `pumpId` is stored and never consulted. So every
+     * alert in the read window would be re-inserted as a fresh announcement on every poll that
+     * reached it: ~150 an hour on this pump, mostly occlusions from 2019. Only the watermark stops
+     * that, and a correctness property that exists solely because an optimisation happens to be
+     * enabled is not a property at all — the other four sync paths key on something stable and so
+     * does this one now.
+     *
+     * `insertTherapyEventIfNewWithTimestamp` is the same insert-if-new transaction reached with a
+     * timestamp the caller chooses, so passing the pump's entry time makes the key
+     * `(ANNOUNCEMENT, pump entry time)` — stable across any number of re-reads of the same log
+     * window, and more truthful besides: an alert is imported when the log is next read, which can
+     * be hours after it fired, and `now()` recorded the read rather than the event.
+     *
+     * It also brings this path under the same `confirmActivePump(timestamp, …)` guard the other
+     * four already sit behind, which rejects anything older than the pump's registration. That is a
+     * second, independent barrier against the same spam — and `insertAnnouncement` was passing
+     * `now()` there too, so a 2019 occlusion sailed straight through it.
+     *
+     * ⚠ The key is the timestamp and not the sequence, so two alerts sharing one pump second would
+     * collapse to one record. That is accepted: the pump timestamps to the second, alerts are
+     * mostly user-acknowledged events, and losing an improbable duplicate announcement is a far
+     * smaller cost than re-inserting the whole window whenever the watermark is not there to
+     * prevent it.
+     */
+    private fun insertAlertAnnouncement(event: PumpHistoryEvent.Alert, serial: String) {
+        pumpSync.insertTherapyEventIfNewWithTimestamp(
+            timestamp = event.timestamp,
+            type = TE.Type.ANNOUNCEMENT,
+            note = event.message,
+            pumpId = event.position,
+            pumpType = PumpType.YPSOPUMP,
+            pumpSerial = serial
+        )
     }
 
     private fun insertTherapyEvent(type: TE.Type, event: PumpHistoryEvent, serial: String) {
