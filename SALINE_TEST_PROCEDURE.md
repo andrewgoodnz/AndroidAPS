@@ -5,33 +5,38 @@ which records what the pump has actually been observed to do.
 
 ## ⏳ Everything still to run — read this first
 
-As of 2026-08-03, **all four delivery phases have passed, Phase 5 is answered except two rows,
-Phase 6 has passed five of six steps, and Phases 7 and 7f have passed in full.** History sync is
-**on by default**, and a quiet poll costs ~580 ms rather than 20 s. What remains is observation, not
-capability — with one exception, and it is first in the list below.
+As of 2026-08-04, **every phase from 1 to 9 has run on hardware and passed.** The driver bonds,
+authenticates in plaintext, reads everything it needs, and writes the clock, a standard bolus, a
+temporary basal, the 24-slot basal profile and a chunked slow bolus. History sync is **on by
+default**, and a quiet poll costs ~580 ms rather than 20 s.
 
 ✅✅ **6b passed on 2026-08-03, and was re-confirmed the same day on HEAD after a flash** — seven
-renewal cycles across two builds, **zero uncovered time**, decided on the database. **Phase 6 is
-complete and no correctness gate remains open.**
+renewal cycles across two builds, **zero uncovered time**, decided on the database.
 
-**Phase 8 (extended bolus) ran 2026-08-03**: it works, needs ≥15 min, and lands in the wrong table.
-**Phase 9 (chunked bolus) is written and is the next thing to build** — it is the answer to slow
-delivery for comfort, and it needs no new pump capability.
+✅ **Phase 9 (chunked bolus) passed 2026-08-04.** "Bolus speed" turned out to be a loop in the phone
+rather than a pump setting; 9c failed first, found a permanent phantom IOB record, was fixed and
+re-run clean. Phase 8's extended bolus works but lands in the wrong table, and is superseded.
+
+⏳ **One thing is written and unrun, and it is the last one that could still change a record:
+Phase 10, the interrupted bolus.** It is items E and F below, and unlike everything above it, its
+subject is not a pump capability — it is what AAPS's own database holds after the phone is taken out
+of the loop mid-delivery. **The code predicts a specific failure there and Phase 10 says so in
+advance.** Everything else remaining is observation.
 
 **Still to run, most valuable first:**
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
 | A | ~~**6b — the renewal fix**~~ | ✅✅ **CLOSED 2026-08-03, verified twice.** 2h33m on the 08-02 build (4 cycles) and then re-confirmed on **HEAD 3.4.2.6** after a flash (3 cycles), with **zero uncovered time at every transition including across the reinstall**. Adjudicated on `temporaryBasals.duration`. The Hold→Renew boundary was seen on real polls (39 min left held, 20 min left renewed) | **6b**, §8.6 |
-| B | **Fix `insertAnnouncement`'s dedupe key** | It keys on `now()`, not `pumpId`, so it is the one sync path that is not idempotent. The watermark currently hides it. Worth fixing on its own terms rather than depending on the thing that hides it | §8.5 |
+| B | ~~**Fix `insertAnnouncement`'s dedupe key**~~ | ✅ **CLOSED 2026-08-04.** The alert path now calls `insertTherapyEventIfNewWithTimestamp(event.timestamp, ANNOUNCEMENT, …)`, so the key is `(type, the pump's entry time)` and re-reading a window is a genuine no-op. It also brings the path under `confirmActivePump(timestamp, …)`, which `now()` had been sailing past. Fixed inside `pump/ypso`, adding no shared-file surface | §8.5 |
 | C | ~~**Phase 5c — cartridge out and priming**~~ | ✅ **CLOSED 2026-08-03.** Cartridge out reads `byte0=3` with the reservoir `FF FF FF FF` (−1) — the first sighting of reservoir `-1`, handled correctly. The *priming* row is recorded as **unreachable by this method**: liveness cannot be proved because the reservoir reads −1 throughout, so a mid-prime reading is byte-identical to one taken after it | **Phase 5c**, §8.3 |
 | D | ~~**Phase 5e — reservoir empty mid-delivery**~~ | ✅ **CLOSED 2026-08-03.** Reads `byte0=3` with the reservoir a **known `0`** — not the `-1` of a cartridge change, so the pump does distinguish empty from absent. Alert count 147 → 148, `104 Cartridge Empty`, urgent. **Phase 5's table is complete** | **Phase 5e**, §8.3 |
-| E | **Reconnect mid-bolus** | Pull BLE range during a 2 U bolus. The pump finishes regardless; what is untested is whether AAPS's *record* settles. A provisional record goes in before sending and `ReconnectManager` chases the link back, armed for the bolus only | §4g |
-| F | **Kill AAPS mid-bolus** | Force-stop during delivery. The provisional record must survive and keep counting — this decides whether `PumpSyncStorage` is needed | §4g |
-| G | **Change the phone's timezone** | Untested: the driver should queue a clock sync and the pump's clock should follow | §8.6 |
-| H | **A bolus while a TBR runs** | Never tried together; both are identified by sequence | — |
-| I | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
-| J | **Restore a profile you care about** | A write you cannot reverse is not finished | Phase 4 |
+| E | **Reconnect mid-bolus** | 📝 **Written as Phase 10a/10c, 2026-08-04, not yet run.** Take the link away during a bolus. The pump finishes regardless; what is untested is whether AAPS's *record* settles. ⚠ The code says it does **not** — an unsettled provisional has no `pumpId`, so the history sync cannot find it and inserts a second row. Phase 10 states that prediction and then goes to look | **Phase 10**, §4g |
+| F | **Kill AAPS mid-bolus** | 📝 **Written as Phase 10b/10d, 2026-08-04, not yet run.** Force-stop during delivery. The provisional is a committed row so it should survive; what is untested is whether anything ever reconciles it. This decides whether `PumpSyncStorage` is needed, and Phase 10b records what each outcome would mean **before** the run | **Phase 10**, §4g |
+| G | **Change the phone's timezone** | ⏳ **UNTESTED, and going into therapy use untested.** The driver should queue a clock sync and the pump's clock should follow. `canHandleDST()` is false and `timezoneOrDSTChanged` queues the write, so the path exists and has never been exercised end to end. The failure mode if it is wrong is history timestamps an hour out, which §5 has already produced once | §8.6 |
+| H | **A bolus while a TBR runs** | ⏳ **UNTESTED.** Never tried together; both are identified by sequence, and both have been exercised alone. Low risk, real | — |
+| I | **A temp basal across an hour boundary** | ⏳ **UNTESTED.** The same percentage becomes a different absolute rate. Inherent behaviour rather than a defect, but worth seeing once | Phase 3 |
+| J | **Restore a profile you care about** | ⏳ **UNTESTED.** A write you cannot reverse is not finished. Matters at the moment of switching pumps, not during steady use | Phase 4 |
 | K | **Chunked bolus for comfort** | ✅ **DONE — Phase 9 passed on hardware 2026-08-04.** "Bolus speed" is a loop in the phone, not a pump setting: Lotus sends ordinary `type=2` boluses on a timer — **1 U/5 s = 12 U/min, 0.5 U/5 s = 6, 0.4 U/8 s = 3** — confirmed in the pump's log (five entries, 8 s apart, summing to 2.00 U). Needs no new pump capability. Built to six design decisions written down before the code; 9c failed first, found a permanent phantom IOB record, was fixed and re-run clean | **Phase 9**, §8.6 |
 | L | **The extended bolus** | ⚠ Works, 15-min minimum, lands in `boluses` as NORMAL and its log entry carries no duration (8a/8c passed/found 2026-08-03). Superseded as the comfort route by K, which hits 12 U/min where this floors at 0.67 | **Phase 8**, §8.6 |
 
@@ -2516,3 +2521,245 @@ the driver behaves for someone who has not chosen one. Nothing chunks unless it 
 condition of the five that no amount of watching a successful run would have exposed — the record
 left behind by a chunk that was never sent. Four steps passing on the first attempt is what a phase
 looks like when it is not asking hard enough; this one asked.
+
+---
+
+# Phase 10 — the interrupted bolus (items E and F)
+
+**Written 2026-08-04, unrun.** This is the last phase before insulin, and it is the only one whose
+subject is not a pump capability. Everything the pump does here is already known and is not in
+question: **the pump owns a bolus once it has been told, and finishes it whether or not the phone is
+still there** (§4g). What is untested is whether **AAPS's record of that bolus settles correctly**
+when the phone is taken out of the loop partway through.
+
+That matters more than it sounds. A driver that mis-records an interrupted bolus is not wrong
+occasionally — it is wrong every time the link drops or the phone is killed during a delivery, which
+on a phone carried around all day is not a rare event. And IOB that is wrong in the **stacking**
+direction is the hypo direction.
+
+## ⚠ The prediction, written before the run
+
+Phase 9c's lesson was that the expensive failures are the ones no successful run can expose, so this
+phase states what the code says will happen and then goes to look. **Read this before running, and
+then judge the run against the database rather than against this text.**
+
+`openPendingBolus` calls `PumpSync.addBolusWithTempId`, which is a **committed row in the `boluses`
+table** — not an in-memory pending list. It carries `temporaryId` set, `pumpId` **null**, and the
+amount *requested*. `settlePendingBolus` is what later promotes it: same row, amount corrected to
+what the pump gave, `pumpId` filled in with the pump's sequence.
+
+If `settlePendingBolus` never runs, nothing else in AAPS will do it. **The whole app contains no
+other consumer of `temporaryId` on a bolus** — a grep finds the interface, the DAO and this driver,
+and nothing that reconciles an orphan. And the history sync cannot: `SyncPumpBolusTransaction` looks
+the row up with `findByPumpIds(pumpId, …)`, the orphan has no `pumpId`, so the lookup misses and the
+sync **inserts a second row** for the same physical bolus.
+
+So the predicted failure, for both E and F, is one bolus and **two live rows**:
+
+| | `amount` | `temporaryId` | `pumpId` | Where it came from |
+|---|---|---|---|---|
+| the orphaned provisional | what was **requested** | set | **null** | `openPendingBolus`, never settled |
+| the history-sync import | what the pump **gave** | null | set | `syncHistoryToAaps` at the next status read |
+
+Both are `isValid=1` with `referenceId` null, so **both count towards IOB**. A 10 U bolus would read
+as ~20 U of insulin on board.
+
+This prediction is the reason the phase exists rather than a reason to skip it. It could be wrong in
+either direction: the reconnect may cover the window more often than the code suggests, the
+force-stop may not leave the row where it is expected, or the double row may turn out to be
+short-lived for a reason nobody has thought of. **Hardware decides. Nothing here is a pass until the
+database says so.**
+
+## Before starting
+
+- Saline, off-body, cannula to air. Full cartridge, and note the reservoir reading before each run.
+- Study phone (Lotus) **off** — it writes the basal profile unprompted on connect (§4i).
+- NSClient uploading off.
+- **Bolus speed set to `Unlimited — no splitting`**, which is the shipped default and the path the
+  main phone will run. 10d repeats one step chunked; the rest are deliberately about the single
+  command, because that is what an interrupted therapy bolus will be.
+- logcat running in a restart loop **before the pump is touched**, per the instrumentation notes:
+  `adb logcat -v time PUMP:V PUMPBTCOMM:V YpsoBleManager:V YpsoPumpManagerImpl:V "*:S"`
+
+### Why a 10 U bolus, and not 2 U
+
+The prompt for item E says a 2 U bolus. At the pump's own ~33.3 U/min a 2 U bolus is **3.6 seconds**
+of delivery, and `deliverOneBolus` goes to the log for its answer 3 s after that — so the whole
+window a tester has to interrupt is about **6.6 seconds**, most of it spent walking. Three attempts
+at the Phase 5c priming reading already missed a window of that size.
+
+**Use 10 U at unlimited speed: ~18 s of delivery and a ~21 s window.** That is long enough to be hit
+by hand, and nothing about the mechanism under test changes with the amount — a bigger number makes
+the *record* discrepancy easier to read, not the behaviour different. Saline, off-body, so 10 U costs
+a reservoir reading and nothing else.
+
+### Two ways to take the link away, and why the scripted one is primary
+
+- **`adb shell svc bluetooth disable`** on the phone. Instant, repeatable, and the tester chooses
+  exactly how long the outage lasts by when they re-enable it. It is also *harsher* than walking
+  away: with the adapter down, `ReconnectManager`'s attempts cannot succeed at all, so the outage
+  length is controlled rather than hoped for.
+- **Physical range loss** — carry the pump to the far end of the house, or shut it in a metal tin.
+  This is what actually happens in use, so it is worth seeing once (10c), but it cannot be timed to
+  a six-second window and RSSI decays rather than cutting.
+
+Run the scripted version first. It is the one that can be repeated identically after a fix.
+
+## 10a. The link dies mid-delivery and comes back — item E
+
+**The question:** the pump finishes the 10 U regardless. Does AAPS end up holding a record of 10 U,
+or of 20?
+
+1. Record the reservoir. Pull a **baseline database** (see *The query*, below).
+2. Bolus **10 U** from AAPS at unlimited speed.
+3. **6 seconds** after the dialog starts moving, `adb shell svc bluetooth disable`.
+4. Leave it off for **90 seconds** — comfortably past the ~21 s window and past
+   `ReconnectManager`'s first two attempts (5 s, then 10 s), so the confirmation cannot succeed.
+5. `adb shell svc bluetooth enable`. Wait for AAPS to reconnect.
+6. Tap **Refresh** on the YPSO tab (`adb shell input tap 140 523`) and let one status read complete,
+   so `syncHistoryToAaps` runs.
+7. Pull the database and run *The query*.
+
+**Confirm — and every one of these is a separate question:**
+
+- **Delivery.** The pump's event log holds **one** `type=2` entry of 10.00 U, and the reservoir has
+  fallen by ~10 U. This is the control on everything else: if the pump did not deliver 10 U the run
+  says nothing about records.
+- **What AAPS reported.** `success=false` is *correct* here and is not a failure of the step — the
+  driver could not confirm, and §0 forbids reporting more than the pump confirmed. A `success=true`
+  on an unconfirmed bolus **is** a failure.
+- **⚠ The row count.** How many live rows (`referenceId is null`) exist for this one bolus, and what
+  do they sum to? **One row summing to 10 U is a pass. Two rows summing to 20 U is the predicted
+  failure.**
+- **IOB.** Read the AAPS home screen. It is the number the loop will act on, and it is the reason
+  the row count matters.
+
+## 10b. AAPS is killed mid-delivery — item F
+
+**The question:** the provisional record is written before the pump is told. Does it survive the
+process dying, does it keep counting, and does anything ever reconcile it?
+
+This is the step that decides whether `PumpSyncStorage` is needed.
+
+1. Reservoir, baseline database.
+2. Bolus **10 U** at unlimited speed.
+3. **6 seconds** in: `adb shell am force-stop info.nightscout.androidaps`.
+4. Confirm the process is gone (`adb shell pidof info.nightscout.androidaps` returns nothing) and
+   that **the pump is still delivering** — the pump's own screen shows the bolus running. That
+   observation is the whole premise of §4g and is worth seeing once with your own eyes.
+5. Wait for the pump to finish. Restart AAPS.
+6. Let it reconnect; tap Refresh; let one status read complete.
+7. Pull the database and run *The query*.
+
+**Confirm:**
+
+- **The provisional survived the kill.** A row with `temporaryId` set and `pumpId` null, amount 10.0.
+  If it is *absent*, that is a different and worse finding than the predicted one — it would mean the
+  window §4g exists to cover is not covered at all, and the insulin is invisible to IOB.
+- **It is still counting.** `isValid=1`, `referenceId` null, and it appears in AAPS's treatments.
+- **⚠ What the sync then did.** One row or two, and the sum.
+- **IOB on the home screen** after the status read.
+
+**What the outcomes mean, decided in advance:**
+
+| Outcome | What it says about `PumpSyncStorage` |
+|---|---|
+| One row, 10 U | Not needed. The committed row and the sync already converge. Record that and move on |
+| Two rows, 20 U | Something must reconcile the orphan. `PumpSyncStorage` is *one* answer — it persists pending entries and settles them after a restart. A narrower one is for the driver to look for an unsettled provisional at the next connection and settle it from the pump's log, or invalidate it. **Decide deliberately; do not reach for the framework because it is there** |
+| No provisional row at all | Neither — this is a different defect, in `addBolusWithTempId`'s durability, and it has to be understood before anything is built on top of it |
+
+## 10c. Real range loss, once
+
+Repeat **10a** with the phone's Bluetooth left alone and the *pump* carried out of range — far end of
+the house, or a closed metal tin — 6 s into a 10 U bolus, returned after 90 s.
+
+**Why it is separate:** `svc bluetooth disable` tears the adapter down; range loss is a link timing
+out with the adapter still up, and the two reach `ReconnectManager` differently. This is the one that
+happens in life. If 10a passed and this does not, the difference is the finding.
+
+## 10d. The same interruption on a chunked sequence
+
+Only if 10a and 10b are settled first.
+
+Bolus **6 U at 3 U/min** (~15 chunks over ~2 minutes) and force-stop AAPS 40 s in.
+
+**Why it is worth a step of its own:** a sequence opens **one provisional per chunk**, so whatever
+10b finds is multiplied — and the chunk in flight when the process died is the only one that can be
+orphaned, while every earlier chunk should already be settled. **Confirm the orphan count is one, not
+N.** If earlier chunks are also unsettled, the per-chunk settle is not working and 9d's pass was
+measured on an uninterrupted run.
+
+## 10e. The control — and it is not optional
+
+Run an **ordinary, uninterrupted 2 U bolus**, and run the same query.
+
+**Confirm exactly one live row of 2.0 U, carrying both a `temporaryId` and a `pumpId`** — that is
+what a settled provisional looks like, and it is what none of the interrupted runs should produce.
+
+This step exists because four checks in `PORTING_NOTES` turned out to be incapable of failing, every
+one of them read as a pass, and the pattern was never the logic — it was that nobody looked at what
+the *inputs* were. A query that cannot tell one row from two would report a pass for 10a and 10b no
+matter what happened. **Run the control on the same build, in the same session, with the same
+command.**
+
+## The query
+
+The database is the arbiter and the log cannot be. Pull all three files — `exec-out`, never `shell`,
+or the binary is CRLF-mangled on Windows:
+
+```bash
+for f in androidaps.db androidaps.db-wal androidaps.db-shm; do
+  adb exec-out "run-as info.nightscout.androidaps cat databases/$f" > "$f"
+done
+```
+
+```sql
+select id,
+       datetime(timestamp/1000,'unixepoch','localtime') as ts,
+       amount, type, pumpId, temporaryId, isValid, referenceId
+from boluses
+order by timestamp desc
+limit 20;
+```
+
+**Read it as:** live rows are `referenceId is null` **and** `isValid = 1`. A settled bolus has both
+`temporaryId` and `pumpId`. An orphaned provisional has `temporaryId` and **no** `pumpId`. A
+sync-only import has `pumpId` and **no** `temporaryId`.
+
+The sum of the live rows in the window is the number to compare against the reservoir. Take the
+reservoir reading before and after every run — it is the only measurement in this phase that does
+not come from the software under test, and it is what adjudicated all five steps of Phase 9.
+
+## What cannot be tested here
+
+- **A phone that never comes back.** Every step assumes the tester restores the link or restarts the
+  app. A phone that is lost, flat or broken leaves the provisional standing for ever, at the
+  requested amount, counting towards IOB — which is §4g's intended failure mode and is the safe
+  direction. There is nothing to run; it is a property of the design and is recorded rather than
+  measured.
+- **Whether the reconnect *usually* succeeds.** These steps deliberately force outages long enough
+  that it cannot. How often a real drop is short enough to be ridden out is a field question, not a
+  bench one.
+- **A crash rather than a force-stop.** `am force-stop` is a clean process kill. A native crash or an
+  OOM kill could in principle leave the database mid-write; Room's WAL is designed for exactly that
+  and this phase does not test it.
+
+## Phase 10 is passed when
+
+10a and 10b each end with **AAPS's live rows summing to what the reservoir says went in** — not
+merely with a record existing — and 10e proves the query can tell one row from two on the same
+build. 10c agrees with 10a. 10d shows one orphan and not N.
+
+**If the predicted double row appears, that is the phase working.** Record it here in full, fix it
+deliberately, and re-run — which is what 9c did, and 9c is the reason the other four Phase 9 results
+are worth believing.
+
+## Results
+
+| Step | Bolus | Interruption | Result |
+|---|---|---|---|
+| 10a link dies and returns | 10 U | `svc bluetooth disable`, 90 s | ⏳ **NOT RUN** |
+| 10b AAPS killed | 10 U | `am force-stop` | ⏳ **NOT RUN** |
+| 10c real range loss | 10 U | pump carried away, 90 s | ⏳ **NOT RUN** |
+| 10d chunked sequence killed | 6 U @ 3 U/min | `am force-stop` at 40 s | ⏳ **NOT RUN** |
+| 10e control, uninterrupted | 2 U | none | ⏳ **NOT RUN** |
