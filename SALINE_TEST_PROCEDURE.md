@@ -1977,7 +1977,7 @@ reminder that this is a deliberate act rather than a tidy-up.
 
 ---
 
-# Phase 9 — the chunked bolus, for comfort ⏳ **NOT STARTED**
+# Phase 9 — the chunked bolus, for comfort ⏳ **BUILT 2026-08-03, AWAITING HARDWARE**
 
 **Written 2026-08-03, before any code.** The mechanism is not a guess: it was read off mylife Lotus's
 own settings screen and then confirmed in the pump's event log, so this phase starts from a worked
@@ -2058,6 +2058,42 @@ Each of these changes what the tests must check. Decide them, write them down, t
 - ⚠ **Phase 8's extended bolus stays refused and unadvertised throughout.** Two delivery changes at
   once is exactly what §0 forbids.
 
+### The build under test — what it does and how to see it
+
+Built 2026-08-03 to the six decisions recorded in `PORTING_NOTES` §8.6, which were settled before any
+code was written. The design decisions are **not** open questions for these steps; what is open is
+whether the pump and the phone behave the way the design assumes.
+
+**⚠ Out of the box this build delivers exactly as Phases 1–8 did.** `YpsoBolusSpeed` now defaults to
+**Pump's own speed (33 U/min)**, which does not chunk at all. Each step below has to set the speed
+by hand first: **Preferences → YpsoPump → Bolus speed**. The list offers *33 U/min / 12 U/min /
+3 U/min*; **6 U/min is deliberately absent** until 9a–9e pass, and its absence is not a defect.
+
+**Nothing chunks below one chunk.** At 12 U/min a bolus of 1.0 U or less is a single command, and at
+3 U/min anything at or below 0.4 U is. So a test bolus must be *bigger than one chunk* or there is no
+sequence to observe.
+
+**Reading the result.** Every sequence writes lines prefixed `CHUNKED:` — one when the plan is made,
+one per chunk, one summary:
+
+```
+adb logcat -v time PUMP:V PUMPBTCOMM:V YpsoPumpManagerImpl:V '*:S' | grep CHUNKED
+```
+
+The summary line carries the three things 9a is decided on — **how many chunks were confirmed, the
+phone-side start offsets, and the gaps between the pump's own entry timestamps** — because the total
+alone cannot tell a working sequence from no sequence. Prefer the *pump entry* gaps: the phone offsets
+say when a command left, not when insulin went in.
+
+**⚠ Expect the spacing to be at or a little over the nominal, never under.** The interval is a
+minimum gap between chunk starts; if a chunk's confirmation overruns its slot the next goes out late.
+5.6 s where 5.0 was asked for is a pass. Under 5.0 would not be.
+
+**One known consequence to watch for rather than be surprised by:** the connection lock is held for
+the whole sequence, so nothing else — status read, TBR, alert check — can reach the pump while it
+runs. That is deliberate (it is what stops a command interleaving between chunks) and it is what 9a's
+step 2 is looking at. It is capped at five minutes.
+
 ## 9a. Two chunks — the smallest thing that is a sequence
 
 **The question:** does a sequence work at all, and does the command queue survive it?
@@ -2125,6 +2161,20 @@ reported is what the log shows; and the alarm still reaches AAPS as an urgent no
 **Whether the chunk parameters are right for comfort.** 1 U per 5 s is Lotus's number, not a measured
 optimum, and comfort is not something a saline bench can assess. Take the manufacturer's figures and
 do not invent others.
+
+## Results
+
+| Step | Speed to set | Bolus | Result |
+|---|---|---|---|
+| 9a two chunks | 12 U/min | 2 U | ⏳ not yet run |
+| 9b cancel mid-sequence | 3 U/min | 6 U | ⏳ not yet run |
+| 9c connection lost | 3 U/min | 6 U | ⏳ not yet run |
+| 9d the record and IOB | — | — | ⏳ not yet run |
+| 9e a refused chunk | 3 U/min | 6 U | ⏳ not yet run |
+
+⚠ **Do not change the logic mid-run to make a step pass.** Record the failure, stop, and fix it
+deliberately — that is the rule the earlier phases were run under and it is what makes their results
+worth anything.
 
 ## Phase 9 is passed when
 
