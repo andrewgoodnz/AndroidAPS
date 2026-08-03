@@ -2578,6 +2578,148 @@ preference should simply go.
 **Not changed during the hardware session** that found it — §8.6's rule. The fix when it happens is to
 relabel it as the timeout estimate it is, or delete it and hard-code a generous timeout.
 
+#### The six Phase 9 design decisions, settled before a line of code — 2026-08-03
+
+Phase 9's table asks six questions and says that each one changes what the tests must check. They are
+answered here **first**, with the reasoning, so that 9a–9e are written against a decided design rather
+than against whatever the code turned out to do. Nothing below is a hardware result; it is the shape
+the hardware is about to be asked to falsify.
+
+**1. The loop lives below the mutex, in `YpsoPumpManagerImpl`.**
+
+`withConnection` is taken **once**, for the whole sequence. The alternative — a loop in `YpsoService`
+calling `deliverBolusConfirmed` N times — releases the connection lock between chunks, and everything
+that is wrong with that is a safety property rather than a performance one: AAPS's command queue could
+land a status read, a temporary basal or a second bolus **between two chunks of the first one**. A
+20-second history sync arriving between chunk 3 and chunk 4 would also stretch the interval to
+whatever that read happened to cost. Holding the lock makes the sequence atomic against the rest of
+the driver, which is the only version of this that can be reasoned about.
+
+⚠ `pumpMutex` is a plain `Mutex` and is **not reentrant**, so the chunked path cannot call
+`deliverBolusConfirmed`; the body of that method is extracted into a `deliverOneBolus` that assumes
+the lock is already held, and both public entry points wrap it.
+
+That extraction moves one line that matters more than it looks: **`cancelRequested = false` moves out
+of the per-bolus body and up into the entry points**, so it is reset once per *sequence*. Left where
+it is, chunk k+1 would wipe the cancel that arrived during chunk k, and the sequence would carry on
+delivering after the user pressed stop — which is 9b's failure, built in.
+
+**2. Every chunk is confirmed from the pump's log. The echo is not evidence.**
+
+The table offered *"per-chunk echo (`fastTotal`) then one log read at the end"*. The second half is
+kept and the first half is **rejected as confirmation**: `fastTotal` is the pump restating the total
+it was told a moment ago. That is the type-19 shape exactly (§4f) — a number that agrees with the
+request because it *is* the request — and §8.8 is the standing rule that such a value is the weakest
+evidence there is. It keeps the job it already does well, catching a misparsed payload *layout*, and
+it never decides how much went in.
+
+What makes per-chunk log confirmation affordable is §5's index 0: the newest entry is the first one
+read, and the chunk that just finished should be it. A **3-entry** read costs ~600 ms against a
+5-second interval, where the standard 5-entry window costs ~1 s. Three rather than one because a
+single interloping entry would otherwise hide the chunk entirely and turn a delivered chunk into "not
+confirmed"; three covers two interlopers, and `findBolusRecord`'s existing retry covers the rest.
+
+The end-of-sequence read is then not a second confirmation but a **reconciliation**: the chunk
+sequences are already known, and what the summary reports is their sum.
+
+**3. N records. This is not a preference — one synthetic record would be corrupted by the sync.**
+
+Phase 9 framed this as accuracy versus tidiness. It is neither: `syncBolusWithPumpId` **upserts on
+`pumpId`** (§8.5). A single 10 U record filed under chunk 1's sequence would be rewritten to chunk 1's
+1 U by the first history sync that reached it, and the other nine chunks inserted alongside. One
+record is not a simplification, it is a defect with a delay on it.
+
+**The provisional record is opened per chunk, immediately before that chunk is sent** — not once for
+the full amount. §4g opens a provisional at the full requested amount because *the pump owns the bolus
+once it has been told*; in a chunked sequence the pump has only been told about one chunk, and insulin
+in chunks that were never commanded will never be delivered by anything. Recording 10 U when the phone
+died after 2 U is not conservatism in §0's sense — §0 is about outcomes that are *unknown*, and this
+one is known. A per-chunk provisional covers exactly the window §4g exists for, which is the chunk in
+flight, and leaves the un-sent chunks unrecorded because they are un-sent.
+
+That needs the chunk results to reach `YpsoService` **as they happen** rather than as a list at the
+end, so the manager takes two callbacks — one before a chunk goes out, one when it has settled. The
+`PumpSync` calls stay in the app module where they already live.
+
+**4. `success = false` at chunk 7 of 10, `bolusDelivered` = the sum of the confirmed chunks. Any
+chunk that does not confirm ends the sequence.**
+
+§0's rule is one-directional: never report more than the pump confirmed. Seven chunks confirmed is
+seven chunks reported, and `complete` is true only when every chunk confirmed *and* the total matches
+the request. Stopping on the first unconfirmed chunk is 9e's requirement — a pump that has alarmed and
+stopped delivering should not be sent ten more boluses — and it also settles 9c, because a chunk
+failing on a dead link is the same case. **A failed chunk never resumes**, even if `ReconnectManager`
+gets the link back mid-sequence: insulin resuming after an unpredictable gap is not the comfort
+feature the user asked for, and it makes the outcome depend on reconnect timing.
+
+For the same reason a BLE exception inside the loop is caught per chunk rather than being allowed to
+propagate. `awaitResult` turns a thrown exception into the fallback result, which reports
+`deliveredUnits = 0.0` — for a sequence that already put six chunks in, that is under-reporting, and
+9c calls under-reporting the failure and honest under-*delivery* the pass.
+
+**5. `YpsoBolusSpeed` survives, stops lying — and its default flips to *unchunked*.**
+
+It becomes real for the first time, and four things change with it:
+
+- **It is no longer "the pump's own speed index".** It is a phone-side chunk size and interval, which
+  is what it always was in Lotus and never was here.
+- **Its stored values become self-describing** — `unlimited`, `12`, `6`, `3` — rather than the
+  indices `0/1/2`. Adding a fourth option to an index list silently remaps every value already
+  stored, and this particular list is missing its option in the *middle* of the range. An
+  unrecognised value falls back to `unlimited`, which is the proven path.
+- ⚠ **The default becomes `unlimited`.** Today's default is `1`, which under the new meaning would
+  chunk **every bolus** on a delivery path nobody has run. Phase 7's precedent is explicit
+  (§8.5): flipping a default is a statement that the shipped build is ready, and it is held until the
+  phase passes. Every phase from 1 to 8 was run against unchunked delivery and stays that way.
+- **The fourth option, 6 U/min, lands with the relabel after 9a–9e pass**, per Phase 9's own
+  "then, and not before". 9a needs 12 and 9b needs 3, both of which the existing three-way list
+  already offers, so nothing is blocked by holding it.
+
+And the preference stops feeding the timeout. `expectedDeliveryMs` uses a constant **~33.3 U/min**,
+the rate actually measured on this pump — which is not a tidy-up but a prerequisite: with the old
+arithmetic a 1 U chunk at a configured 12 U/min is "expected" to take 5 s, and the wait before reading
+the log would exceed the 5-second interval it is supposed to fit inside. The measured native rate is
+what makes 12 U/min reachable at all.
+
+**6. A five-minute ceiling on the sequence, enforced by stepping up to the next manufacturer rate.**
+
+The held command queue is the cost: for the length of the sequence there is no status read, no
+temporary basal, no SMB and **no alert check** — and an occlusion during a slow bolus is exactly when
+the alert check earns its keep (§4g). Five minutes is one AAPS loop cycle, and the standard bolus
+already holds the queue for ~20 s, so this is a factor of fifteen and not a factor of a thousand.
+
+At 25 U (`maxBolusAmount`) the nominal spans are 125 s at 12 U/min, 250 s at 6, and **504 s at 3** —
+so the ceiling binds only at 3 U/min above ~14.8 U. When it binds, the rate **steps up to the next
+faster option Lotus publishes** rather than falling back to the pump's native ~33 U/min. Refusing the
+bolus is the wrong failure (the user asked for insulin, and a comfort setting should not withhold it);
+falling straight to unchunked would hand someone who configured 3 U/min a 20 U bolus in 36 seconds
+without warning. Stepping up keeps every parameter a manufacturer figure — Phase 9's own instruction
+not to invent others — and at the current 25 U maximum it never has to reach `unlimited`. Whatever it
+does is logged and goes into the result comment.
+
+**⚠ And one property that falls out of all six: the configured rate is an upper bound, never a
+floor.** The interval is a minimum gap between chunk *starts*; if a chunk's confirmation overruns it,
+the next chunk goes out late and the sequence runs slower than configured. Slower is the safe
+direction for a comfort feature, and the driver will never deliver *faster* than configured. It is
+recorded here because a test that reads 5.6-second spacing where 5.0 was asked for is a pass, and
+somebody will otherwise file it as a defect.
+
+#### What this makes 9a adjudicable on
+
+9a's trap is that an unchunked 2 U bolus also ends 2.00 U down with `success=true`, so **only the
+entry count and the spacing distinguish a working sequence from no sequence at all**. Both are made
+directly readable rather than inferable, on one greppable line per sequence:
+
+```
+CHUNKED: asked 2.0U at 12 U/min -> 2 chunks of [1.00, 1.00] U every 5.0s
+CHUNKED: chunk 1/2 1.00U sent +0.0s, seq=160901 v1=100 -> 1.00U (pump 15:02:11)
+CHUNKED: chunk 2/2 1.00U sent +5.1s, seq=160902 v1=100 -> 1.00U (pump 15:02:16)
+CHUNKED: 2/2 confirmed, 2.00U of 2.0U, starts [0.0, 5.1]s, pump entries 5s apart, seqs 160901..160902
+```
+
+Phone-side spacing and the pump's own entry timestamps are both printed, because they are different
+measurements and the pump's is the one that matters — the phone's says when the command left.
+
 ### ✅ [verified] The extended bolus works, needs ≥15 min, and lands in the wrong table — 2026-08-03
 
 Phase 8a, run on saline behind the YPSO tab's bench probe. **The pump does extended boluses.**
