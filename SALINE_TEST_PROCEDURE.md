@@ -2167,10 +2167,21 @@ do not invent others.
 | Step | Speed to set | Bolus | Result |
 |---|---|---|---|
 | 9a two chunks | 12 U/min | 2 U | ✅ **PASSED 2026-08-03** |
-| 9b cancel mid-sequence | 3 U/min | 6 U | ⏳ not yet run |
-| 9c connection lost | 3 U/min | 6 U | ⏳ not yet run |
+| 9b cancel mid-sequence | 3 U/min | 6 U | ✅ **PASSED 2026-08-03** |
+| 9c connection lost | 3 U/min | 2 U | ⚠ **PARTIAL** — delivery correct, **recording defective** |
 | 9d the record and IOB | — | — | ✅ **PASSED 2026-08-03** |
-| 9e a refused chunk | 3 U/min | 6 U | ⏳ not yet run |
+| 9e a refused chunk | 3 U/min | 4 U | ✅ **PASSED 2026-08-03** |
+
+⚠ **Phase 9 is therefore NOT passed**, and `YpsoBolusSpeed`'s fourth option stays out. 9c found a real
+defect — see below. The gate says *all* of 9a–9e.
+
+**Every run was checked against the reservoir, not against the driver's own account of itself:**
+
+| Run | Driver reported | Reservoir | Basal in window | Agrees |
+|---|---|---|---|---|
+| 9b 19:14:41 | 2.00 U | 102.76 → 100.75 = 2.01 | ~0.004 | ✓ |
+| 9c 19:16:20 | 0.40 U | 100.75 → 100.34 = 0.41 | ~0.014 | ✓ |
+| 9e 19:19:08 | 3.16 U | 100.34 → 97.17 = 3.17 | ~0.011 | ✓ |
 
 Run on build **3.4.2.6**, installed 17:06:32. (The labels on the speed dropdown were corrected
 afterwards; the delivery code is byte-identical, so these results stand for HEAD.)
@@ -2283,6 +2294,129 @@ probe**, which is §8.5's own pricing.
 ⚠ **Do not change the logic mid-run to make a step pass.** Record the failure, stop, and fix it
 deliberately — that is the rule the earlier phases were run under and it is what makes their results
 worth anything.
+
+### ✅ 9b PASSED — the cancel stopped the sequence, not just the chunk
+
+6 U at 3 U/min, 15 chunks planned, cancelled from AAPS at ~32 s.
+
+```
+CHUNKED: chunk 5/15 0.4U sent +32.002s, seq=160916 -> 0.4U, pump entry +8s — Bolus stopped after 0.4 U of 0.4 U
+CHUNKED: 5/15 confirmed, 2.0U of 6.0U, phone starts [0.0, 8.002, 16.001, 24.001, 32.002]s,
+         pump entries [8, 8, 8, 8]s apart, seqs [160912 … 160916] — stopped by the user before chunk 6 of 15
+deliverBolus: asked 6.0U, pump delivered 2.0U, success=false
+```
+
+**No sixth chunk.** The pump's own log confirms it independently of the driver's account: the next
+event entry is `160917`, which is the *following test's* first chunk more than a minute later — the
+gap check at 19:19:07 reports `events newest=160917`, so nothing was written between the cancel and
+then. And the reservoir moved 2.01 U for five chunks of 0.4 U.
+
+**The cancel landed mid-chunk and that chunk still completed** — `Bolus stopped after 0.4 U of 0.4 U`
+is chunk 5 delivering in full while the stop flag was already set. That is correct and worth being
+explicit about: **a cancel cannot recall a chunk the pump is already delivering**, because the pump
+owns it. What it stops is the *sequence*, which is exactly the distinction 9b was written to test.
+The chunk therefore counts as confirmed (5/15, 2.0 U) while the sequence reports `success=false`.
+
+### ✅ 9e PASSED — an occlusion stopped the sequence, and AAPS was told
+
+4 U at 3 U/min, occlusion forced during chunk 8 of 10.
+
+```
+CHUNKED: chunk 7/10 0.4U sent +48.001s, seq=160925 -> 0.4U, pump entry +8s
+CHUNKED: chunk 8/10 0.4U sent +56.0s, seq=160926 -> 0.36U — Pump delivered only 0.36 U of the 0.4 U requested
+CHUNKED: 7/10 confirmed, 3.16U of 4.0U, … seqs [160919 … 160926]
+PUMP ALERT: Alert: Occlusion (type 105, seq 160962)
+Pump alert 105 (Alert: Occlusion), urgent=true
+```
+
+All three of 9e's conditions:
+
+- **The sequence stopped rather than hammering a stopped pump.** Two chunks unsent.
+- **The amount reported is what the log shows** — 3.16 U = seven whole chunks plus the 0.36 U partial.
+  The reservoir says 3.17 U including basal. The partial chunk's insulin is *counted in the total*
+  while *not counted as a confirmed chunk*, which is the §0 split working: report only what the pump
+  confirmed, record everything that went in.
+- **The alarm reached AAPS as urgent**, `urgent=true`, 20 s after the sequence gave up.
+
+**And Phase 6's machinery interoperated with it unprompted**: the pump went to `mode=STOPPED
+rate=0.0U/h` and the driver opened the 0% suspend record (`suspendRecord=open … 59min left of 60`)
+without anyone asking. A failed chunked bolus leaving a stopped pump does not leave AAPS counting
+basal that is not being delivered.
+
+**This is also the first run where confirmation overran its slot.** Chunk 8 was *sent* on time at
++56.0 s but took 13.4 s to confirm, because `findBolusRecord` retried against an entry the pump was
+still revising. The sequence absorbed it and reported honestly. The "upper bound, never a floor"
+property is therefore no longer untested — it took a failure to exercise it.
+
+### ⚠ 9c PARTIAL — delivery is right; the record keeps a phantom that can never be reconciled
+
+2 U at 3 U/min, pump taken out of range after chunk 1.
+
+```
+CHUNKED: chunk 1/5 0.4U sent +0.0s, seq=160917 -> 0.4U
+GLB write to 669a0c20-0008-969e-e211-fcbecc3b7bc5 failed (GATT status=133)
+Bolus refused: The pump's event log could not be read, so a bolus could not be confirmed — nothing was sent
+CHUNKED: 1/5 confirmed, 0.4U of 2.0U … seqs [160917]
+deliverBolus: asked 2.0U, pump delivered 0.4U, success=false
+BLE disconnected (reason=10)  → reconnect attempts → Failed to connect: reason=-1
+```
+
+**Two of 9c's three conditions passed.** Delivery stopped — the reservoir moved **0.41 U**, which is
+chunk 1 and basal, so chunk 2 genuinely never went in. The pump's log contains only `160917`.
+
+**The third failed.** *"AAPS's record equals that sum and no more."* It does not:
+
+```
+19:16:20   0.4   pumpId=160917     ← real
+19:16:28   0.4   pumpId=(null)     ← phantom: the provisional for a chunk that was never sent
+```
+
+**0.8 U recorded for 0.4 U delivered.** The *report* was honest (`pump delivered 0.4U,
+success=false`), so §0's reporting rule held. The IOB record did not.
+
+#### ⚠⚠ Why this is a defect and not §4g working as intended
+
+§4g says an unconfirmed bolus is left recorded in full because *"deleting it would assert that
+nothing was delivered, which is the one thing not known."* **Here it is known.** The failure was in
+`newestEventSequence()` — the baseline read, which happens *before* `suspendStartBolus`. The driver's
+own message says so: **"nothing was sent"**. No bolus command was ever written for chunk 2.
+
+So this is a case §4g's rule does not actually cover — it was written for *unknown* outcomes, and
+this branch has a **known** one. Three things make it worth fixing rather than tolerating:
+
+- **It is permanent.** No pump entry will ever exist for that chunk, so no history sync can ever
+  reconcile it. Unlike the transient window §4g describes, this row stays in the database for ever.
+- **Chunking multiplies the opportunities.** Every chunk boundary re-runs the baseline read, so a
+  fifteen-chunk bolus has fifteen chances to hit it where a single bolus has one.
+- **It is silent.** IOB is simply wrong by up to one chunk, and nothing announces it.
+
+⚠ **It fails in the safe direction** — over-stated IOB makes AAPS dose *less* — and the magnitude is
+capped at one chunk (0.4 U at 3 U/min, 1.0 U at 12). Nothing was mis-dosed. But "safe direction" is
+why it was not noticed, not a reason to keep it.
+
+⚠ **The same defect exists on the unchunked path**, where it is *rarer but larger*: a baseline-read
+failure there leaves a provisional at the **full** bolus amount. Chunking made each occurrence
+smaller and more frequent, and that is what made it visible.
+
+**Not fixed during the run** — §8.6's rule. 9c must be re-run after the fix.
+
+### ⚠ Unexplained: sequence numbers that appear in neither log
+
+Recorded as an observation, not an explanation, because guessing at this pump's numbering is what
+made upstream's delivery-mode table wrong.
+
+**`160918` appears nowhere** — not imported, not skipped, not in any window dump, in the whole
+capture. It sits between chunk 1 of the 9c run (`160917`) and chunk 1 of the 9e run (`160919`).
+Likewise the watermark jumped **`160917` → `160962`** while the event log's newest was `160926`, so
+**`160927`–`160961` were allocated and never seen either**. The gap check reported `0 missed` both
+times, because it compares the oldest entry in a window against the watermark and cannot see holes
+*inside* the range it skips over.
+
+**None of it is insulin** — the reservoir accounts for every unit across all three runs to within
+0.01 U, so whatever these are, they did not deliver. The consequence is narrower: the watermark has
+advanced past them, so if they ever do appear in a window read they will be skipped as "at or below
+watermark". §8.8's third, never-read history log (`YpsoPumpUuids.System`) is the obvious suspect and
+**has not been checked**, which is why this is written down rather than concluded.
 
 ## Phase 9 is passed when
 
