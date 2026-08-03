@@ -50,6 +50,7 @@ import app.aaps.pump.ypso.ui.YpsoExtendedBolusProbeCommand
 import app.aaps.pump.ypso.ui.YpsoLoadHistoryCommand
 import app.aaps.pump.ypso.ui.YpsoOverviewFragment
 import app.aaps.pump.ypso.ui.YpsoSyncTimeCommand
+import com.ypsopump.sdk.BolusSpeed
 import io.reactivex.rxjava3.disposables.CompositeDisposable
 import io.reactivex.rxjava3.kotlin.plusAssign
 import javax.inject.Inject
@@ -584,13 +585,22 @@ class YpsoPlugin @Inject constructor(
                 }
             )
             addPreference(
+                // ⚠ 6 U/min is missing on purpose. Phase 9 says the fourth option appears only once
+                // 9a–9e have passed; 9a needs 12 and 9b needs 3, so nothing is blocked by holding
+                // it. BolusSpeed knows the parameters either way — the duration ceiling steps
+                // through 6 U/min whether or not it is offered here.
                 AdaptiveListPreference(
                     ctx = context,
                     stringKey = YpsoStringKey.YpsoBolusSpeed,
                     title = R.string.ypso_bolus_speed_title,
+                    summary = R.string.ypso_bolus_speed_summary,
                     dialogTitle = R.string.ypso_bolus_speed_title,
-                    entries = arrayOf("3 U/min", "12 U/min", "33.3 U/min"),
-                    entryValues = arrayOf("0", "1", "2")
+                    entries = arrayOf("Pump's own speed (33 U/min)", "12 U/min", "3 U/min"),
+                    entryValues = arrayOf(
+                        BolusSpeed.Unlimited.storedValue,
+                        BolusSpeed.Twelve.storedValue,
+                        BolusSpeed.Three.storedValue
+                    )
                 )
             )
             addPreference(

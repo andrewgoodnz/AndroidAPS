@@ -41,6 +41,8 @@ import com.pump.common.OperatingMode
 import com.pump.common.PumpConnectionState
 import com.pump.common.PumpHistoryEvent
 import com.pump.common.PumpStatus
+import com.ypsopump.sdk.BolusChunkPlan
+import com.ypsopump.sdk.BolusSpeed
 import com.ypsopump.sdk.HistorySyncDecision
 import com.ypsopump.sdk.YpsoEventTypes
 import com.ypsopump.sdk.YpsoPumpManagerImpl
@@ -921,13 +923,9 @@ class YpsoService : DaggerService() {
         )
 
         return awaitResult("deliverBolus", failed) {
-            pumpManager.bolusSpeedUnitsPerMinute = configuredBolusSpeedUnitsPerMinute()
+            val plan = BolusChunkPlan.plan(insulin, BolusSpeed.from(preferences.get(YpsoStringKey.YpsoBolusSpeed)))
 
-            // ⚠ Recorded BEFORE the pump is told, at the amount requested. See [openPendingBolus].
-            val temporaryId = dateUtil.now()
-            openPendingBolus(detailedBolusInfo, insulin, temporaryId)
-
-            val result = pumpManager.deliverBolusConfirmed(insulin)
+            val result = if (plan.isChunked) deliverChunked(detailedBolusInfo, plan) else deliverWhole(detailedBolusInfo, insulin)
             aapsLogger.info(
                 LTag.PUMP,
                 "deliverBolus: asked ${insulin}U, pump delivered ${result.deliveredUnits}U, " +
@@ -938,11 +936,55 @@ class YpsoService : DaggerService() {
                 ypsoPump.lastBolusAmount = result.deliveredUnits
                 ypsoPump.lastBolusTime = dateUtil.now()
             }
-            settlePendingBolus(detailedBolusInfo, result, temporaryId)
 
             rxBus.send(EventYpsoPumpDataChanged())
             result
         }
+    }
+
+    /** One command to the pump — the path every hardware phase from 1 to 8 ran. */
+    private suspend fun deliverWhole(detailedBolusInfo: DetailedBolusInfo, insulin: Double): YpsoPumpManagerImpl.ConfirmedBolus {
+        // ⚠ Recorded BEFORE the pump is told, at the amount requested. See [openPendingBolus].
+        val temporaryId = dateUtil.now()
+        openPendingBolus(detailedBolusInfo, insulin, temporaryId)
+        val result = pumpManager.deliverBolusConfirmed(insulin)
+        settlePendingBolus(detailedBolusInfo, result, temporaryId)
+        return result
+    }
+
+    /**
+     * A run of ordinary standard boluses on a timer, for comfort on a large dose (§8.6).
+     *
+     * **The provisional record is opened per chunk rather than once for the whole amount**, and the
+     * distinction is the whole reason this is not simply [deliverWhole] in a loop. [openPendingBolus]
+     * exists because *the pump owns the bolus once it has been told*; here the pump has been told
+     * about one chunk. Insulin in chunks that were never commanded will never be delivered by
+     * anything, so recording 10 U when the phone died after 2 U would not be §0's "err high on an
+     * unknown outcome" — that outcome is known. One provisional per chunk covers exactly the window
+     * §4g exists for, which is the chunk in flight.
+     *
+     * Each provisional is then settled to that chunk's own pump sequence, giving N records: the same
+     * N the history sync produces from the same N log entries, resolving to one set rather than two
+     * (§8.5). A single synthetic record filed under one chunk's sequence would be rewritten down to
+     * that chunk's amount by the first sync to reach it.
+     */
+    private suspend fun deliverChunked(
+        detailedBolusInfo: DetailedBolusInfo,
+        plan: BolusChunkPlan
+    ): YpsoPumpManagerImpl.ConfirmedBolus {
+        var pendingTemporaryId: Long? = null
+        return pumpManager.deliverChunkedBolusConfirmed(
+            plan = plan,
+            onChunkStarting = { chunkUnits ->
+                val temporaryId = dateUtil.now()
+                pendingTemporaryId = temporaryId
+                openPendingBolus(detailedBolusInfo, chunkUnits, temporaryId)
+            },
+            onChunkSettled = { chunkResult ->
+                pendingTemporaryId?.let { settlePendingBolus(detailedBolusInfo, chunkResult, it) }
+                pendingTemporaryId = null
+            }
+        )
     }
 
     /**
@@ -1241,14 +1283,6 @@ class YpsoService : DaggerService() {
         rxBus.send(EventYpsoPumpDataChanged())
         written
     }
-
-    /** The pump's own speed index: `0` = 3 U/min, `1` = 12 U/min, `2` = 33.3 U/min. */
-    private fun configuredBolusSpeedUnitsPerMinute(): Double =
-        when (preferences.get(YpsoStringKey.YpsoBolusSpeed)) {
-            "0"  -> 3.0
-            "2"  -> 33.3
-            else -> 12.0
-        }
 
     // ==================== PUMPSYNC ====================
 

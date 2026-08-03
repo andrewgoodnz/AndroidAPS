@@ -32,6 +32,7 @@ import com.ypsopump.sdk.internal.parsing.YpsoHistoryMapper
 import com.ypsopump.sdk.internal.protocol.BolusNotificationStatus
 import com.ypsopump.sdk.internal.protocol.DeliveryMode
 import com.ypsopump.sdk.internal.protocol.EventType
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -46,6 +47,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.resume
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
  * Plaintext [PumpManager] implementation for the YpsoPump, derived from vicktor's SDK.
@@ -142,6 +144,43 @@ class YpsoPumpManagerImpl private constructor(
 
         /** How many of the newest event-log entries to search for the command just issued. */
         private const val HISTORY_SEARCH_ENTRIES = 5
+
+        /**
+         * The window used to confirm one **chunk** of a chunked bolus, which is narrower because it
+         * has to fit inside the interval between chunks.
+         *
+         * Index 0 is always the newest entry (§5), so the chunk that has just finished should be the
+         * first one read; three costs ~600 ms against a five-second interval where five costs ~1 s.
+         * Three rather than one because a single interloping entry would otherwise hide the chunk
+         * and turn a delivered chunk into "not confirmed" — which stops the sequence. Anything
+         * deeper than two interlopers falls to [findBolusRecord]'s existing retry.
+         */
+        private const val CHUNK_HISTORY_SEARCH_ENTRIES = 3
+
+        /**
+         * How often the inter-chunk wait looks at [cancelRequested].
+         *
+         * The wait cannot be one `delay(interval)`: a cancel arriving a quarter-second into a
+         * five-second gap would not be acted on until the gap expired, and the next chunk would
+         * already be on its way. This bounds "the user pressed stop" to "no further insulin" at a
+         * quarter of a second.
+         */
+        private const val CHUNK_CANCEL_POLL_MS = 250L
+
+        /**
+         * The rate this pump actually delivers at, **measured** — 0.3 U in 1.27 s and 3.92 U in
+         * 8.33 s on 2026-08-03, both fitting ~33 U/min with a consistent ~0.7 s overhead (§8.6).
+         *
+         * It replaces a user preference that was never a pump setting. Only [expectedDeliveryMs] and
+         * [bolusTimeoutMs] use it, and it fails safe in one direction: a rate believed too slow makes
+         * the driver wait longer, never abandon a bolus that is still running.
+         *
+         * ⚠ Getting this right is a **prerequisite** for chunking rather than a tidy-up. With the old
+         * arithmetic a 1 U chunk at a configured 12 U/min was "expected" to take 5 s, so the wait
+         * before reading the log would on its own exceed the five-second interval the chunk has to
+         * fit inside. 12 U/min is not reachable until the estimate matches the pump.
+         */
+        private const val PUMP_NATIVE_UNITS_PER_MINUTE = 33.3
 
         /**
          * A deeper window for temporary basals, because a TBR's entry is not appended when the TBR
@@ -357,12 +396,12 @@ class YpsoPumpManagerImpl private constructor(
     val bolusProgress: StateFlow<BolusProgress?> = _bolusProgress
 
     /**
-     * Bolus speed in U/min, mirrored from the driver preference; sets the completion timeout.
-     * Defaults to the 12 U/min the Lotus export had configured.
+     * Set by [cancelBolus] from another thread, read by the delivery loop **and by the chunk loop**.
+     *
+     * ⚠ It is reset once per *sequence*, in the two public entry points, and deliberately not in
+     * [deliverOneBolus]. Resetting it per bolus would make chunk k+1 wipe the cancel that arrived
+     * during chunk k, and the sequence would go on delivering after the user pressed stop.
      */
-    var bolusSpeedUnitsPerMinute: Double = 12.0
-
-    /** Set by [cancelBolus] from another thread, read by the delivery loop. */
     @Volatile
     private var cancelRequested: Boolean = false
 
@@ -998,33 +1037,69 @@ class YpsoPumpManagerImpl private constructor(
         cancelRequested = false
         _bolusProgress.value = BolusProgress(0.0, amount, finished = false, cancelled = false)
 
+        // From here until the outcome is known, a dropped link is worth chasing: the pump will finish
+        // the bolus without us and the amount it gave is in its event log. Disarmed in the `finally`
+        // so an idle disconnect never triggers a reconnect — and so an exception on the way out
+        // cannot leave it armed for ever, which the previous straight-line version could.
+        reconnectManager.enable()
+        val outcome = try {
+            deliverOneBolus(amount, HISTORY_SEARCH_ENTRIES, alreadyDelivered = 0.0, sequenceTotal = amount, probeDeliveryModeOnce = true)
+        } finally {
+            reconnectManager.disable()
+        }
+        _bolusProgress.value = BolusProgress(
+            outcome.deliveredUnits,
+            amount,
+            finished = true,
+            cancelled = outcome.errorMessage != null
+        )
+        outcome
+    }
+
+    /**
+     * One standard bolus, start to confirmed outcome, **with the connection lock already held**.
+     *
+     * Extracted from [deliverBolusConfirmed] so that [deliverChunkedBolusConfirmed] can issue a run
+     * of these inside a single `withConnection`. [pumpMutex] is not reentrant, so a chunk loop that
+     * called the public method would deadlock on its second chunk; and taking the lock per chunk —
+     * the other way to write it — would let a status read, a temporary basal or a second bolus land
+     * *between two chunks of the first one*.
+     *
+     * Three things deliberately do **not** live here, because they belong to the sequence rather
+     * than to one bolus: resetting [cancelRequested], arming [reconnectManager], and the terminal
+     * `finished = true` progress update.
+     *
+     * @param alreadyDelivered what earlier chunks put in, so progress reads as a running total
+     *   against [sequenceTotal] rather than restarting from zero on every chunk.
+     * @param probeDeliveryModeOnce only the first chunk answers §8.3's question; the rest would be N
+     *   extra round trips inside a timing budget measured in seconds.
+     */
+    private suspend fun deliverOneBolus(
+        amount: Double,
+        searchEntries: Int,
+        alreadyDelivered: Double,
+        sequenceTotal: Double,
+        probeDeliveryModeOnce: Boolean
+    ): ConfirmedBolus {
         // Baseline the event log first. This is what lets the bolus we are about to start be told
         // apart from every bolus already in the log, and without it a stale entry could be read
         // back as confirmation of this one. If it cannot be read, nothing is sent: an
         // unconfirmable delivery is not one this driver makes (§0).
         val baselineSequence = newestEventSequence()
-        if (baselineSequence == null) {
-            return@withConnection bolusFailure(
+            ?: return bolusFailure(
                 amount,
                 "The pump's event log could not be read, so a bolus could not be confirmed — nothing was sent"
             )
-        }
         log("Bolus $amount U requested. Newest event sequence before sending: $baselineSequence")
 
-        // From here until the outcome is known, a dropped link is worth chasing: the pump will finish
-        // the bolus without us and the amount it gave is in its event log. Disarmed in the `finally`
-        // below so an idle disconnect never triggers a reconnect.
-        reconnectManager.enable()
-
         if (!suspendStartBolus(amount)) {
-            _bolusProgress.value = BolusProgress(0.0, amount, finished = true, cancelled = false)
-            return@withConnection bolusFailure(amount, "The pump refused the bolus command")
+            return bolusFailure(amount, "The pump refused the bolus command")
         }
 
         val expectedMs = expectedDeliveryMs(amount)
         val timeoutMs = bolusTimeoutMs(amount)
         val startedAt = System.currentTimeMillis()
-        log("Bolus sent. Expecting ~${expectedMs / 1000}s at $bolusSpeedUnitsPerMinute U/min, giving up after ${timeoutMs / 1000}s")
+        log("Bolus sent. Expecting ~${expectedMs / 1000}s at the pump's $PUMP_NATIVE_UNITS_PER_MINUTE U/min, giving up after ${timeoutMs / 1000}s")
 
         var progressSeen = 0.0
         var sawDelivering = false
@@ -1055,10 +1130,15 @@ class YpsoPumpManagerImpl private constructor(
                     // blocked behind this call — so without this read the question in §8.3 cannot be
                     // answered at all. Once per bolus, on the first poll that confirms delivery, and
                     // the result is logged and nothing else: see probeDeliveryMode.
-                    if (!sawDelivering) probeDeliveryMode("during-bolus")
+                    if (!sawDelivering && probeDeliveryModeOnce) probeDeliveryMode("during-bolus")
                     sawDelivering = true
                     progressSeen = maxOf(progressSeen, status.fastInjected.toDouble())
-                    _bolusProgress.value = BolusProgress(progressSeen, amount, finished = false, cancelled = cancelRequested)
+                    _bolusProgress.value = BolusProgress(
+                        alreadyDelivered + progressSeen,
+                        sequenceTotal,
+                        finished = false,
+                        cancelled = cancelRequested
+                    )
                 } else if (sawDelivering && BolusNotificationStatus.hasFinished(status.fastStatus)) {
                     log("Pump bolus status reached ${BolusNotificationStatus.name(status.fastStatus)}")
                     break
@@ -1080,16 +1160,186 @@ class YpsoPumpManagerImpl private constructor(
         }
 
         // The authoritative record: what the pump wrote into its own event log.
-        val record = findBolusRecord(baselineSequence)
-        reconnectManager.disable()
-        val outcome = bolusOutcome(amount, record, progressSeen, mismatch)
-        _bolusProgress.value = BolusProgress(
-            outcome.deliveredUnits,
-            amount,
-            finished = true,
-            cancelled = outcome.errorMessage != null
+        return bolusOutcome(amount, findBolusRecord(baselineSequence, searchEntries), progressSeen, mismatch)
+    }
+
+    // ==================== CHUNKED BOLUS ====================
+
+    /**
+     * Delivers [plan] as a run of ordinary standard boluses on a timer — the whole of "slow bolus".
+     *
+     * **No new pump capability is used here.** Every chunk is the `type=2` standard bolus this driver
+     * has delivered and confirmed since Phase 2, sent through the same [deliverOneBolus] and
+     * confirmed the same way, from the pump's own event log. The pump never learns that anything
+     * unusual is happening; it is the phone that is the sequencer, which is exactly what mylife
+     * Lotus does and what its five-entry log capture on 2026-08-03 proved (§8.6).
+     *
+     * **The connection lock is held for the whole sequence**, which is the point: it is what stops
+     * another command interleaving between two chunks of the same bolus. [BolusChunkPlan] caps how
+     * long that can last.
+     *
+     * **Any chunk that does not confirm ends the sequence, and nothing resumes.** A pump that has
+     * alarmed and stopped delivering must not be sent ten more boluses (9e), and a link that came
+     * back after dropping should not restart insulin after an unpredictable gap (9c).
+     *
+     * @param onChunkStarting called immediately before a chunk is sent, with its amount. The caller
+     *   opens the provisional IOB record here — per chunk, because the pump has only been told about
+     *   one chunk, and insulin in chunks that were never commanded will never be delivered by
+     *   anything (§0's err-high rule is about outcomes that are *unknown*; these are known).
+     * @param onChunkSettled called for **every** chunk that was started, with whatever the pump's
+     *   log said about it, so the caller can settle that provisional to the pump's own sequence.
+     *
+     * @return the sequence as one result. `pumpSequence` is deliberately **null**: a sequence has no
+     *   single identity, its N identities went out through [onChunkSettled], and returning one of
+     *   them would invite a caller to file the whole amount under a chunk's sequence — which the
+     *   next history sync would rewrite down to that chunk's amount (§8.5).
+     */
+    suspend fun deliverChunkedBolusConfirmed(
+        plan: BolusChunkPlan,
+        onChunkStarting: (Double) -> Unit = {},
+        onChunkSettled: (ConfirmedBolus) -> Unit = {}
+    ): ConfirmedBolus = withConnection {
+        val total = plan.requestedCentiUnits / 100.0
+        if (total <= 0.0) {
+            return@withConnection bolusFailure(total, "Bolus amount must be greater than zero")
+        }
+        if (total > maxBolusAmount) {
+            return@withConnection bolusFailure(total, "Bolus of $total U exceeds the pump maximum of $maxBolusAmount U")
+        }
+
+        val chunks = plan.chunkUnits
+        log(
+            "CHUNKED: asked ${total}U at ${plan.speed.unitsPerMinute} U/min -> ${chunks.size} chunks of " +
+                "$chunks U every ${plan.speed.intervalSeconds}s" +
+                if (plan.ceilingSteppedUp)
+                    " (stepped up from ${plan.requestedSpeed.unitsPerMinute} U/min: at that rate this bolus would " +
+                        "have held the command queue past the ${BolusChunkPlan.MAX_SEQUENCE_SECONDS}s ceiling)"
+                else ""
         )
-        outcome
+
+        cancelRequested = false
+        _bolusProgress.value = BolusProgress(0.0, total, finished = false, cancelled = false)
+        reconnectManager.enable()
+
+        val sequenceStartedAt = System.currentTimeMillis()
+        val startOffsetsMs = mutableListOf<Long>()
+        val pumpEntrySeconds = mutableListOf<Long>()
+        val sequences = mutableListOf<Long>()
+        // Summed in centi-units, not in Double. The pump's figures are exact centi-units and
+        // accumulating 0.4 fifteen times in floating point is §4d's trap on a number that is shown
+        // to the user as "how much insulin you got".
+        var deliveredCentiUnits = 0
+        var confirmedChunks = 0
+        var stopReason: String? = null
+
+        try {
+            for ((index, chunkUnits) in chunks.withIndex()) {
+                // Chunk k is due at sequenceStart + k * interval — measured from the *start* of the
+                // sequence, not from when the previous chunk happened to finish, so confirmation
+                // costs do not accumulate across a fifty-chunk run. If a chunk overruns its slot the
+                // next one goes out immediately and the sequence simply runs slower than configured,
+                // which is the safe direction for a comfort feature.
+                if (index > 0 && !waitForNextChunk(sequenceStartedAt + index * plan.intervalMillis)) {
+                    stopReason = "stopped by the user before chunk ${index + 1} of ${chunks.size}"
+                    break
+                }
+                if (cancelRequested) {
+                    stopReason = "stopped by the user before chunk ${index + 1} of ${chunks.size}"
+                    break
+                }
+
+                val offsetMs = System.currentTimeMillis() - sequenceStartedAt
+                startOffsetsMs += offsetMs
+                onChunkStarting(chunkUnits)
+
+                val result = runCatching {
+                    deliverOneBolus(
+                        amount = chunkUnits,
+                        searchEntries = CHUNK_HISTORY_SEARCH_ENTRIES,
+                        alreadyDelivered = deliveredCentiUnits / 100.0,
+                        sequenceTotal = total,
+                        probeDeliveryModeOnce = index == 0
+                    )
+                }.getOrElse { error ->
+                    if (error is CancellationException) throw error
+                    // Caught rather than propagated. An exception escaping here reaches the service's
+                    // awaitResult, which reports the fallback result — 0.0 U delivered — for a
+                    // sequence that may already have put six chunks in. Under-reporting is the
+                    // failure 9c names; honest under-*delivery* is the pass.
+                    log("CHUNKED: chunk ${index + 1} of ${chunks.size} threw: ${error.message}")
+                    ConfirmedBolus(
+                        requestedUnits = chunkUnits,
+                        deliveredUnits = 0.0,
+                        pumpSequence = null,
+                        timestampMillis = null,
+                        complete = false,
+                        errorMessage = "the connection failed during chunk ${index + 1} of ${chunks.size}"
+                    )
+                }
+
+                onChunkSettled(result)
+                deliveredCentiUnits += (result.deliveredUnits * 100).roundToInt()
+                result.pumpSequence?.let { sequences += it }
+                result.timestampMillis?.let { pumpEntrySeconds += it / 1000 }
+                if (result.complete) confirmedChunks++
+
+                val pumpGap = if (pumpEntrySeconds.size >= 2)
+                    ", pump entry +${pumpEntrySeconds.last() - pumpEntrySeconds[pumpEntrySeconds.size - 2]}s"
+                else ""
+                log(
+                    "CHUNKED: chunk ${index + 1}/${chunks.size} ${chunkUnits}U sent +${offsetMs / 1000.0}s, " +
+                        "seq=${result.pumpSequence} -> ${result.deliveredUnits}U$pumpGap" +
+                        (result.errorMessage?.let { " — $it" } ?: "")
+                )
+
+                if (!result.complete) {
+                    stopReason = result.errorMessage ?: "chunk ${index + 1} of ${chunks.size} was not confirmed"
+                    break
+                }
+            }
+        } finally {
+            reconnectManager.disable()
+        }
+
+        val delivered = deliveredCentiUnits / 100.0
+        val complete = confirmedChunks == chunks.size &&
+            deliveredCentiUnits == plan.requestedCentiUnits &&
+            !cancelRequested
+        val pumpGaps = pumpEntrySeconds.zipWithNext { a, b -> b - a }
+        log(
+            "CHUNKED: $confirmedChunks/${chunks.size} confirmed, ${delivered}U of ${total}U, " +
+                "phone starts ${startOffsetsMs.map { it / 1000.0 }}s, pump entries ${pumpGaps}s apart, seqs $sequences" +
+                (stopReason?.let { " — $it" } ?: "")
+        )
+
+        _bolusProgress.value = BolusProgress(delivered, total, finished = true, cancelled = !complete)
+
+        ConfirmedBolus(
+            requestedUnits = total,
+            deliveredUnits = delivered,
+            // Null on purpose — see the method's @return. The N real identities went out through
+            // onChunkSettled and are already recorded.
+            pumpSequence = null,
+            timestampMillis = null,
+            complete = complete,
+            errorMessage = if (complete) null else
+                "Delivered ${delivered}U of ${total}U — $confirmedChunks of ${chunks.size} chunks" +
+                    (stopReason?.let { ". $it" } ?: "")
+        )
+    }
+
+    /**
+     * Waits until [dueAtMillis], giving up early if the user cancels.
+     *
+     * @return false if the sequence should stop.
+     */
+    private suspend fun waitForNextChunk(dueAtMillis: Long): Boolean {
+        while (true) {
+            if (cancelRequested) return false
+            val remaining = dueAtMillis - System.currentTimeMillis()
+            if (remaining <= 0) return true
+            delay(minOf(remaining, CHUNK_CANCEL_POLL_MS))
+        }
     }
 
     /**
@@ -1179,10 +1429,10 @@ class YpsoPumpManagerImpl private constructor(
      * caller told it is provisional — because a bolus whose amount is unknown must not be reported
      * as nothing at all.
      */
-    private suspend fun findBolusRecord(afterSequence: Long): HistoryEntry? {
+    private suspend fun findBolusRecord(afterSequence: Long, searchEntries: Int): HistoryEntry? {
         var provisional: HistoryEntry? = null
         repeat(BOLUS_HISTORY_ATTEMPTS) { attempt ->
-            val newest = suspendReadHistoryEvents(HISTORY_SEARCH_ENTRIES)
+            val newest = suspendReadHistoryEvents(searchEntries)
                 .filter { it.sequence > afterSequence && it.entryType in STANDARD_BOLUS_TYPES }
                 .maxByOrNull { it.sequence }
 
@@ -1240,13 +1490,19 @@ class YpsoPumpManagerImpl private constructor(
         )
     }
 
-    /** How long the pump should take to deliver [amount] at the configured speed. */
+    /**
+     * How long the pump should take to deliver [amount], at the rate it was measured doing it.
+     *
+     * ⚠ This used to be driven by `YpsoBolusSpeed`, which was never a pump setting and defaulted to
+     * a figure 2.8× slower than the pump's real rate (§8.6). Slow-bolus delivery is now chunking,
+     * and the chunks themselves always go in at the pump's native rate.
+     */
     private fun expectedDeliveryMs(amount: Double): Long =
-        ((amount / (bolusSpeedUnitsPerMinute / 60.0)) * 1000).toLong()
+        ((amount / (PUMP_NATIVE_UNITS_PER_MINUTE / 60.0)) * 1000).toLong()
 
     /**
-     * How long to wait for the pump to finish, from the configured bolus speed plus slack for the
-     * command round trip and the pump's own start-up.
+     * How long to wait for the pump to finish, from its measured rate plus slack for the command
+     * round trip and the pump's own start-up.
      */
     private fun bolusTimeoutMs(amount: Double): Long =
         expectedDeliveryMs(amount) + (BOLUS_TIMEOUT_SLACK_SECONDS * 1000).toLong()

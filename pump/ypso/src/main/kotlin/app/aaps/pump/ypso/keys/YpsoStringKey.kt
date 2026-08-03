@@ -19,9 +19,21 @@ enum class YpsoStringKey(
 ) : StringPreferenceKey {
 
     /**
-     * Bolus speed, as the pump's own index. `1` = 12 U/min (1 U per 5 s), which is what the
-     * decrypted mylife Lotus export had configured. Read-only for now; it becomes load-bearing
-     * when bolus progress and completion timeouts are implemented.
+     * How fast a bolus is delivered, by **chunking it in the phone** — see `BolusSpeed`.
+     *
+     * ⚠ This used to claim to be "the pump's own speed index" and it was not: nothing was ever
+     * written to the pump, and with mylife Lotus set to 3 U/min a bolus commanded by AAPS still ran
+     * at 31.2 U/min (§8.6). All it configured was a timeout estimate and a log line. It is a real
+     * setting for the first time now that the driver does what Lotus does — issue ordinary standard
+     * boluses on a timer.
+     *
+     * The stored values are self-describing rather than indices, because the option this list is
+     * missing (6 U/min) belongs in the *middle* of its range, and adding it to an index list would
+     * silently re-point every stored preference at a different rate.
+     *
+     * ⚠ **The default is `unlimited` — no chunking**, which is the delivery path every hardware
+     * phase from 1 to 8 ran. Phase 9 flips it, or does not, on the evidence; Phase 7 set the
+     * precedent that a default is a statement the shipped build is ready.
      */
-    YpsoBolusSpeed("ypso_bolus_speed", "1"),
+    YpsoBolusSpeed("ypso_bolus_speed", "unlimited"),
 }

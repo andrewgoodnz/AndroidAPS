@@ -84,6 +84,7 @@ It writes no treatment record; the history sync will pick up whatever the pump l
     <string name="ypso_bolus_over_pump_max">Bolus of %1$.2f U exceeds the pump maximum of %2$.2f U</string>
 
     <string name="ypso_bolus_speed_title">Bolus speed</string>
+    <string name="ypso_bolus_speed_summary">Slower speeds split a large bolus into several small ones, delivered a few seconds apart, which is more comfortable. The pump itself always delivers at its own speed — the splitting is done by the phone, so AAPS cannot reach the pump during a slow bolus.</string>
     <string name="ypso_nano_bolus_title">Nano bolus</string>
     <string name="ypso_nano_bolus_summary">Pump is configured for tiny bolus steps</string>
     <string name="ypso_rssi_threshold_title">Scan signal threshold (dBm)</string>
