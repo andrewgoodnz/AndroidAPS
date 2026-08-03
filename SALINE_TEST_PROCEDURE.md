@@ -32,7 +32,7 @@ delivery for comfort, and it needs no new pump capability.
 | H | **A bolus while a TBR runs** | Never tried together; both are identified by sequence | — |
 | I | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
 | J | **Restore a profile you care about** | A write you cannot reverse is not finished | Phase 4 |
-| K | **Chunked bolus for comfort** ← **START HERE NEXT SESSION** | ✅ Mechanism solved 2026-08-03, **procedure written (Phase 9), code not started.** "Bolus speed" is a loop in the phone, not a pump setting: Lotus sends ordinary `type=2` boluses on a timer — **1 U/5 s = 12 U/min, 0.5 U/5 s = 6, 0.4 U/8 s = 3** — confirmed in the pump's log (five entries, 8 s apart, summing to 2.00 U). Needs no new pump capability. **Phase 9 lists the design decisions to make before coding** | **Phase 9**, §8.6 |
+| K | **Chunked bolus for comfort** | ✅ **DONE — Phase 9 passed on hardware 2026-08-04.** "Bolus speed" is a loop in the phone, not a pump setting: Lotus sends ordinary `type=2` boluses on a timer — **1 U/5 s = 12 U/min, 0.5 U/5 s = 6, 0.4 U/8 s = 3** — confirmed in the pump's log (five entries, 8 s apart, summing to 2.00 U). Needs no new pump capability. Built to six design decisions written down before the code; 9c failed first, found a permanent phantom IOB record, was fixed and re-run clean | **Phase 9**, §8.6 |
 | L | **The extended bolus** | ⚠ Works, 15-min minimum, lands in `boluses` as NORMAL and its log entry carries no duration (8a/8c passed/found 2026-08-03). Superseded as the comfort route by K, which hits 12 U/min where this floors at 0.67 | **Phase 8**, §8.6 |
 
 **Closed on 2026-08-02, no longer on the list:**
@@ -1678,7 +1678,15 @@ unverified sync logic.
 
 ---
 
-# Phase 8 — the extended bolus ⏳ **NOT STARTED**
+# Phase 8 — the extended bolus ⚠ **8a RAN 2026-08-03; the rest stands unrun, and deliberately so**
+
+> **Status, 2026-08-04.** Only **8a** was run. It answered the question that mattered — the pump
+> *does* extended boluses, enforces a 15-minute minimum, and logs them under its own event type
+> carrying **no duration**, so one cannot be reconstructed from history alone (§8.6). At a 15-minute
+> floor a 10 U dose is 0.67 U/min, far slower than the ~12 U/min this was wanted for, so **Phase 9's
+> chunked bolus superseded it as the comfort route** and the remaining steps were never run. The
+> extended bolus stays **refused and unadvertised**, and nothing depends on it. This is a decision,
+> not an unfinished job — see §8.6.
 
 **Written 2026-08-03, before any code, which is the rule this file keeps for itself.** Four of the
 checks in these notes initially "passed" against a test that could not have failed, and every one of
@@ -1977,7 +1985,7 @@ reminder that this is a deliberate act rather than a tidy-up.
 
 ---
 
-# Phase 9 — the chunked bolus, for comfort ⏳ **BUILT 2026-08-03, AWAITING HARDWARE**
+# Phase 9 — the chunked bolus, for comfort ✅ **PASSED 2026-08-04**
 
 **Written 2026-08-03, before any code.** The mechanism is not a guess: it was read off mylife Lotus's
 own settings screen and then confirmed in the pump's event log, so this phase starts from a worked

@@ -7,9 +7,9 @@ writes the pump clock, a standard bolus, a temporary basal and the 24-slot basal
 of those was gated behind its own hardware test on saline, and every one is confirmed by reading the
 pump back rather than by the write callback.
 
-One thing is built and **has never run against a pump**: the slow ("chunked") bolus, which delivers a
-large dose as several small ones for comfort. It is off by default and cannot happen until the bolus
-speed is changed by hand — see [Before insulin](#before-insulin).
+It also delivers a **slow ("chunked") bolus** — a large dose given as several small ones a few
+seconds apart, for comfort — which passed its own hardware phase on 2026-08-04. It is **off by
+default** and cannot happen until the bolus speed is changed by hand.
 
 **Every test to date has been on saline, off-body, cannula to air.** Nothing here has moved insulin
 into a person. What stops it doing so is the cartridge, not the code — see
@@ -257,11 +257,10 @@ change to the framing code.
 
 Stated plainly, because this is the question the whole project is pointed at.
 
-### Next up: the chunked bolus (Phase 9) — **built, and never run against a pump**
+### ✅ The chunked bolus (Phase 9) — passed on hardware, 2026-08-04
 
-**The one piece of work with code written and no hardware behind it.** The pump delivers a commanded
-bolus at a fixed ~33 U/min, so 10 U goes in over 18 seconds — uncomfortable for large doses where
-other pumps take minutes.
+The pump delivers a commanded bolus at a fixed ~33 U/min, so 10 U goes in over 18 seconds —
+uncomfortable for large doses where other pumps take minutes.
 
 mylife Lotus solves this **entirely in the phone**: its "bolus speed" setting is a chunk size and an
 interval, not a pump setting. Confirmed in the pump's own log on 2026-08-03 — a 2 U Lotus bolus at
@@ -274,16 +273,23 @@ interval, not a pump setting. Confirmed in the pump's own log on 2026-08-03 — 
 ```
 
 So this needs **no new pump capability, no new wire format and no new event type** — every chunk is
-the standard bolus this driver has delivered and confirmed since Phase 2. The driver now does the
-same thing, built on 2026-08-03 to six design decisions written down first (`PORTING_NOTES` §8.6),
-with `SALINE_TEST_PROCEDURE.md` **Phase 9** holding the procedure that has yet to be run.
+the standard bolus this driver has delivered and confirmed since Phase 2. Built to six design
+decisions written down *before* the code (`PORTING_NOTES` §8.6), and passed all five steps of
+`SALINE_TEST_PROCEDURE.md` **Phase 9**: on the bench it reproduced Lotus's own capture, five chunks
+eight seconds apart summing to exactly 2.00 U. A cancel stops the sequence, a lost link stops it, an
+occlusion stops it, and every run was checked against the reservoir.
 
 ⚠ **Nothing chunks unless it is switched on.** *Preferences → YpsoPump → Bolus speed* defaults to
-the pump's own 33 U/min, which is one command and is exactly what every hardware phase so far ran.
-6 U/min is deliberately missing from the list until Phase 9 passes. Two properties are worth knowing
-before turning it on: the connection is held for the whole sequence, so nothing else — including the
-alert check — reaches the pump while it runs (capped at five minutes); and a 10 U bolus becomes ten
-treatment records, which is noisy but accurate, because the insulin genuinely went in as ten pulses.
+the pump's own ~33 U/min, which is one command and exactly what every hardware phase ran. Three
+things are worth knowing before turning it on:
+
+- **The connection is held for the whole sequence**, so nothing else — including the alert check that
+  notices an occlusion — reaches the pump while it runs. Capped at five minutes; above that the rate
+  steps up to the next option rather than refusing the bolus.
+- **A 10 U bolus becomes ten treatment records.** Noisy but accurate: the insulin genuinely went in
+  as ten pulses, and it is what the history sync produces from the pump's log anyway.
+- **The rate is an upper bound, never a floor.** If a chunk's confirmation overruns its slot the
+  sequence runs slower than configured. It will never run faster.
 
 ---
 
