@@ -1767,7 +1767,10 @@ none of them was, was a pump problem.
 10. **A DST transition.** `pumpSecondsToUnix` converts through a local calendar and is tested across
     a boundary in unit tests, but no real transition has occurred while the driver was running.
 11. **Two controllers at once.** Now known to be more than theoretical: the study phone running Lotus
-    writes the basal profile unprompted when it wakes (§4i). What happens if both are connected
+    writes the basal profile unprompted when it wakes (§4i) — **confirmed a second time 2026-08-03**,
+    and this time *predicted before it happened* rather than discovered as a mystery. All 24 slots
+    went 0.30 → 1.20 U/h within a minute of the phone powering up, which is what makes a read-back
+    diff useless as a driver test while it is awake. What happens if both are connected
     during a delivery command is unknown, and the driver holds its connection rather than releasing
     it between commands.
 
@@ -2450,6 +2453,58 @@ configuring the pump. They are configuring a log line and a timeout. Same specie
 `YpsomedCapabilities` promising an extended bolus — and worse in one respect: the capability could be
 caught by pressing the button, whereas this one had no pump menu to contradict it and needed a
 stopwatch.
+
+#### ✅ [verified] It is not a pump setting AAPS can reach — tested 2026-08-03
+
+The settings-index hunt was run and came back negative, decisively.
+
+**mylife Lotus offers four speeds, not three**: *unlimited (33.3), 12, 6, 3 U/min*. `YpsoBolusSpeed`
+offers three and maps `0→3, 1→12, 2→33.3`, so the driver's list is missing **6 U/min** and its
+index mapping is wrong independently of everything below.
+
+**The experiment.** Lotus was set from unlimited to **3 U/min** on the study phone, then
+`probeUnknownSettings()` re-read indices 2–13:
+
+```
+              BEFORE 14:23    AFTER 15:29
+index 2           10              10
+index 3           50              50        (bolus increment, mapped §8.8)
+index 4        26247           26247
+index 5        32105           32105
+index 6        17505           17505
+index 7          188             188
+index 8            2               2        ← the obvious candidate. Unchanged.
+index 9–13   0,3,0,1,1       0,3,0,1,1
+```
+
+**Nothing moved.** And `index 8 = 2` — which fit "speed index 2 = 33.3 U/min" so neatly — held. That
+is the fit §8.8 warns is the weakest evidence there is, and it failed the moment it was tested,
+which is the whole point of testing it rather than writing it down.
+
+**Then the measurement that decides it.** With Lotus set to 3 U/min, a **2.0 U bolus commanded by
+AAPS** was timed:
+
+```
+15:34:08.194  BolusNotification 01   (delivering)
+15:34:12.040  BolusNotification 04   (done)
+```
+
+**3.85 s for 2.0 U = 31.2 U/min.** At 3 U/min it would have taken **40 seconds**. Unchanged from the
+30.8 U/min measured before Lotus was touched.
+
+**So the setting does not apply to a bolus commanded over BLE by another controller**, and Lotus had
+certainly reached the pump — it rewrote all 24 basal slots on connect (§4i) in the same session.
+
+**Conclusion: `YpsoBolusSpeed` should be deleted, not mapped.** There is no pump-side speed for an
+AAPS-commanded bolus to obey, so the preference cannot be made to work by finding an index. It
+configures a log line and a timeout estimate, and presenting it as a three-way choice over the
+pump's behaviour is the same species of false promise as a capability the driver refuses.
+
+⚠ **Two limits on this result, stated rather than glossed.** `probeUnknownSettings()` reads **only
+indices 2–13** — nobody has ever read above 13, so "not in 2–13" is not "not anywhere". And whether a
+bolus commanded by *Lotus itself* would run at 3 U/min is untested; if it would, the protocol
+supports slow delivery by some means not yet found, and the hunt would be worth resuming above index
+13. If it would not, Lotus's setting is cosmetic there too and the matter is closed.
 
 ⚠ **Do not map it to a settings index on the strength of the obvious candidate.** If speed index 2 =
 33.3 U/min then `index 8 = 2` from the §8.8 probe is a tempting fit — and that is exactly the shape of
