@@ -7,101 +7,106 @@ Driver for an **unlocked plaintext research YpsoPump** on current AndroidAPS (3.
 > is the record of what the pump was observed doing and why the code is shaped the way it is,
 > including every wrong turn, because the wrong turns are the part that is expensive to rediscover.
 
-**Status, 2026-08-04: every phase from 1 to 9 has run on hardware and passed. Phase 10 is written and
-has not run, and it is the only open gate.** The driver bonds,
-connects, authenticates in plaintext with no key exchange, reads every value it needs, and
-**writes** — the pump clock (§4e), a standard bolus with abort (§4f), a temporary basal with cancel
+**Status, 2026-08-04. Phases 1 to 9 have all run on hardware and passed. Phase 10 is written, has
+never run, and is the only open gate** — and it is the first one whose subject is not the pump.
+
+This header is the current state of the driver, not a changelog. Each claim names the section that
+holds the evidence at full length, including the wrong turns that produced it.
+
+## What the driver does, and what confirmed it
+
+It bonds, connects, **authenticates in plaintext with no key exchange**, reads every value it needs,
+and **writes**: the pump clock (§4e), a standard bolus with abort (§4f), a temporary basal with cancel
 (§4h), the 24-slot basal profile (§4i), and a **slow bolus delivered as a timed run of standard
-boluses** (§8.6). Each was gated behind its own saline test and each is confirmed by reading the pump
-back, never by the write callback.
+boluses** (§8.6). Each write was gated behind its own saline test, and **each is confirmed by reading
+the pump back — never by the write callback**, because a successful GATT write proves nothing on this
+pump (§3).
 
-Deliveries reach `PumpSync` under the pump's own sequence number, pump alarms reach AAPS as urgent
-notifications (§4g, §8.2), and **history sync is switched on** — a bolus given on the pump's own
-menu now becomes insulin on board (§8.5).
+Deliveries reach `PumpSync` under the pump's own sequence number, pump alarms arrive as urgent AAPS
+notifications (§4g, §8.2), and **history sync is on by default** — a bolus given on the pump's own menu
+becomes insulin on board (§8.5). A stopped pump opens a 0% `PUMP_SUSPEND` record that is re-asserted
+across polls, so AAPS stops counting basal that is not being delivered (§8.6).
 
-⚠ **This driver can now move insulin.** What stops it doing so is the cartridge, not the code. Every
-test to date has been on **saline, off-body, cannula to air**, and §8.1 lists what must still be true
-before that changes.
+**A quiet status poll costs ~580 ms.** Without the probe that reads index 0 first and skips an unmoved
+window it costs **20.4 s**, because `YpsoHistoryReadCount` applies to *each* log — twice what this file
+originally predicted (§8.5).
 
-**Phase 7 passed in full on 2026-08-02.** The first enable took a baseline and imported nothing; a
-manual bolus arrived exactly once at the right amount and time; an AAPS bolus stayed one record
-across two re-reads; a 24-entry burst reached no treatment and opened no gap; and four idle hours
-produced fourteen empty syncs and not one row in any treatment table.
+**Byte 0 of the system status has two values and that is the whole answer, not a gap.** During a bolus
+`10`; while alarming, after an alarm, stopped by hand, through a whole cartridge change and with the
+cartridge run dry, `3`. There is no pause state on this pump at all. What distinguishes those states is
+the **reservoir field**, not byte 0 — `-1` while the cartridge is out, a known `0` when it has run
+empty. Only "during priming with fluid moving" is unfilled, recorded as **unreachable by this method**
+rather than blank: the reservoir reads `-1` throughout a change, so no reading can be shown to have
+been taken live (§8.3).
 
-**The sync's cost is solved.** It was 20.4 s on every status read — twice what this file predicted,
-because `YpsoHistoryReadCount` applies to *each* log. A probe that reads index 0 first and skips the
-window when nothing has moved cut a quiet poll to **~580 ms**, verified in Phase 7f (§8.5).
+⚠ **This driver can move insulin.** What stops it is the cartridge, not the code. Every test to date
+has been on **saline, off-body, cannula to air**; §8.1 lists what must be true before that changes.
 
-**Phase 9 passed on 2026-08-04 — the chunked bolus works.** "Bolus speed" turned out to be a loop in
-the phone rather than a pump setting: Lotus issues ordinary `type=2` boluses on a timer
-(1 U/5 s = 12 U/min), confirmed in the pump's own log. The driver now does the same, and on the bench
-it reproduced Lotus's own capture — five chunks eight seconds apart summing to exactly 2.00 U. Six
-design decisions were settled and written down **before any of it was coded**, because each one
-changes what the tests must check; they are in §8.6 and the tests were not free to re-open them.
+⚠ **Nothing chunks unless somebody chooses it.** `YpsoBolusSpeed` offers all four of Lotus's speeds but
+**defaults to the pump's own ~33 U/min — no chunking**, the exact path Phases 1–8 ran. Passing Phase 9
+licensed the option; it did not change anything for anyone who has not picked one.
 
-**9c is the reason to believe the other four.** It failed first time, on the one condition of the
-five that no successful run could ever have exposed: a chunk whose baseline read died left an IOB
-record for insulin that was never commanded, permanent because no pump entry will ever exist to
-reconcile it (§4g). Fixed by opening the provisional *after* the baseline read, and re-run — the link
-obligingly died in the same place, and the old phantom row left in the database served as the control
-proving the query finds such rows when they exist. Its re-run also caught the **instrument** logging
-a stale inter-chunk gap for a chunk that produced no entry, which is this file's recurring failure
-shape appearing in the log rather than in the driver.
+## What is still open
 
-⚠ **Nothing about delivery changes until somebody chooses it.** `YpsoBolusSpeed` offers all four of
-Lotus's speeds but **defaults to the pump's own ~33 U/min — no chunking**, the exact path Phases 1–8
-ran. Passing Phase 9 licensed the option, not a change for anyone who has not picked one.
+⚠⚠ **1. Phase 10 — the interrupted bolus. Written, unrun, and the code predicts it will fail.**
+Every gate about what the *pump* does is closed. This one is about **what AAPS's own database holds
+after a bolus is interrupted** — the link dropping, or the app being killed, mid-delivery.
+`openPendingBolus` writes a committed row with `pumpId` null; `settlePendingBolus` is the only thing
+that ever promotes it; and **nothing else in AAPS consumes `temporaryId` on a bolus**. So an unsettled
+provisional cannot be found by the history sync, which looks up by `pumpId`, and the sync therefore
+inserts a *second* row for the same insulin. One bolus, two live rows, both counting. 9c already
+produced exactly one such permanent phantom record, which is why this is a prediction rather than a
+worry (§4g, Phase 10).
 
-**Three things stand between here and an insulin trial, and none of them is a pump capability:**
+**2. What the event log does at 3000 entries** — roughly three months at this user's rate of profile
+changes, so a dated concern rather than a theoretical one. If sequences restart there, a monotonic
+watermark stops being sound. The behaviour is traced rather than guessed at, and the probe makes a wrap
+audible instead of silent (§8.5).
 
-1. ✅✅ **6b is closed — verified twice on 2026-08-03, on the fix and then on HEAD.** 2h33m on the
-   08-02 build (four renewal cycles), then HEAD 3.4.2.6 flashed onto the still-stopped pump and left
-   to poll unattended (three more), with **zero uncovered time at every transition including across
-   the reinstall**. Decided on `temporaryBasals.duration`, not on a log line (§8.6).
-2. ⚠⚠ **Phase 10 is written, unrun, and the code says it will fail.** Every gate about what the
-   *pump* does is now closed; this one is about **what AAPS's own database holds after a bolus is
-   interrupted** — the link dropping, or the app being killed, mid-delivery. `openPendingBolus` writes
-   a committed row with `pumpId` null, `settlePendingBolus` is the only thing that promotes it, and
-   **nothing else in AAPS consumes `temporaryId` on a bolus** — so an unsettled provisional cannot be
-   found by the history sync, which looks up by `pumpId` and therefore inserts a *second* row for the
-   same insulin. One bolus, two live rows. 9c already produced exactly one such permanent phantom
-   record, which is why this is stated as a prediction and not a worry (§4g, Phase 10).
-3. **The 3000-entry log cap now has a date on it** — roughly three months at this user's rate of
-   profile changes. What happens when it wraps is now traced rather than guessed at, and the probe
-   makes it audible instead of silent (§8.5).
+**3. A real DST or timezone transition.** `canHandleDST()` is false and `timezoneOrDSTChanged` queues
+the clock write, so the path exists and is unit tested; no actual transition has happened while the
+driver was running (§8.6).
 
-**Session 8 closed the remaining tidying and built the therapy candidate.** Item B — the one sync path
-that was not idempotent — is fixed on its own terms rather than behind the watermark (§8.5); the
-capability surface is honest and pinned by tests that fail if someone "fixes" it by editing shared
-`core/data`; the donor module is gone and the changed-file surface outside `pump/ypso/` re-audited at
-**seven files, 19 added lines and 2 changed**; and `:pump:ypso` now carries **47 unit tests** against
-the SDK's 84. The release APK is `full`/`fullRelease` at **versionName 3.4.2.6, no suffix**, built
-from a clean tree because `isMaster()` enforces it. ⚠ **Gradle produces it unsigned** — there is no
-release signing config in this project — so it is signed separately with `apksigner`, and the
-signature must be checked against the phone's installed app *before* installing, because a mismatch
-can only be resolved by an uninstall and an uninstall deletes the database. `README_YPSO.md` has the
-procedure.
+None of the three is a capability gap. **6b — the last pump-facing gate — closed on 2026-08-03,
+verified twice:** 2h33m on the 08-02 build (four renewal cycles), then HEAD 3.4.2.6 flashed onto the
+still-stopped pump and left to poll unattended (three more), with **zero uncovered time at every
+transition including across the reinstall**, adjudicated on `temporaryBasals.duration` and not on a log
+line (§8.6).
 
-**Byte 0 of the system status is identified for two values out of 256, and that is the answer, not a
-gap — Phase 5's table is now complete.** Every state reachable on hardware came back as one of those
-two. During a bolus it reads `10`; while alarming, after an alarm, stopped by hand, **through a whole
-cartridge change, and with the cartridge run dry** it reads `3`; and there is no pause state on this
-pump at all (§8.3). What separates those states is not byte 0 but the **reservoir field** — `-1` while
-the cartridge is out or being changed, a known `0` when it has run empty. Only "during priming with
-fluid moving" is unfilled, and it is recorded as **unreachable by this method** rather than blank:
-the reservoir reads `-1` throughout a change, so no reading can be shown to have been taken live.
+## The lesson this file keeps re-learning
 
-**Four checks in this file have now turned out to be incapable of failing** — the type-19 bolus echo
-(§4f), the epoch "verified" against wall-clock readings (§5), the gap warning measured across both
-logs (§8.5), and Phase 7d re-writing the profile the pump already held (§8.5). Every one read as a
-pass. The pattern is never the logic; it is that nobody looked at what the **inputs** were.
+**Four checks here have turned out to be incapable of failing** — the type-19 bolus echo (§4f), the
+epoch "verified" against wall-clock readings (§5), the gap warning measured across both logs (§8.5),
+and Phase 7d re-writing the profile the pump already held (§8.5). **Every one of them read as a pass.**
+The pattern is never the logic; it is that nobody looked at what the **inputs** were.
+
+The same shape turns up outside the checks, which is worth knowing because it is where it will turn up
+next: 9c's re-run caught the **instrument** logging a stale inter-chunk gap for a chunk that had
+produced no entry (§8.6). Not a vacuous check — a truthful-looking number computed from the wrong
+input, in the log rather than in the driver.
+
+That is why each phase's confirmation check is written down *before* its code, and why Phase 10 carries
+a control step whose only job is to prove the query can tell one row from two.
+
+## The build, and the pump
+
+The therapy candidate is `full`/`fullRelease` at **versionName 3.4.2.6 — no suffix**, which is what
+makes `isMaster()` true at build time (enforcing a clean tree) and `Config.isDev()` false at run time
+(so no `engineering_mode` marker is needed). ⚠ **Gradle produces it unsigned** — this project has no
+release signing config — so it is signed separately with `apksigner`, and **the signature must be
+checked against the phone's installed app before installing**: a mismatch can only be resolved by an
+uninstall, and an uninstall deletes the database. The installed package is
+`info.nightscout.androidaps`, not `app.aaps`. `README_YPSO.md` has the procedure.
+
+Outside `pump/ypso/` this branch touches **seven files, 19 added lines and 2 changed** (§9).
+`:pump:ypso` carries **47 unit tests**, the SDK **84**.
 
 Test pump: **YpsoPump_10074292**, MAC `EC:2A:F0:01:22:34`, firmware V05.02.03 — the unit whose
-settings are in the decrypted Lotus export. (Serial 10178681 is a *different*, standard pump
-running mylife CamAPS FX; see §7.)
+settings are in the decrypted Lotus export. (Serial 10178681 is a *different*, standard pump running
+mylife CamAPS FX; see §7.)
 
-Findings marked **[verified]** below were confirmed against the pump display. Everything else is
-still inference from the sources.
+Findings marked **[verified]** below were confirmed against the pump display. Everything else is still
+inference from the sources.
 
 ---
 
@@ -200,6 +205,23 @@ anything, so recording the full requested amount when a sequence stopped after t
 be erring high on an unknown outcome — that outcome is known. The provisional record is therefore
 opened per chunk, immediately before that chunk is sent, which covers exactly the window this rule
 exists for (§8.6).
+
+### ⚠⚠ And it is not established that the provisional record *settles* — that is Phase 10
+
+Everything above describes what the provisional is **for**. What has never been tested on hardware is
+what happens to it when the phone is taken out of the loop before it can be settled, and **the code's
+own answer is that it does not settle at all**: `settlePendingBolus` is the only thing that promotes
+the row, nothing else in AAPS consumes `temporaryId` on a bolus, and the history sync looks rows up by
+`pumpId` — which an unsettled provisional does not have. The predicted result is a second row for the
+same insulin, both live, both counting.
+
+So the rule this section states — *record in full, report as failed* — is sound, and the mechanism that
+implements it has an untested failure mode pointing the **other** way: not under-recording an unknown
+outcome, but **double-recording a known one**. For a completed bolus that errs high, which is the safe
+side. For a **cancelled** one it over-states insulin nobody received, and nothing ever reconciles it.
+
+Do not treat the temporary-id record as a solved problem until Phase 10 has run. It is the one place in
+this file where the design intent and the verified behaviour have not been shown to agree.
 
 **Remove refusals one at a time, each with its own saline test.** Never in a batch. The
 procedures are in `SALINE_TEST_PROCEDURE.md`, one phase per refusal, each naming the read-back
@@ -2095,6 +2117,10 @@ within reach of overflowing it.
 
 ### Unit tests
 
+**Current counts, 2026-08-04: `:pump:ypso:sdk` 84, `:pump:ypso` 47 — 131 in total.** The entries below
+are dated and record what each addition covered at the time; the numbers in them are the numbers of
+that day, not of today.
+
 `:pump:ypso:sdk` now has a test source set, with **65 tests** covering the decodes the hardware
 findings live in: the CRC and GLB formats (§4a–4c), the full 18-byte status payload against both
 captured samples (§4), the 17-byte history entry and its 2000 epoch (§5), the clock decode and its
@@ -3101,8 +3127,8 @@ force is how that record is lost. If the throwaway branch comes out clean and bu
 Then, in order, and do not skip any of them:
 
 ```bash
-./gradlew :pump:ypso:sdk:testFullDebugUnitTest     # 65 tests — the wire decodes
-./gradlew :pump:ypso:testFullDebugUnitTest         # 35 tests — the plugin and the suspend logic
+./gradlew :pump:ypso:sdk:testFullDebugUnitTest     # 84 tests — the wire decodes
+./gradlew :pump:ypso:testFullDebugUnitTest         # 47 tests — the plugin, suspend and event policy
 ./gradlew :app:assembleFullDebug                   # the whole thing still builds
 ```
 
