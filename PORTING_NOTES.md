@@ -31,6 +31,12 @@ produced fourteen empty syncs and not one row in any treatment table.
 because `YpsoHistoryReadCount` applies to *each* log. A probe that reads index 0 first and skips the
 window when nothing has moved cut a quiet poll to **~580 ms**, verified in Phase 7f (§8.5).
 
+**The next piece of work is the chunked bolus — `SALINE_TEST_PROCEDURE.md` Phase 9, written and not
+yet built.** "Bolus speed" turned out to be a loop in the phone rather than a pump setting: Lotus
+issues ordinary `type=2` boluses on a timer (1 U/5 s = 12 U/min), confirmed in the pump's own log.
+It needs no new pump capability, and it is the answer to slow delivery for comfort that the extended
+bolus is not (§8.6).
+
 **Two things stand between here and an insulin trial, and neither is a capability:**
 
 1. ✅✅ **6b is closed — verified twice on 2026-08-03, on the fix and then on HEAD.** 2h33m on the

@@ -14,6 +14,10 @@ capability — with one exception, and it is first in the list below.
 renewal cycles across two builds, **zero uncovered time**, decided on the database. **Phase 6 is
 complete and no correctness gate remains open.**
 
+**Phase 8 (extended bolus) ran 2026-08-03**: it works, needs ≥15 min, and lands in the wrong table.
+**Phase 9 (chunked bolus) is written and is the next thing to build** — it is the answer to slow
+delivery for comfort, and it needs no new pump capability.
+
 **Still to run, most valuable first:**
 
 | # | Test | Why it matters | Where |
@@ -28,7 +32,7 @@ complete and no correctness gate remains open.**
 | H | **A bolus while a TBR runs** | Never tried together; both are identified by sequence | — |
 | I | **A temp basal across an hour boundary** | The same percentage becomes a different absolute rate. Inherent, but see it once | Phase 3 |
 | J | **Restore a profile you care about** | A write you cannot reverse is not finished | Phase 4 |
-| K | **Chunked bolus for comfort** | ✅ **Mechanism solved 2026-08-03, not yet implemented.** "Bolus speed" is a loop in the phone, not a pump setting: Lotus sends ordinary `type=2` boluses on a timer — **1 U/5 s = 12 U/min, 0.5 U/5 s = 6, 0.4 U/8 s = 3** — confirmed in the pump's log (five entries, 8 s apart, summing to 2.00 U). Needs its own phase: the bolus flow settles against **one** log entry and would need N | §8.6 |
+| K | **Chunked bolus for comfort** ← **START HERE NEXT SESSION** | ✅ Mechanism solved 2026-08-03, **procedure written (Phase 9), code not started.** "Bolus speed" is a loop in the phone, not a pump setting: Lotus sends ordinary `type=2` boluses on a timer — **1 U/5 s = 12 U/min, 0.5 U/5 s = 6, 0.4 U/8 s = 3** — confirmed in the pump's log (five entries, 8 s apart, summing to 2.00 U). Needs no new pump capability. **Phase 9 lists the design decisions to make before coding** | **Phase 9**, §8.6 |
 | L | **The extended bolus** | ⚠ Works, 15-min minimum, lands in `boluses` as NORMAL and its log entry carries no duration (8a/8c passed/found 2026-08-03). Superseded as the comfort route by K, which hits 12 U/min where this floors at 0.67 | **Phase 8**, §8.6 |
 
 **Closed on 2026-08-02, no longer on the list:**
@@ -1970,3 +1974,163 @@ record across a re-read; 8d and 8e both cancel cleanly with no delivery-error al
 `PumpCapability.YpsomedCapabilities` in shared `core/data` (§9). `YpsoPluginTest` asserts the
 withdrawal, so that test is expected to be updated in the same change, and its failing is the
 reminder that this is a deliberate act rather than a tidy-up.
+
+---
+
+# Phase 9 — the chunked bolus, for comfort ⏳ **NOT STARTED**
+
+**Written 2026-08-03, before any code.** The mechanism is not a guess: it was read off mylife Lotus's
+own settings screen and then confirmed in the pump's event log, so this phase starts from a worked
+example rather than a hypothesis. That is a better position than Phases 1–8 began from, and it is
+worth not squandering by skipping the gates.
+
+## What this is, and why it replaced the extended bolus
+
+**The goal is comfort on large boluses.** The pump delivers a commanded bolus at a fixed **~33 U/min**
+(§8.6), so 10 U goes in over 18 seconds. Other pumps take minutes.
+
+**"Bolus speed" is not a pump setting. It is a loop in the phone.** Lotus's four options are labelled
+with their own implementation:
+
+```
+unlimited              33.3 U/min — the pump's native rate, no chunking
+12 U/min   =  1 U   per 5 s
+ 6 U/min   =  0.5 U per 5 s
+ 3 U/min   =  0.4 U per 8 s
+```
+
+Confirmed on 2026-08-03 in the pump's log — a 2 U bolus from Lotus at 3 U/min:
+
+```
+seq=160875 type=2(Bolus Immediate) v1=41  -> 0.41 U
+seq=160876 type=2(Bolus Immediate) v1=41  -> 0.41 U   +8 s
+seq=160877 type=2(Bolus Immediate) v1=41  -> 0.41 U   +8 s
+seq=160878 type=2(Bolus Immediate) v1=41  -> 0.41 U   +8 s
+seq=160879 type=2(Bolus Immediate) v1=36  -> 0.36 U   +8 s
+                                             = 2.00 U exactly
+```
+
+Five ordinary standard boluses, the last trimmed so the total lands exactly. **Nothing is written to
+the pump.** So this needs no new pump capability, no new wire format, and no new event type — every
+chunk is the `type=2` bolus this driver has delivered and confirmed since Phase 2.
+
+**Why not the extended bolus (Phase 8).** It works, but floors at a **15-minute minimum** — 0.67 U/min
+for a 10 U dose, far slower than the 12 U/min asked for — and it lands in `boluses` as `NORMAL` with
+no duration in its log entry, so it cannot even be recorded correctly without more work. Phase 8's
+findings stand on their own; they are just not the answer to this question.
+
+## ⚠ This reverses an argument these notes made first
+
+When the question was first asked, this file argued **against** driver-side chunking on §0 grounds:
+*"the pump owns the bolus once it has been told"*, and chunking makes the phone the sequencer. The
+objection was over-stated, and three things moved it:
+
+- **Every chunk is a complete, pump-owned, pump-logged bolus.** A phone that dies mid-sequence simply
+  stops issuing chunks; the pump finishes the one in flight and no more. That is **under**-delivery,
+  and the driver can report exactly what went in because every chunk is in the log — which is what
+  §4f's partial-bolus path already does for a cancelled bolus.
+- **The manufacturer's own app does this**, on this pump, with these parameters.
+- **The history sync already handles the result**, demonstrated without being asked to: all five
+  chunks above imported as separate records totalling 2.00 U, while AAPS's own bolus stayed a single
+  live row (7c holding under a five-entry burst).
+
+Recorded because a future reader will find both arguments in this repository and should know which
+one the evidence settled on, and why.
+
+## Design decisions to make BEFORE writing code
+
+Each of these changes what the tests must check. Decide them, write them down, then build.
+
+| Question | Options | Note |
+|---|---|---|
+| **Where does the loop live?** | `YpsoPumpManagerImpl.deliverBolusConfirmed`, or a layer above it | Below the mutex means the whole sequence holds `withConnection`, which is what keeps a second command from interleaving mid-sequence |
+| **Confirm each chunk, or only the total?** | per-chunk echo (`fastTotal`) then one log read at the end | A silently-dropped chunk must not pass unnoticed. The gap is 5–8 s, so there is time |
+| **One AAPS record or N?** | N (what the pump did) vs 1 synthetic (what the user asked for) | N is *accurate* and the sync produces it anyway. 1 would fight the sync on every re-read |
+| **What does `success` mean at chunk 7 of 10?** | `success=false`, `bolusDelivered` = sum of confirmed chunks | §0: never report more than the pump confirmed, but record the full amount that went in |
+| **Does the preference survive?** | `YpsoBolusSpeed` currently controls nothing and is due for deletion (§8.6) | If chunking lands, it becomes real for the first time — and needs a **fourth** option, 6 U/min, which the current three-way list is missing |
+| **Ceiling on duration?** | 10 U at 12 U/min = 50 s of held command queue | Compare: the standard bolus already holds it for ~20 s. A cap on total sequence time is worth considering |
+
+## Before starting
+
+- Saline, off-body, cannula to air. Full cartridge.
+- Study phone (Lotus) **off** — it rewrites the basal profile on connect (§4i, confirmed twice).
+- NSClient uploading off.
+- ⚠ **Phase 8's extended bolus stays refused and unadvertised throughout.** Two delivery changes at
+  once is exactly what §0 forbids.
+
+## 9a. Two chunks — the smallest thing that is a sequence
+
+**The question:** does a sequence work at all, and does the command queue survive it?
+
+1. Bolus **2 U at 12 U/min** — should be 2 chunks of 1 U, 5 s apart.
+2. While it runs, watch whether anything else can reach the pump.
+
+**Confirm:**
+
+- The pump logs **exactly two** `type=2` entries, ~5 s apart, summing to **2.00 U**.
+- `bolusDelivered` is 2.0 and `success=true`.
+- The reservoir falls by 2.0 U.
+
+⚠ **The check that could be written so it cannot fail:** a 2 U bolus delivered *unchunked* also ends
+2.00 U down with `success=true`. **Only the log entry count and their timestamps distinguish the two.**
+Read them, not the total.
+
+## 9b. Cancel mid-sequence
+
+**The question:** does `stopBolus` stop the *sequence*, or only the chunk in flight?
+
+1. Bolus **6 U at 3 U/min** — ~15 chunks over ~2 minutes.
+2. Cancel from AAPS after ~30 s.
+
+**Confirm:** no further `type=2` entries appear after the cancel; `bolusDelivered` equals the sum of
+the entries that did land; `success=false`. **A sequence that keeps going after a cancel is the worst
+failure this phase can produce** — the user has asked it to stop and insulin is still going in.
+
+## 9c. Connection lost mid-sequence
+
+**The question:** the one the §0 objection was about. Answer it deliberately rather than discovering it.
+
+1. Bolus **6 U at 3 U/min**.
+2. Pull the pump out of BLE range after ~30 s.
+
+**Confirm:** delivery **stops** (chunks are issued by the phone, so no phone means no chunks); the
+pump's log contains only the chunks that were sent; and once reconnected, AAPS's record equals that
+sum and no more. **Under-delivery reported honestly is a pass. Over-reporting is a failure.**
+
+## 9d. The record, and IOB
+
+Query the database, not the log — §5c-ii's lesson:
+
+```sql
+select datetime(timestamp/1000,'unixepoch','localtime') ts, amount, pumpId, isValid, referenceId
+from boluses order by timestamp desc limit 20;
+```
+
+**Confirm:** the live rows (`referenceId is null`) sum to what the pump delivered, with no duplicates
+and no missing chunk. Then **re-read history** and confirm the count does not change — the sync must
+be idempotent across a chunked bolus exactly as 7c proved it is for a single one.
+
+## 9e. A chunk the pump refuses
+
+**The question:** what happens when chunk N is rejected — the pump's own max bolus, or an alarm
+stopping delivery partway.
+
+Reachable by forcing an occlusion mid-sequence, which this pump raises reliably (§8.2).
+
+**Confirm:** the sequence **stops** rather than continuing to hammer a stopped pump; the amount
+reported is what the log shows; and the alarm still reaches AAPS as an urgent notification.
+
+## What cannot be tested here
+
+**Whether the chunk parameters are right for comfort.** 1 U per 5 s is Lotus's number, not a measured
+optimum, and comfort is not something a saline bench can assess. Take the manufacturer's figures and
+do not invent others.
+
+## Phase 9 is passed when
+
+9a shows the **right number of log entries at the right spacing** (not merely the right total); 9b
+stops the sequence on cancel; 9c under-delivers honestly on a lost link; 9d's live rows sum correctly
+and survive a re-read; and 9e stops on a refused chunk.
+
+**Then, and not before**, `YpsoBolusSpeed` becomes a real preference for the first time — and it needs
+its fourth option, **6 U/min**, which the current three-way list is missing (§8.6).

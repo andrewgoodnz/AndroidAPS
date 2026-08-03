@@ -252,6 +252,29 @@ change to the framing code.
 
 Stated plainly, because this is the question the whole project is pointed at.
 
+### Next up: the chunked bolus (Phase 9)
+
+**The one piece of work with a written procedure and no code yet.** The pump delivers a commanded
+bolus at a fixed ~33 U/min, so 10 U goes in over 18 seconds — uncomfortable for large doses where
+other pumps take minutes.
+
+mylife Lotus solves this **entirely in the phone**: its "bolus speed" setting is a chunk size and an
+interval, not a pump setting. Confirmed in the pump's own log on 2026-08-03 — a 2 U Lotus bolus at
+3 U/min appeared as five ordinary `type=2` boluses 8 s apart, summing to exactly 2.00 U.
+
+```
+12 U/min  =  1 U   per 5 s
+ 6 U/min  =  0.5 U per 5 s
+ 3 U/min  =  0.4 U per 8 s
+```
+
+So this needs **no new pump capability, no new wire format and no new event type** — every chunk is
+the standard bolus this driver has delivered and confirmed since Phase 2.
+`SALINE_TEST_PROCEDURE.md` **Phase 9** has the procedure and, more importantly, the design decisions
+to settle before writing any code.
+
+---
+
 **No correctness gate is open.** Phase 6b — the last one — closed on 2026-08-03, verified twice:
 2h33m of stopped pump on one build (four renewal cycles), then re-confirmed on the current build
 after a flash (three more), with **zero uncovered time at every transition, including across the
