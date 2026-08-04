@@ -27,13 +27,23 @@ Nothing was dosed blind: AAPS's accounting was correct throughout and knew exact
 The high temp simply ran to its natural end because nothing could replace it, and was cancelled by
 hand. The pump went back on saline the same day.
 
-**`SALINE_TEST_PROCEDURE.md` Phase 11 is written to settle it and has not been run.** Two hypotheses
-survive — 0% is never accepted, or nothing can be replaced while a temporary basal is running — and
-only one combination was ever exercised. **Cancelling to 100% works**, so if it is the replacement
-rule the fix is small.
+**Phase 11 ran on saline the same evening and settled it. The cause is not 0%.**
 
-Until Phase 11 passes: **do not close the loop with insulin in this pump.** Manual and open-loop use
-are a separate question this finding does not settle.
+| | | |
+|---|---|---|
+| 0% from idle | **accepted**, and delivery genuinely stops | reservoir unmoved for 19 min |
+| a running TBR replaced by another | **refused** | 150% running, 400% asked, refused |
+
+**This pump will not replace a running temporary basal with any other value.** It will cancel one
+(to 100%) — that path works and always has. So the loop can start a temp basal and it can cancel one,
+but it cannot *adjust* one, and oref1 adjusts constantly.
+
+**The fix is therefore small and known:** `setTbrConfirmed` should cancel first when it finds a
+temporary basal already running, then set — building on a primitive that already works. Phase 11d
+requires that sequence demonstrated by hand before the code is written.
+
+Until that fix exists and is tested: **do not close the loop with insulin in this pump.** Manual and
+open-loop use are a separate question this finding does not settle.
 
 ⚠ **A second gate is open and it is not about the pump.** **Phase 10 — what AAPS's database holds
 after a bolus is interrupted** by a dropped link or a killed app — is written and has never been run,

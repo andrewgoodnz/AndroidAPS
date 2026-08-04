@@ -61,15 +61,13 @@ licensed the option; it did not change anything for anyone who has not picked on
 
 ## What is still open
 
-⚠⚠ **1. Phase 11 — a running temporary basal cannot be replaced by 0%.** Found on insulin, on a
-person (§4h). The refusal is the pump's: `tbrPercentRange` is `0..500`, so 0 clears the guard and the
-write itself fails. **Cancel to 100% works**, and that asymmetry is the lead — the pump will change a
-running temporary basal to *none*, but apparently not to *another*. Only one combination has ever been
-exercised, so two hypotheses survive: 0% is never accepted, or nothing can be replaced while running.
-Phase 11 is a 2×2 written to separate them, with a control that must reproduce the field refusal on
-the bench. If it is the replacement rule, the fix is cancel-then-set — a few lines against a primitive
-that already works — and 11d requires it demonstrated by hand before the code exists. **This is the
-one that decides whether the driver can loop at all.**
+⚠⚠ **1. A running temporary basal cannot be replaced — [verified] on saline, cause known, fix not yet
+written.** Found on insulin on a person, then settled on the bench the same evening (§4h). **0% was
+never special:** a 0% from idle is accepted and genuinely stops delivery, while a **400% request was
+refused with 150% running**. The pump starts temporary basals and cancels them; it does not change a
+running one. oref1 adjusts constantly, so **this is what decides whether the driver can loop at all.**
+The fix is `setTbrConfirmed` cancelling first and then setting, on a primitive that already works;
+Phase 11d requires it shown by hand before the code exists.
 
 ⚠⚠ **2. Phase 10 — the interrupted bolus. Written, unrun, and the code predicts it will fail.**
 This one is about **what AAPS's own database holds
@@ -1072,15 +1070,32 @@ because nothing could replace it.
 seen succeeding repeatedly the same day, including immediately after these refusals. So the pump will
 change a running temporary basal to *none*; what it would not do is change one to *another*.
 
-**Two hypotheses, and only one combination has ever been exercised** (0% while 400% ran), so the log
-cannot separate them: either 0% is never accepted, or no new temporary basal is accepted while one is
-running. `SALINE_TEST_PROCEDURE.md` **Phase 11** is written to settle it with a 2×2 — 0% from idle
-against a non-zero replacement — plus a control that must reproduce the field refusal on the bench.
+#### ✅❌ [verified] Settled the same evening on saline — it is the replacement, not the zero
 
-**If it is the replacement rule, the fix is small** and belongs in `setTbrConfirmed`: cancel first,
-then set, against a primitive that already works. Phase 11d requires that sequence to be demonstrated
+Phase 11 ran on the bench a few hours later and separated the two hypotheses:
+
+- **0% from idle is accepted**, and it genuinely stops delivery — the reservoir did not move for 19
+  minutes where 0.3 U/h would have consumed ~0.095 U. It also leaves `delivering=true` and
+  `suspendRecord=none`, so no competing suspend record opens. **H-ZERO is refuted.**
+- **A running temporary basal cannot be replaced by another, at any percentage.** With **150%
+  running** (byte 10 = 0x96, 23 min left) a request for **400%** was refused with the identical
+  message. **H-REPLACE is confirmed.**
+
+So the rule is: this pump will start a temporary basal, and will cancel one to 100%, but will **not
+change a running one to another value**. Nothing about zero was ever special.
+
+**The fix belongs in `setTbrConfirmed`: cancel first when a temporary basal is already running, then
+set.** It builds on `cancelTbrConfirmed`, which works. Phase 11d requires the sequence demonstrated
 **by hand before the code is written**, because a failure by hand is information about the pump and a
 failure afterwards is ambiguous between the pump and the patch.
+
+⚠ **And the reason nine phases missed it is structural, not careless.** When a temporary basal is
+running, AAPS's Actions tab replaces the `TEMPBASAL` button with `CANCEL n%` — there is no "set a
+different one" affordance. Every phase from 1 to 9 was driven by hand through that UI, so **a manual
+tester cannot attempt a replacement at all.** The path is reachable only from the loop, which calls
+`setTempBasalAbsolute` directly. The combination was not merely unconsidered; it was **unreachable by
+the test method**, and the only instrument that reaches it is a running loop — which produced it seven
+minutes after one was pointed at the pump.
 
 ⚠ **Until Phase 11 passes, this driver is not fit for closed-loop use with insulin.** Manual and
 open-loop use are a separate question; what is established is that the loop cannot reliably reduce
