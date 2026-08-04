@@ -3070,8 +3070,69 @@ from a real trial rather than a precaution.
 
 | Step | What | Expected | Result |
 |---|---|---|---|
-| 11a 0% from idle | 0% / 30 min from `tbr=none` | unknown — the question | ⏳ **NOT RUN** |
-| 11b replace non-zero | 150% running → 80% | unknown — the question | ⏳ **NOT RUN** |
-| 11c field control | 400% running → 0% | **refused**, matching the field | ⏳ **NOT RUN** |
-| 11d cancel-then-set | 400% → cancel → 0% | accepted | ⏳ **NOT RUN** |
-| 11e zero temp endures | 0% / 30 min, watched | byte 10 stays 0, reservoir static | ⏳ **NOT RUN** |
+| 11a 0% from idle | 0% / 30 min from `tbr=none` | unknown — the question | ✅ **ACCEPTED — 2026-08-04 20:18** |
+| 11b replace non-zero | a TBR running → a different one | unknown — the question | ❌ **REFUSED — 2026-08-04 20:49** |
+| 11c field control | reproduce the field refusal | **refused** | ✅ **REPRODUCED — same message** |
+| 11d cancel-then-set | TBR → cancel → new TBR | accepted | ⏳ **NOT RUN** |
+| 11e zero temp endures | 0% / 30 min, watched | byte 10 stays 0, reservoir static | ⚠ **ENDED EARLY — see below** |
+
+### ✅❌ **RESOLVED 2026-08-04: it is H-REPLACE. 0% was never special.**
+
+**11a — 0% from idle is accepted, and it genuinely stops delivery.**
+
+```
+20:18:05  Starting TBR: 0% for 30min
+20:18:05  TBR: writing 16B … payload: 00 00 00 00 FF FF FF FF 1E 00 00 00 E1 FF FF FF
+20:18:05  Status: Running, Rate: 0.0U/h, TBR 0% 30min left
+20:18:07  TBR confirmed by read-back: 0% with 30min left, logged as seq=161453 v1=0 v2=30
+20:18:07  setTempBasalPercent: asked 0% for 30min, confirmed=true
+```
+
+Adjudicated against the reservoir, not the read-back: **81.39 U at 20:18, still 81.39 U at 20:37** — 19
+minutes with no movement, where 0.3 U/h would have consumed ~0.095 U and the preceding readings fell
+~0.08 U per 20 min. Delivery really stops. ⚠ And the interaction nobody had reasoned through is
+benign: `delivering=true` and `suspendRecord=none` throughout, so **a 0% TBR does not make the pump
+report itself stopped** and no competing `PUMP_SUSPEND` record opens.
+
+**11b — a running temporary basal cannot be replaced, at any percentage.** Produced by the loop
+itself, which is the only thing that can reach this path (see below):
+
+```
+20:49:54  Status: Running, Rate: 0.45U/h, TBR 150% 23min left
+          raw = 0A C4 1F 00 00 02 2D 00 00 00 96 00 00 00 17 00 00 00
+                                        ^^byte6=0x2D=45      ^^byte10=0x96=150   ^^byte14=0x17=23min
+20:49:55  setTempBasalPercent: asked 400% for 30min, confirmed=false, The pump refused the temporary basal command
+20:49:55  CommandTempBasalAbsolute: Result rate: 1.2 durationInMinutes: 30 success: false enacted: false
+```
+
+**150% running, 400% requested, refused.** Both non-zero, both mid-range, and the refusal message is
+identical to the field's. Taken with 11a this settles the 2×2: **H-ZERO is refuted and H-REPLACE is
+confirmed.** The pump will change a running temporary basal to *none* (cancel works) but not to
+another value.
+
+### ⚠⚠ Why no bench phase could ever have found this — the UI forbids it
+
+**When a temporary basal is running, AAPS's Actions tab replaces the `TEMPBASAL` button with
+`CANCEL 150%`.** There is no "set a different one" affordance at all. Every phase from 1 to 9 was run
+by hand through that UI, so **a manual tester physically cannot attempt a replacement.** The path is
+reachable only from the loop, which calls `setTempBasalAbsolute` directly and bypasses the button.
+
+That is a stronger statement than "nobody thought of the combination". The combination was
+*unreachable by the test method*, and the only instrument that reaches it is a running loop. Which is
+why this was found seven minutes after a loop was pointed at the pump, and not in nine phases of
+careful manual work.
+
+### ⚠ 11e, unplanned: a 0% TBR ended ~10 minutes early, and nothing cancelled it
+
+The 0% set at 20:18:05 for **30 minutes** read `0% 11min left` at 20:37:24, and by 20:42:36 the pump
+reported `tbr=none` with the reservoir moving again (81.39 → 81.36). AAPS's own record agrees —
+`temporaryBasals` row 78 carries **duration 20 min**, not 30.
+
+**Nothing cancelled it.** The driver was disconnected from 20:37:25 to 20:42:32; no command was sent
+in that window, and the loop was not running yet.
+
+⚠ **One observation, not a conclusion.** It has not been repeated, the reservoir arithmetic has ~1 min
+of slack in it, and no TBR in this session has yet been watched across its *full* programmed duration
+uninterrupted. If it is real it matters a great deal — a loop that sets a 60-minute zero temp and gets
+20 minutes of one would under-deliver against its own model in the hypo direction. **Watch it
+continuously; do not infer it from two samples five minutes apart.**
