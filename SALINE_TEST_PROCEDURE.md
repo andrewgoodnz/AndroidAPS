@@ -3110,6 +3110,29 @@ identical to the field's. Taken with 11a this settles the 2×2: **H-ZERO is refu
 confirmed.** The pump will change a running temporary basal to *none* (cancel works) but not to
 another value.
 
+### What the loop can and cannot do — observed over three hours of saline looping
+
+The refusal is narrower than "the loop cannot drive this pump". Watching a real closed loop from
+20:18 to 21:52 shows exactly three behaviours, and only one of them fails:
+
+| Loop action | Result | Seen |
+|---|---|---|
+| set a temporary basal **from `tbr=none`** | ✅ accepted | 0% at 20:18, 150% at 20:42, 400% at 21:19 |
+| **cancel** a running temporary basal | ✅ accepted | 400% cancelled at 21:44 with 5 min left |
+| **replace** a running one with another | ❌ refused | 5 × 400%-while-150%-ran, 20:49–21:09 |
+
+**So the loop is degraded rather than frozen.** It can still reach any rate it wants, but only by
+passing through idle — and it does not know to do that, so when it wants a *different* rate it simply
+retries the replacement every loop cycle and is refused every time until the running TBR expires or it
+independently decides to cancel. Five consecutive refusals across 20 minutes is what that looks like.
+
+⚠ **And this is the fix, demonstrated by the loop itself without a line of code being written.** Both
+halves of cancel-then-set were exercised repeatedly and both work; the only untried part is doing them
+back to back inside one connection, which is what 11d asks for. Worth noting too that the cancel
+recorded `Recorded TBR stop under endPumpId=161455, new=true` — **the pump's own sequence, not the
+`dateUtil.now()` fallback** that §4h flags as wanting rework. In the ordinary cancel path that fallback
+is not reached.
+
 ### ⚠⚠ Why no bench phase could ever have found this — the UI forbids it
 
 **When a temporary basal is running, AAPS's Actions tab replaces the `TEMPBASAL` button with
