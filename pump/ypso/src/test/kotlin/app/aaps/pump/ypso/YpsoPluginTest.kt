@@ -189,6 +189,32 @@ class YpsoPluginTest : TestBaseWithProfile() {
     }
 
     @Test
+    fun `after a restart the pump reads as suspended until it answers, and that is every restart`() {
+        // ⚠ This is the SAME condition as the test above, and for a long time that was the only way
+        // it was read — as "a genuinely stopped pump". It is also the state of every single app
+        // start, which is a different situation with different consequences, and nothing said so.
+        //
+        // `lastConnection` is persisted in preferences; `isDelivering` is a plain in-memory field
+        // that starts false. So after any restart both are true at once — a pump that has answered
+        // (once, in some previous process) and is not delivering (as far as this process knows).
+        // Observed on hardware 2026-08-04: AAPS opened SUSPENDED_BY_PUMP for 30.3 s on a pump that
+        // was running the whole time, cancelled the temporary basal, and then healed itself.
+        //
+        // It is left this way deliberately. Before the first read the pump's state is genuinely
+        // unknown, and "suspended" is the conservative guess — it withholds dosing rather than
+        // dosing blind. Medtrum, the driver this one is shaped on, does exactly the same thing
+        // (`pumpState` starts at NONE, and NONE < ACTIVE). Dana and Diaconn guess the other way.
+        whenever(preferences.get(YpsoLongNonKey.LastConnection)).thenReturn(1_785_000_000_000L)
+        // isDelivering is left at its constructed default on purpose — that IS the restart state.
+        assertThat(ypsoPump.isDelivering).isFalse()
+        assertThat(plugin.isSuspended()).isTrue()
+
+        // The first status read that finds the pump running is what ends it.
+        ypsoPump.isDelivering = true
+        assertThat(plugin.isSuspended()).isFalse()
+    }
+
+    @Test
     fun `model and manufacturer are the ones the rest of AAPS keys on`() {
         assertThat(plugin.model()).isEqualTo(PumpType.YPSOPUMP)
         assertThat(plugin.pumpDescription.pumpType).isEqualTo(PumpType.YPSOPUMP)

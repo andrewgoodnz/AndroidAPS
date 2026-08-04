@@ -154,6 +154,44 @@ empty — so the driver can tell "no cartridge" from "empty cartridge" even thou
 `3` for both. Running dry also raises a real pump alert (`104 Cartridge Empty`, urgent); a *low*
 reservoir never does.
 
+### ⚠ Every AAPS restart suspends the loop for ~30 s and cancels any running temp basal
+
+**Measured on hardware, 2026-08-04.** This is not a fault to report; it is what the driver does, and
+it is documented here because on a looping phone it is visible and looks alarming.
+
+On every app start AAPS logs `SUSPENDED_BY_PUMP — Pump suspended`, suspends the loop, and issues a
+`cancelTempBasal` — **even though the pump is running normally.** About 30 seconds later, when the
+first status read comes back, it logs `PUMP_RUNNING — Pump running` and resumes. Timed at **30.3 s**
+on the test tablet, on a pump that was delivering throughout with a falling reservoir.
+
+The cause is one line, and it is deliberate:
+
+```kotlin
+override fun isSuspended(): Boolean = ypsoPump.lastConnection > 0 && !ypsoPump.isDelivering
+```
+
+`lastConnection` is persisted in preferences; `isDelivering` is in-memory and starts `false`. So
+immediately after a restart both conditions hold, and the driver reports "suspended" until it has
+actually read the pump.
+
+**Why it is left this way.** Before the first read the pump's state is genuinely unknown, and the two
+possible guesses are not symmetric: guessing "suspended" withholds dosing for half a minute, while
+guessing "running" would let the loop dose into a pump that might be stopped. **Medtrum — the driver
+this one is shaped on — behaves identically** (its `pumpState` starts at `NONE`, and `NONE < ACTIVE`
+reads as suspended). Dana and Diaconn guess the other way.
+
+**What it actually costs you, and the one part that matters:**
+
+- ~30 s of no loop after each restart, self-healing. Harmless.
+- A `SUSPENDED_BY_PUMP` / `PUMP_RUNNING` pair in the therapy log on each restart. Noise, but it is
+  noise in the record you would use to reconstruct a day.
+- ⚠ **A running temporary basal is cancelled** — this is AAPS's `suspendLoop` doing it, not the
+  driver. After a phone reboot or an app restart mid-TBR, that TBR is gone and the loop must
+  re-establish it on its next iteration. It errs towards less insulin, not more.
+
+If you want the loop up faster after a restart, open the YPSO tab and press **Refresh** — the
+suspension ends on the first successful status read, not on a timer.
+
 ### Smaller ones
 
 - **A low reservoir is not a pump alert.** The mylife controller computes it on the phone; nothing
