@@ -131,10 +131,18 @@ cleared the TBR-replace case: both operations work alone, both are identified by
 looks safe.
 
 `SALINE_TEST_PROCEDURE.md` now carries a **combination matrix** — `command × the pump's state when it
-arrives` — with what has been run, what has not, and the two entries promoted out of "someday" by this
-finding: a **basal profile write while a temporary basal runs** (a TBR is a percentage, so rewriting
-the profile underneath it silently changes the delivered rate), and **6e's unrun second half**,
+arrives` — with what has been run, what has not, and the entries promoted out of "someday" by this
+finding: a **basal profile write while a temporary basal runs**, and **6e's unrun second half**,
 stopping the pump while a real TBR runs. Every "low risk" adjective on that axis has been withdrawn.
+
+⚠ **And immediately a demonstration of how the same mistake is made.** The first draft of the
+profile-write entry asserted that rewriting the profile under a running TBR *silently* changes the
+delivered rate. The rate does change — but the "silently" was written without checking how the TBR is
+recorded, and it is recorded with `isAbsolute = false` and `rate = percentage`, so AAPS applies the
+same percentage to the same new profile and the two track each other. Corrected within the hour, and
+left visible in the procedure, because inventing a hazard and inheriting one cost the same to
+investigate and only one of them is real. **The rule that catches both is the same: look at the
+inputs.**
 
 ### And a companion lesson, learned the same day it was written down
 

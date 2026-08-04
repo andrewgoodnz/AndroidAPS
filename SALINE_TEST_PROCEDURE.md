@@ -49,7 +49,7 @@ this driver is not fit for closed-loop use with insulin.
 | F | **Kill AAPS mid-bolus** | 📝 **Written as Phase 10b/10d, 2026-08-04, not yet run.** Force-stop during delivery. The provisional is a committed row so it should survive; what is untested is whether anything ever reconciles it. This decides whether `PumpSyncStorage` is needed, and Phase 10b records what each outcome would mean **before** the run | **Phase 10**, §4g |
 | G | **Change the phone's timezone** | ⏳ **UNTESTED, and going into therapy use untested.** The driver should queue a clock sync and the pump's clock should follow. `canHandleDST()` is false and `timezoneOrDSTChanged` queues the write, so the path exists and has never been exercised end to end. The failure mode if it is wrong is history timestamps an hour out, which §5 has already produced once | §8.6 |
 | H | **A bolus while a TBR runs** | ⏳ **UNTESTED, and the "low risk" that used to be written here is withdrawn.** The reasoning was that both operations work alone and both are identified by sequence — which is *exactly* the reasoning that would have rated "replace a running TBR" low risk the day before it failed on a person. Nothing on the command × pump-state axis is low risk until it has been run | **combination matrix** |
-| H2 | ⚠⚠ **A basal profile write while a TBR runs** | ⏳ **UNTESTED, and newly identified 2026-08-04.** A TBR here is a **percentage**, and the pump logs it as one — so rewriting the 24 slots underneath a running TBR silently changes the delivered rate with nothing in either record to say so. Item I is the same phenomenon at an hour boundary and is inherent; this one is a write AAPS chooses to make, at a moment it chooses | **combination matrix**, §4h |
+| H2 | **A basal profile write while a TBR runs** | ⏳ **UNTESTED, identified 2026-08-04.** The delivered rate does change across the write, because the pump applies the percentage to the new base. It should stay *consistent*: the driver records the TBR as a percentage (`isAbsolute = false`), so AAPS applies the same percentage to the same new profile, and `writeBasalProfile` verifies all 24 slots. **Nothing checks for a running TBR before writing, though**, and the agreement is two independent calculations rather than an enforced invariant. Realistic trigger: an exercise profile change landing while the loop holds a TBR | **combination matrix**, §4h |
 | H3 | ⚠ **6e — stop the pump while a real TBR runs** | ⏳ **Written, unrun, no pass marker.** The procedure calls it "the interaction with the least analysis behind it" and says the row exists to be observed rather than confirmed. After Phase 11, an unanalysed interaction between the suspend record and a running TBR is not a curiosity | **6e** |
 | I | **A temp basal across an hour boundary** | ⏳ **UNTESTED.** The same percentage becomes a different absolute rate. Inherent behaviour rather than a defect, but worth seeing once | Phase 3 |
 | J | **Restore a profile you care about** | ⏳ **UNTESTED.** A write you cannot reverse is not finished. Matters at the moment of switching pumps, not during steady use | Phase 4 |
@@ -83,14 +83,22 @@ stays stopped, an alarm stays raised. That is where the untested ground is.
 **Three of these deserve promoting above "someday", and one of them was already written down and
 dismissed:**
 
-1. ⚠⚠ **A basal profile write while a temporary basal is running.** A TBR on this pump is a
-   **percentage**, and the pump's own log entry records the percentage rather than an absolute rate
-   (§4h). So rewriting the 24-slot profile underneath a running TBR silently changes the delivered
-   rate, with nothing in either record to show it happened. Item I already notes the slow version of
-   this — the same percentage becoming a different absolute rate at an hour boundary — and calls it
-   inherent behaviour. **A profile write is the same phenomenon arriving in one second, under AAPS's
-   control, at a moment AAPS chooses.** That is not inherent behaviour; that is a write whose effect
-   depends on state nobody checked.
+1. ⚠ **A basal profile write while a temporary basal is running** — and the first draft of this entry
+   overstated it, which is worth leaving visible. Rewriting the 24 slots under a running TBR **does**
+   change the delivered rate immediately, because the pump applies the percentage to whatever base it
+   now holds. The claim that it does so *invisibly* was wrong: the driver records the TBR with
+   `isAbsolute = false` and `rate = percentage`, so **AAPS's own model applies the same percentage to
+   the same new profile** and the two stay in agreement. `writeBasalProfile` also confirms all 24
+   slots read back and drops its cache on failure, so a partial write cannot quietly leave the two
+   sides disagreeing.
+
+   **What remains worth one run** is that no code anywhere checks for a running TBR before writing the
+   profile, and the agreement above is a property of two independent pieces of arithmetic rather than
+   anything enforced. The realistic trigger is ordinary: a profile percentage change for exercise
+   (~4–5× a week per §8.5) landing while the loop happens to hold a temporary basal. Watch the
+   effective rate on the pump and the rate AAPS believes, across the write, and confirm they agree.
+   Item I is the same phenomenon arriving slowly at an hour boundary and is inherent; this one arrives
+   in a second, at a moment AAPS chooses.
 
 2. ⚠ **6e's second half — stop the pump while a real TBR is running.** It is written, it has no pass
    marker, and the procedure describes it in its own words as *"the interaction with the least
