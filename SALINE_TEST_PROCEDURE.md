@@ -3136,3 +3136,27 @@ of slack in it, and no TBR in this session has yet been watched across its *full
 uninterrupted. If it is real it matters a great deal — a loop that sets a 60-minute zero temp and gets
 20 minutes of one would under-deliver against its own model in the hypo direction. **Watch it
 continuously; do not infer it from two samples five minutes apart.**
+
+#### ✅ The control arrived the same evening: a **non-zero** TBR runs its full duration exactly
+
+The 150% set at 20:42:38 for 30 min was polled every ~5 minutes by the loop and tracked perfectly:
+
+| elapsed (wall) | pump says elapsed | drift | reservoir | used | expected @0.45 U/h |
+|---|---|---|---|---|---|
+| 0.0 | 0 | 0.0 | 81.36 | 0.000 | 0.000 |
+| 7.3 | 7 | 0.3 | 81.32 | 0.040 | 0.055 |
+| 12.2 | 12 | 0.2 | 81.27 | 0.090 | 0.091 |
+| 17.1 | 17 | 0.1 | 81.25 | 0.110 | 0.129 |
+| 22.1 | 22 | 0.1 | 81.21 | 0.150 | 0.166 |
+| 27.1 | 27 | 0.1 | 81.16 | **0.200** | **0.203** |
+
+**Countdown drift under 0.3 min across 27 minutes, and 0.200 U consumed against 0.203 U expected.** So
+the pump honours a non-zero temporary basal for its whole programmed duration *and* delivers exactly
+the rate it claims — 0.45 U/h being 150% of the 0.3 U/h base.
+
+⚠ **That makes the early ending look specific to 0%, not general to temporary basals** — which is a
+different and more troubling shape, because 0% is the one the loop depends on for backing off. It is
+still **one observation of each**. What would settle it is a 0% left alone and polled continuously
+across its full duration, with the reservoir read at both ends. Until that exists, treat "a zero temp
+may quietly end early" as **suspected and unconfirmed**, and do not build the cancel-then-set fix on
+an assumption that a zero temp, once accepted, stays.
