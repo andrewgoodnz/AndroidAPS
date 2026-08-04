@@ -133,31 +133,38 @@ SMB every five minutes does not.
 
 These are the things a new user should be told before they find them.
 
-### The pump logs no cannula-priming event, so CAGE cannot restart itself
+### ✅ CAGE *does* restart itself — use the pump's **cannula fill** step, not a big prime
 
-**There is no `type=25` anywhere in this pump's history**, and it is worse than an omission. AAPS's
-site-change age timer (CAGE) is driven by a `CANNULA_CHANGE` therapy event; the driver maps type 25
-to exactly that, and the pump has never emitted one.
-
-**A cartridge change on 2026-08-03 with a deliberate 30 U cannula prime settled it:**
+**This section said the opposite until 2026-08-05, and the correction is more useful than the
+original claim.** AAPS's site-change timer (CAGE) is driven by a `CANNULA_CHANGE` therapy event, which
+the driver maps from `type=25`. It works:
 
 ```
-06:28:06  INSULIN_CHANGE   rewind
-06:31:24  TUBE_CHANGE      14.35 U prime (tubing)
-06:35:13  TUBE_CHANGE      30 U prime — the cannula prime
-06:37:43  INSULIN_CHANGE   second rewind
+06:54:20  type=16  rewind            → INSULIN_CHANGE   (IAGE restarts)
+06:55:04  type=4   2.0 U prime       → below the tube-change threshold, correctly not recorded
+06:55:11  type=25  0.3 U cannula fill → CANNULA_CHANGE  (CAGE restarts)
 ```
 
-The cannula prime arrived as `type=4`, **the same event as the tubing prime**. So the pump gives no
-signal that separates the two, and there is nothing to remap CAGE onto — the only candidate is
-indistinguishable from an event that is not a site change.
+**The pump does distinguish the two primes**: `type=4` is the tubing, `type=25` is the cannula. So to
+keep CAGE honest, **complete the pump's cannula-fill step when you change a site** — the small one,
+typically a few tenths of a unit. It is the step that emits type 25, and the amount does not matter.
 
-**You must record site changes by hand in AAPS**, exactly as an MDI user does. This is a property of
-the pump's log, not a gap in the driver, and no amount of work here will change it.
+⚠ **Why this was believed impossible for weeks, because the mistake is worth more than the fact.** Two
+history dumps contained no type 25, and a cartridge change on 2026-08-03 was performed with what the
+notes called "a deliberate 30 U cannula prime" — which arrived as `type=4` and looked like proof that
+the pump could not tell the two apart. **But 30 U is a tubing fill.** The test believed it was priming
+a cannula and was in fact priming a line for the second time, so the negative result was never evidence
+about the pump at all. It is the same failure this project keeps meeting — the logic was fine, nobody
+checked what the *input* actually was.
 
-The neighbouring timers *do* fill themselves in, which is what makes this one easy to assume is
-fine: the rewind becomes an `INSULIN_CHANGE` (IAGE) and a battery removal becomes a
-`PUMP_BATTERY_CHANGE` (BAGE). IAGE and battery age work; CAGE silently does not.
+⚠ **One consequence to be aware of.** The driver maps type 25 to a site change unconditionally,
+because that is what the event means. If you fill a cannula for a reason that is *not* a new site — as
+happens if you top up a cartridge and clear the line afterwards — **CAGE will restart anyway** and your
+site age will read younger than it is. That is the pump's semantics, not a decode error, and it is
+worth knowing before you trust the number.
+
+The neighbouring timers work the same way: a rewind becomes `INSULIN_CHANGE` (IAGE), a battery removal
+becomes `PUMP_BATTERY_CHANGE` (BAGE).
 
 ### The event log holds 3000 entries — roughly three months
 

@@ -131,7 +131,7 @@ occluding mid-chunk. The rest are harder to time by hand and are not claimed her
 | **A TBR cancel closing the suspend record** | ✅ Found, fixed and verified the same day (6f). It was firing **automatically on every pump stop**, not on an edge case |
 | **Change the pump's bolus increment** | ✅ **It does not bind a commanded bolus.** With the menu step at 2 U, AAPS asked for 0.3 U and got exactly that. `bolusSize = 0.1` is safe |
 | **Read the setting probe, indices 2–13** | ✅ Read. **Index 3 is the bolus increment** in centi-units, confirmed against two settings |
-| **Does a cannula-priming event exist?** | ❌ **No `type=25`, anywhere.** AAPS's site-change timer (CAGE) can never restart itself on this pump. A documented limitation now, not a silent failure waiting for Phase 7 |
+| **Does a cannula-priming event exist?** | ✅ **YES — reopened and answered 2026-08-05.** This said "no `type=25`, anywhere" for two days. A cartridge top-up with the pump's own **cannula fill** step produced `type=25` at 0.3 U and a real `CANNULA_CHANGE`; **CAGE restarts.** The 2026-08-03 "deliberate cannula prime" that proved otherwise was **30 U — a tubing fill**, so it tested the wrong action (§5c-ii) |
 | ~~Decide the alarm poll interval~~ | **Withdrawn.** Command-queue-driven connect/disconnect is how AAPS drives every pump but Insight. See §8.7 |
 
 **✅ Passed 2026-07-31 and no longer on the list:** the bolus cancelled *on the pump* (recorded 0.58 U
@@ -830,6 +830,12 @@ being given. Record whether that is what you see once the mapping exists.
 
 #### 5c-ii. …and while you are in there, find out whether type 25 exists
 
+> ✅ **ANSWERED 2026-08-05: type 25 exists and CAGE restarts.** The procedure below is kept because it
+> is what was run, and because its decision table is the reason a wrong answer stood for two days —
+> every row assumed the cannula would be primed, and no row asked *how much*. **The action that
+> produces `type=25` is the pump's own cannula-fill step (a few tenths of a unit), not a large prime.**
+> Jump to *"REOPENED 2026-08-05"* below for the evidence.
+
 **A second question the same cartridge change answers**, and it decides whether AAPS's **site-change
 timer (CAGE) will ever restart by itself.**
 
@@ -919,9 +925,40 @@ display recorded beside it.** Leave a row blank rather than guessing it.
 | **Stopped after an alarm (5b)** ✅ | **3** | same alarm acknowledged, pump stopped | open | — | `03 0F 40 00 00 02 00 00 00 00 64 00 00 00 00 00 00 00` — **byte-identical to the line above** |
 | **Cartridge removed (5c)** ✅ | **3** | pump stopped for the change, cartridge out | **open** since 06:28 | — | `03 FF FF FF FF 02 00 00 00 00 64 00 00 00 00 00 00 00` — **reservoir reads `FF FF FF FF` = −1**, and `reservoir=unknown` |
 | **Priming (5c)** ⚠ **unreachable by this method** | (`3` on both sides and throughout the procedure, but see below) | pump in the cartridge-change menu | open | — | **Liveness cannot be proved.** §8.3's bolus reading was trustworthy because its own payload showed the reservoir 0.12 U down mid-delivery. During a change the reservoir reads `-1`, so a mid-prime reading is byte-identical to one taken after it. Left unverified rather than filled in from inference |
-| **Does `type=25` exist? (5c-ii)** ✅ **CLOSED** | **No — confirmed twice, the second time with a deliberate cannula prime.** See below | | | | |
+| **Does `type=25` exist? (5c-ii)** ✅ **REOPENED AND RE-CLOSED 2026-08-05** | **YES — it exists.** The 2026-08-03 answer below was wrong because it tested the wrong action. See *"reopened"* underneath it | | | | |
 
-#### ✅ [verified] 5c-ii closed 2026-08-03 — and the answer is worse than "type 25 is missing"
+#### ⚠⚠ [verified] REOPENED 2026-08-05 — type 25 exists, and the 08-03 test primed the wrong thing
+
+**Everything in the 2026-08-03 entry below is accurate except its conclusion.** A cartridge top-up on
+2026-08-05, in which the operator went through the pump's own **cannula fill** step, produced:
+
+```
+06:54:20  type=16   rewind             → INSULIN_CHANGE   (pumpId 161526)
+06:55:04  type=4    2.0 U prime        → below the tube-change threshold, correctly not recorded
+06:55:11  type=25   0.3 U cannula fill → CANNULA_CHANGE   (pumpId 161530)
+```
+
+`CANNULA_CHANGE` has exactly one source in `YpsoEventPolicy.consumableEventFor` — `type=25` — so its
+presence in `therapyEvents` is proof the event arrived. **CAGE restarts on this pump.**
+
+⚠ **Why the earlier answer was wrong, which is the part worth keeping.** The 08-03 run used a
+**30 U "cannula prime"**. Thirty units is a *tubing* fill; a cannula fill is a few tenths. So the test
+performed a second line prime, correctly got `type=4`, and concluded from it that the pump cannot
+distinguish the two primes. **It never exercised the cannula-fill step at all.** The pump had always
+been able to tell them apart — `type=4` tubing, `type=25` cannula — and the missing thing was a button
+press, not a capability.
+
+This is the fifth time in these notes a confident negative has turned out to be a statement about the
+*inputs* rather than about the pump. The tell was available in the data the whole time: 30 U is
+visibly a line volume, and it sat in the table next to a 14.35 U prime labelled "tubing" without
+anyone asking why a cannula would need twice as much.
+
+**What this changes:** site changes no longer have to be recorded by hand *provided the operator
+completes the cannula-fill step*. ⚠ And the converse — filling a cannula for any other reason, such as
+clearing a line after a cartridge top-up, **also restarts CAGE**, so a site age can read younger than
+the site really is. That is the pump's semantics, not a decode fault.
+
+#### ❌ The superseded entry — 5c-ii "closed" 2026-08-03, wrong conclusion, kept for its lesson
 
 The 2026-08-01 change produced `seq=160635 type=16` and `seq=160637 type=4 v1=1000` and no type 25 —
 but that change **may never have primed a cannula**, so it could not settle the question. §5c-ii said

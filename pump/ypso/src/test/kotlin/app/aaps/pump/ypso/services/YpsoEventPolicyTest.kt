@@ -75,12 +75,24 @@ class YpsoEventPolicyTest {
     }
 
     @Test
-    fun `cannula priming maps to a site change - a branch no pump has ever reached`() {
-        // ⚠ Read this before trusting it. Type 25 has never appeared in this pump's log, in any
-        // state, which is why AAPS's site-change timer can never restart itself here (§8.4). The
-        // mapping is right if an entry ever appears; the test pins the mapping and this comment
-        // pins the fact that nothing has exercised it against real data.
+    fun `cannula priming maps to a site change - and the pump really does log it`() {
+        // This comment used to say type 25 had never appeared in this pump's log and the branch was
+        // dead. That was wrong, and instructively so: it rested on two history dumps that contained
+        // no type 25 plus a session believed to have primed a cannula. On 2026-08-05 a cartridge
+        // top-up in which somebody actually pressed the pump's **cannula fill** step produced
+        // type=4 for the 2.0 U tubing prime and then type=25 for the 0.3 U cannula fill, seven
+        // seconds apart, and AAPS recorded a CANNULA_CHANGE from it.
+        //
+        // The absence was never evidence about the pump; it was evidence about which buttons had
+        // been pressed. Both primes are now live branches, and the split this mapping assumed —
+        // type 4 tubing, type 25 cannula — is the split the pump actually makes.
         assertThat(YpsoEventPolicy.consumableEventFor(YpsoEventTypes.CANNULA_PRIMING_FINISHED, 0.0))
+            .isEqualTo(TE.Type.CANNULA_CHANGE)
+
+        // ⚠ And the amount is irrelevant to this branch, which matters because the real one was
+        // 0.3 U — far below the tube-change threshold that governs type 4. A cannula fill is a site
+        // change however small it is.
+        assertThat(YpsoEventPolicy.consumableEventFor(YpsoEventTypes.CANNULA_PRIMING_FINISHED, 0.3))
             .isEqualTo(TE.Type.CANNULA_CHANGE)
     }
 

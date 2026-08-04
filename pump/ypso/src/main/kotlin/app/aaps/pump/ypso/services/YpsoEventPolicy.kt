@@ -49,10 +49,17 @@ object YpsoEventPolicy {
      * bubble, and recording it as a set change would reset the AAPS timer that tells the user when
      * their infusion set is due.
      *
-     * ⚠ **`CANNULA_PRIMING_FINISHED` (25) has never been seen on this pump**, in any log, in any
-     * state — which is why AAPS's site-change timer can never restart itself here (§8.4). The branch
-     * is kept because the constant is real and the mapping is the right one *if* an entry ever
-     * appears; it is a documented dead branch rather than an untested live one, and the test says so.
+     * ✅ **`CANNULA_PRIMING_FINISHED` (25) is real, and this branch is live — verified 2026-08-05.**
+     * It was called a dead branch here for weeks, on the strength of two history dumps that contained
+     * no type 25 and a session that was believed to have primed a cannula. It appeared the moment
+     * somebody actually performed the pump's **cannula fill** step: a cartridge top-up produced
+     * `type=16` rewind, `type=4` for the 2.0 U *tubing* prime, and then `type=25` for the 0.3 U
+     * **cannula** fill, seven seconds apart. AAPS recorded a `CANNULA_CHANGE` from it and the site
+     * timer restarted.
+     *
+     * So the pump does distinguish the two primes, and the distinction is the one this mapping always
+     * assumed: **type 4 is the tubing, type 25 is the cannula.** What was missing was never the event
+     * — it was a tester pressing that step.
      *
      * @param primedUnits how much the prime delivered, for [YpsoEventTypes.PRIMING_FINISHED]. The
      *   caller decodes it from the entry's raw data; it is passed in so this stays a function of
