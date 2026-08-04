@@ -3125,8 +3125,25 @@ careful manual work.
 ### ⚠ 11e, unplanned: a 0% TBR ended ~10 minutes early, and nothing cancelled it
 
 The 0% set at 20:18:05 for **30 minutes** read `0% 11min left` at 20:37:24, and by 20:42:36 the pump
-reported `tbr=none` with the reservoir moving again (81.39 → 81.36). AAPS's own record agrees —
-`temporaryBasals` row 78 carries **duration 20 min**, not 30.
+reported `tbr=none` with the reservoir moving again (81.39 → 81.36).
+
+⚠ **Be careful which source says what — the two are not independent.** `temporaryBasals` row 78 carries
+`duration = 1,245,416 ms = 20.757 min`, and its `dateCreated` is **27 ms after** that computed end.
+That is the signature of **AAPS writing "it ended now"**, not of importing the pump's figure: the pump
+records durations in whole minutes (`v2=30`), so a value of 20.757 cannot have come from it. The
+database therefore records **when AAPS decided the TBR was over**, which is not necessarily when the
+pump ended it.
+
+**What stands on the pump's own evidence**, independent of AAPS's bookkeeping: at 20:42:36 the raw
+status read `0A C8 1F 00 00 02 1E 00 00 00 **64** …` — byte 10 = `0x64` = 100 = *no temporary basal* —
+when a 30-minute TBR started at 20:18:05 should have had ~5.5 minutes left. The reservoir had also
+resumed falling. **The pump really did end it early; the precise moment is AAPS's guess.**
+
+⚠ **The path that closed the record at 20:38:50 was not identified, and now cannot be from this run.**
+A dump taken while the window was still in the buffer showed no ypso/PUMP lines between 20:37:25 and
+20:42:32, so the driver was not connected — but by the time the anomaly was worth chasing, logcat had
+rotated (buffer now begins 20:42:04) and the non-pump AAPS activity at 20:38:50 is gone. **Next time
+this is suspected, dump logcat immediately rather than after the following poll.**
 
 **Nothing cancelled it.** The driver was disconnected from 20:37:25 to 20:42:32; no command was sent
 in that window, and the loop was not running yet.
@@ -3154,9 +3171,21 @@ The 150% set at 20:42:38 for 30 min was polled every ~5 minutes by the loop and 
 the pump honours a non-zero temporary basal for its whole programmed duration *and* delivers exactly
 the rate it claims — 0.45 U/h being 150% of the 0.3 U/h base.
 
-⚠ **That makes the early ending look specific to 0%, not general to temporary basals** — which is a
-different and more troubling shape, because 0% is the one the loop depends on for backing off. It is
-still **one observation of each**. What would settle it is a 0% left alone and polled continuously
-across its full duration, with the reservoir read at both ends. Until that exists, treat "a zero temp
-may quietly end early" as **suspected and unconfirmed**, and do not build the cancel-then-set fix on
-an assumption that a zero temp, once accepted, stays.
+**And it ran to term.** The 150% was set at 20:42:38.888 and `temporaryBasals` row 81 records
+`duration = 1,800,000 ms = 30.000 min` **exactly** — the requested value, never truncated — with the
+pump reading `tbr=none` afterwards at 21:19:46 and the loop then setting a fresh 400% from idle. A
+non-zero temporary basal is honoured for its whole programmed duration.
+
+⚠ **So the early ending looks specific to 0%, not general to temporary basals** — a more troubling
+shape, because 0% is the one the loop depends on for backing off. The comparison is now controlled
+(same session, same 30-minute request, same polling) but it is still **one observation of each**:
+
+| | asked | recorded | source of the recorded figure |
+|---|---|---|---|
+| 0% | 30 min | **20.757 min** | AAPS's own reckoning at 20:38:50 |
+| 150% | 30 min | **30.000 min** | the requested value, untouched |
+
+What would settle it is a **0% left alone and polled continuously across its full duration**, with the
+reservoir read at both ends and logcat dumped the moment it disappears. Until that exists, treat "a
+zero temp may quietly end early" as **suspected and unconfirmed** — and do not build the
+cancel-then-set fix on an assumption that a zero temp, once accepted, stays.
