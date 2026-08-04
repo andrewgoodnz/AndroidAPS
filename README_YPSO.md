@@ -154,6 +154,38 @@ empty — so the driver can tell "no cartridge" from "empty cartridge" even thou
 `3` for both. Running dry also raises a real pump alert (`104 Cartridge Empty`, urgent); a *low*
 reservoir never does.
 
+### "Fallback to SMB. Not enough TDD data." is **not** this driver's missing TDD support
+
+Worth stating plainly because the inference is so natural and so wrong. This driver reports
+`supportsTDDs = false` and `loadTDDs` is unimplemented (§8.6), so when Dynamic ISF starts complaining
+about TDD the obvious conclusion is that the two are connected. **They are not, and implementing
+`loadTDDs` would not fix it.**
+
+`OpenAPSSMBPlugin` gets its TDD from `TddCalculator`, and `TddCalculatorImpl.calculateInterval`
+computes it **entirely from AAPS's own database** — boluses from `getBolusesFromTimeToTime`, plus
+basal integrated from the active profile and any temp basals, in 5-minute steps. It never reads a
+pump-reported TDD record. What the pump could tell us about its own daily totals is irrelevant to
+this code path.
+
+The actual requirement is **seven consecutive complete days**:
+`tddCalculator.calculate(7, allowMissingDays = false)` returns `null` unless every one of the seven
+produced a value, and a day produces `null` if the profile was not active for even one 5-minute step
+in it, or if no insulin at all was recorded. Basal alone is enough — a day with no boluses still
+totals 24 × the profile rate.
+
+Measured on the phone 2026-08-04, and it shows the shape exactly:
+
+```
+tdd1D=37.0   tddLast24H=36.0   tddLast4H=9.3   tddLast8to4H=4.8   tdd7D=null
+28/07 null   29/07 null   30/07 null   31/07 null   01/08 28.8   02/08 28.8   03/08 37.0
+```
+
+Only `tdd7D` was missing, because the four days before 1 August had no profile coverage in that
+database. It resolves itself once seven unbroken days have accumulated — no action, just time — and
+any gap in profile coverage restarts the count. Until then AAPS runs the documented SMB fallback,
+which is a safety behaviour and not a fault. Turning Dynamic ISF off also removes the fallback, but
+that is a therapy decision and nothing to do with the pump.
+
 ### ⚠ Every AAPS restart suspends the loop for ~30 s and cancels any running temp basal
 
 **Measured on hardware, 2026-08-04.** This is not a fault to report; it is what the driver does, and
