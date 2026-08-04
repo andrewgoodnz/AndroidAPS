@@ -371,7 +371,13 @@ So the split is:
 The phone's key is `C:\Users\Andrew\StudioProjects\aaps_key` — **PKCS12, one entry, alias `key0`**,
 created 2021-06-04.
 
+⚠ **`apksigner.bat` needs `JAVA_HOME` and will not inherit one from Android Studio.** Without it the
+only thing it prints is `ERROR: JAVA_HOME is not set and no 'java' command could be found in your
+PATH`, which looks like a broken toolchain and is one missing variable. It is a per-window setting, so
+a fresh terminal needs it again.
+
 ```bash
+export JAVA_HOME="/c/Program Files/Android/Android Studio/jbr"   # PowerShell: $env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
 APKSIGNER="/c/Users/Andrew/AppData/Local/Android/Sdk/build-tools/36.1.0/apksigner.bat"
 cd app/build/outputs/apk/full/release
 
