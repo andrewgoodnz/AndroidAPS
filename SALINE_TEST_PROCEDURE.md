@@ -3298,6 +3298,30 @@ wanting 0% on insulin (over-delivery, the hypo direction, §4h), and stuck at 0%
 (under-delivery, then a catch-up). **The first is the dangerous one. This one is the one that shows
 how long it lasts.**
 
+#### And the dangerous direction, also measured — 02:24 to 02:44, 20 minutes
+
+The same night produced the hypo-side case on saline, which the insulin trial had shown without a
+duration. A 107% temporary basal was set from idle at 02:14:54; glucose then fell, and the loop asked
+to cut delivery four times:
+
+```
+02:24:53  107% running  →  asked  73%  →  REFUSED
+02:29:53  107% running  →  asked   0%  →  REFUSED
+02:34:50  107% running  →  asked   0%  →  REFUSED
+02:39:52  107% running  →  asked   0%  →  REFUSED   (5 min left)
+02:44:52  tbr=none — the 107% expired on its own after 29.97 min
+02:44:53  asked 0%  →  ✅ ACCEPTED, seq=161470
+```
+
+**20.0 minutes during which the loop was asking for zero basal and the pump delivered 0.32 U/h** —
+about **0.107 U given against an explicit request for none**. Small in absolute terms on a 0.3 U/h
+profile; the point is the mechanism and the duration, both of which scale with the user's basal rate.
+
+**So the block is symmetric and bounded the same way in both directions:** 15 minutes stuck at zero
+wanting more, 20 minutes stuck delivering wanting zero, each ending only when the running TBR expired
+of its own accord. Neither was escapable by the loop, and in both cases the correct rate was applied
+on the first attempt once the pump was idle.
+
 ### ⚠ The refusal is not about the value: an identical request is refused too
 
 Three more refusals arrived while that 0% ran, and two of them asked for **0% while 0% was already
