@@ -257,9 +257,14 @@ disagreement is a **four-fold** error in what AAPS thinks is being delivered —
 where the pump's real base is *higher* than AAPS believes, AAPS under-counts the insulin going in and
 doses more on top.
 
-`isThisProfileSet` notices the divergence and AAPS rewrites the profile, so it heals — but it heals
-*afterwards*, and nothing protects the window. Turn the other controller off, or keep it out of range,
-before connecting. `PORTING_NOTES.md` §4h has the reasoning in full.
+`isThisProfileSet` notices and AAPS rewrites the profile, so it does heal — **and the healing was timed
+on hardware: 4 min 49 s to detect, 5 min 20 s to a confirmed correction.** That is the guard working as
+designed. But for those five minutes the pump held a base four times what the other controller
+believed, and **nothing rechecks a temporary basal after the fact** — `isThisProfileSet` compares
+profiles, not running TBRs. So the profile self-corrects and a TBR set against the wrong one does not.
+
+Turn the other controller off, or keep it out of range, before connecting. `PORTING_NOTES.md` §4h has
+the reasoning and the capture.
 
 ### Smaller ones
 

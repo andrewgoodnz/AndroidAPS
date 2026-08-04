@@ -1015,12 +1015,30 @@ base:
 
 At 400% a 1.2 vs 0.3 U/h disagreement is a **four-fold** error in what AAPS thinks is going in.
 
-⚠⚠ **And the way that divergence actually arises is two controllers.** Observed the same day: the
-main phone came back into Bluetooth range while the tablet was also connected, and the two spent
-several minutes overwriting each other's basal profile on the same pump — the tablet's `[ypso-state]`
-shows `rate=0.3U/h`, then `1.2U/h`, then `0.3U/h` again. Any percentage TBR set during that window is
-interpreted against whichever profile its own controller last believed. `isThisProfileSet` is the
-guard that notices and heals it, but it heals *afterwards*; there is no protection during the window.
+⚠⚠ **And the way that divergence actually arises is two controllers — [verified], with the window
+timed.** The main phone came back into Bluetooth range while the tablet was connected, and the tablet's
+own log caught the whole cycle:
+
+```
+14:45:57  Basal profile Profile A: [1.2, 1.2, … ×24]                    ← the phone's profile, on the pump
+14:50:46  isThisProfileSet: hour 0 differs — pump 1.2 vs wanted 0.3     ← the guard notices
+14:51:17  writeBasalProfile: confirmed=true                             ← and rewrites it back to 0.3
+```
+
+**The guard works, and it takes about five minutes.** 4 min 49 s from the foreign profile being on the
+pump to `isThisProfileSet` reporting the mismatch — it is evaluated per loop iteration, not per poll —
+and 5 min 20 s to a confirmed correction. Nothing is broken here; this is the healing behaving exactly
+as designed, and it is the first time it has been watched end to end.
+
+⚠ **But it heals afterwards, and that window is live.** For those five minutes the pump held a base
+rate **four times** what the other controller believed. A percentage TBR set in that window is
+multiplied by the wrong base for its whole duration, and unlike the profile itself **nothing rechecks a
+TBR after the fact** — `isThisProfileSet` compares profiles, not running temporary basals. So the
+profile self-corrects and any TBR set against the wrong one does not.
+
+The same capture also shows the suspend record working through the cartridge change back to saline —
+`byte0=3 name='Stopped' … suspendRecord=open since 2:05 pm (39min left of 60)` — which is 6b's renewal
+logic doing its job unattended (§8.6).
 
 **This is the strongest practical argument for the rule §0 already states** — never let two
 controllers reach this pump — and it is now a measured consequence rather than a tidiness preference.
