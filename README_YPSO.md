@@ -15,11 +15,30 @@ default** and cannot happen until the bolus speed is changed by hand.
 into a person. What stops it doing so is the cartridge, not the code — see
 [Before insulin](#before-insulin).
 
-⚠ **One gate is open and it is not about the pump.** Every phase that tests what the *pump* does has
-passed. **Phase 10 — what AAPS's database holds after a bolus is interrupted** by a dropped link or a
-killed app — is written and has never been run, and the code predicts it leaves a bolus counted
-twice. If this build is used for therapy before Phase 10 runs, an interrupted bolus is a record to
-check by hand. Read [Before insulin](#before-insulin) for the specifics, not just this paragraph.
+## ⚠⚠ Not fit for closed-loop use with insulin — read this before anything else
+
+**On 2026-08-04 this driver ran a closed loop on a person, and the trial was ended after about ten
+minutes by a defect no bench test had reached.** The pump **refused a 0% temporary basal while a 400%
+one was running**, twice. Zero temps are not incidental to oref1 — one accompanies every SMB, and it
+is how the loop backs off insulin when glucose falls — so this is the loop losing the ability to
+deliver *less* on demand.
+
+Nothing was dosed blind: AAPS's accounting was correct throughout and knew exactly what was running.
+The high temp simply ran to its natural end because nothing could replace it, and was cancelled by
+hand. The pump went back on saline the same day.
+
+**`SALINE_TEST_PROCEDURE.md` Phase 11 is written to settle it and has not been run.** Two hypotheses
+survive — 0% is never accepted, or nothing can be replaced while a temporary basal is running — and
+only one combination was ever exercised. **Cancelling to 100% works**, so if it is the replacement
+rule the fix is small.
+
+Until Phase 11 passes: **do not close the loop with insulin in this pump.** Manual and open-loop use
+are a separate question this finding does not settle.
+
+⚠ **A second gate is open and it is not about the pump.** **Phase 10 — what AAPS's database holds
+after a bolus is interrupted** by a dropped link or a killed app — is written and has never been run,
+and the code predicts it leaves a bolus counted twice. An interrupted bolus is a record to check by
+hand. Read [Before insulin](#before-insulin) for the specifics, not just this paragraph.
 
 Three documents, and they have different jobs:
 
@@ -621,7 +640,20 @@ things are worth knowing before turning it on:
 
 ---
 
-**Every gate about what the pump does is closed.** Phase 6b — the last of those — closed on
+### ⚠⚠ The temporary basal that could not be replaced — the one that ended the trial
+
+Covered at the top of this file and in full in `PORTING_NOTES.md` §4h and `SALINE_TEST_PROCEDURE.md`
+Phase 11. In one line: **the pump refused `0%` while `400%` was running**, `tbrPercentRange` is
+`0..500` so the refusal is the pump's rather than a guard, cancelling to 100% works, and until Phase 11
+separates the two possible causes the loop cannot be relied on to reduce delivery.
+
+It is worth saying *why* nothing caught it earlier, because the answer is not carelessness. Phases 1
+to 9 each removed one refusal and tested that capability **on its own** — set a temporary basal, cancel
+a temporary basal, and both passed repeatedly. The failure lives in the **combination**: replacing one
+while another runs. That is the same shape as every expensive finding in these notes, and it is the
+argument for Phase 11's 2×2 rather than a single reproduction.
+
+**Everything else about what the pump does is closed.** Phase 6b — the last of those — closed on
 2026-08-03, verified twice: 2h33m of stopped pump on one build (four renewal cycles), then
 re-confirmed on the current build after a flash (three more), with **zero uncovered time at every
 transition, including across the reinstall**. The 0% suspend record is held continuously while the

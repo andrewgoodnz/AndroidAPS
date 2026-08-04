@@ -17,16 +17,30 @@ renewal cycles across two builds, **zero uncovered time**, decided on the databa
 rather than a pump setting; 9c failed first, found a permanent phantom IOB record, was fixed and
 re-run clean. Phase 8's extended bolus works but lands in the wrong table, and is superseded.
 
-⏳ **One thing is written and unrun, and it is the last one that could still change a record:
-Phase 10, the interrupted bolus.** It is items E and F below, and unlike everything above it, its
-subject is not a pump capability — it is what AAPS's own database holds after the phone is taken out
-of the loop mid-delivery. **The code predicts a specific failure there and Phase 10 says so in
-advance.** Everything else remaining is observation.
+⏳ **Phase 10, the interrupted bolus, is written and unrun.** It is items E and F below, and unlike the
+phases above it its subject is not a pump capability — it is what AAPS's own database holds after the
+phone is taken out of the loop mid-delivery. **The code predicts a specific failure there and Phase 10
+says so in advance.**
+
+⚠⚠ **Phase 11 now comes before it, and Phase 11 was not written from the code.** It was written from a
+pump that refused a command while insulin was going into a person. Nothing on this page predicted it,
+because every phase from 1 to 9 tested capabilities one at a time and this is a *combination* — a
+temporary basal replaced while another is running. That is the shape of every expensive finding in
+these notes, and it took a real loop to produce it.
+
+⚠⚠ **2026-08-04, later the same day: the driver ran on insulin, on a person, and the trial was ended
+by a defect that no bench phase had reached.** The pump **refused a 0% temporary basal while a 400%
+one was running** — twice. A zero temp accompanies every SMB in oref1 and is the loop's instrument for
+backing off insulin, so this is a loss of control rather than a missing feature. IOB accounting stayed
+correct throughout and nothing was dosed blind. The pump is back on saline and the phone is back on
+its previous pump. **Phase 11 is now the first thing to run, ahead of Phase 10**, and until it passes
+this driver is not fit for closed-loop use with insulin.
 
 **Still to run, most valuable first:**
 
 | # | Test | Why it matters | Where |
 |---|---|---|---|
+| **0** | ⚠⚠ **Phase 11 — the TBR that could not be replaced** | 📝 **Written 2026-08-04, not yet run. The only item here found by real insulin use rather than by reading.** The pump refused `0%` while `400%` was running; `tbrPercentRange` is `0..500` so the refusal is the pump's, not a guard. Two hypotheses — 0% is never accepted, or no TBR can be replaced while one runs — and a 2x2 that separates them. Cancel (100%) works, so if it is the latter the fix is cancel-then-set | **Phase 11**, §4h |
 | A | ~~**6b — the renewal fix**~~ | ✅✅ **CLOSED 2026-08-03, verified twice.** 2h33m on the 08-02 build (4 cycles) and then re-confirmed on **HEAD 3.4.2.6** after a flash (3 cycles), with **zero uncovered time at every transition including across the reinstall**. Adjudicated on `temporaryBasals.duration`. The Hold→Renew boundary was seen on real polls (39 min left held, 20 min left renewed) | **6b**, §8.6 |
 | B | ~~**Fix `insertAnnouncement`'s dedupe key**~~ | ✅ **CLOSED 2026-08-04.** The alert path now calls `insertTherapyEventIfNewWithTimestamp(event.timestamp, ANNOUNCEMENT, …)`, so the key is `(type, the pump's entry time)` and re-reading a window is a genuine no-op. It also brings the path under `confirmActivePump(timestamp, …)`, which `now()` had been sailing past. Fixed inside `pump/ypso`, adding no shared-file surface | §8.5 |
 | C | ~~**Phase 5c — cartridge out and priming**~~ | ✅ **CLOSED 2026-08-03.** Cartridge out reads `byte0=3` with the reservoir `FF FF FF FF` (−1) — the first sighting of reservoir `-1`, handled correctly. The *priming* row is recorded as **unreachable by this method**: liveness cannot be proved because the reservoir reads −1 throughout, so a mid-prime reading is byte-identical to one taken after it | **Phase 5c**, §8.3 |
@@ -2788,3 +2802,181 @@ are worth believing.
 | 10c real range loss | 10 U | pump carried away, 90 s | ⏳ **NOT RUN** |
 | 10d chunked sequence killed | 6 U @ 3 U/min | `am force-stop` at 40 s | ⏳ **NOT RUN** |
 | 10e control, uninterrupted | 2 U | none | ⏳ **NOT RUN** |
+
+---
+
+# Phase 11 — the temporary basal that could not be replaced ⏳
+
+**Written 2026-08-04, unrun. This one is not a gap found by reading the code — it is a defect that
+appeared during the driver's first and only period of real insulin use, and it is the reason that
+period ended.**
+
+## What happened, and why it stopped the trial
+
+The pump was carrying insulin and looping on a person. AAPS set a 400% temporary basal, then **twice
+asked to replace it with 0% and was refused by the pump both times**:
+
+```
+13:17:06  setTempBasalAbsolute: 4.8U/h against the pump's 1.2U/h = 400% for 30min
+13:17:08  setTempBasalPercent: asked 400% for 30min, confirmed=true
+13:17:08  TBR confirmed by read-back: 400% with 30min left, logged as seq=161015 v1=400 v2=30
+
+13:20:46  setTempBasalAbsolute: 0.0U/h against the pump's 1.2U/h = 0% for 60min
+13:20:46  setTempBasalPercent: asked 0% for 60min, confirmed=false, The pump refused the temporary basal command
+13:22:04  ... and again, identically, 78 seconds later
+```
+
+**The refusal is the pump's, not the driver's.** `tbrPercentRange` is `0..500`, so 0 passes the range
+guard — a percentage outside it produces a different message naming the range. The failure comes from
+`!suspendStartTbr(...)` inside `setTbrConfirmed`, which is the write itself.
+
+**Why this ends a loop trial rather than joining a list.** A zero temporary basal is not an occasional
+request in oref1: it accompanies **every SMB**, because the microbolus replaces basal delivery, and it
+is the loop's primary instrument for backing off insulin when glucose falls. A pump that will not
+accept one has not lost a feature — it has lost the ability to reduce delivery on demand. Through the
+live event AAPS's IOB accounting stayed correct (it knew the 400% was running and said so in
+`currentTemp`), so nothing was dosed blind; what was lost was **control**, and it could not be
+recovered until the temporary basal expired or somebody cancelled it by hand.
+
+⚠ **Cancel is a different code path and it works.** `cancelTbrConfirmed()` writes the pump's "no TBR"
+value of 100%, and was observed succeeding repeatedly the same day. That asymmetry is why this phase
+can be short: there is a working primitive to build on if the diagnosis lands where it probably lands.
+
+## The two hypotheses, and the 2x2 that separates them
+
+Everything observed fits either of these, because **only one combination was ever exercised**: 0%
+requested while a TBR was already running.
+
+1. **H-ZERO — the pump refuses 0% itself**, whatever the current state. Then zero temps are not
+   expressible on this pump and the loop needs a different instrument (a pump stop, or a very low
+   non-zero percentage). A design question, not a patch.
+2. **H-REPLACE — the pump refuses *any* new temporary basal while one is running**, and 0% is
+   incidental. Then the fix is small and sits entirely in `setTbrConfirmed`: cancel first, then set.
+
+The 400% at 13:17 was set from `tbr=none` and succeeded. That is the only other data point and it
+rules out neither.
+
+| | **11b: 150% → 80% succeeds** | **11b: refused** |
+|---|---|---|
+| **11a: 0% from idle succeeds** | Neither hypothesis — the failure needs the *combination*; investigate further | **H-REPLACE.** Fix: cancel-then-set |
+| **11a: refused** | **H-ZERO.** 0% is not expressible; rethink the instrument | Both true; fix replacement first, then confront 0% |
+
+**Run 11a and 11b before anything else — they are the whole point of the phase.** The rest confirms.
+
+## Before starting
+
+- Saline, off-body, cannula to air. **Insulin out of the cartridge before this phase begins.**
+- Note the reservoir before every step. It is the only measurement that does not come from the
+  software under test.
+- Study phone (Lotus) off. NSClient uploading off.
+- Base basal must be a known non-zero rate or the percentage arithmetic is meaningless. Record it —
+  every expected rate below is a multiple of it.
+- logcat running before the pump is touched:
+  `adb logcat -v time PUMP:V PUMPBTCOMM:V "*:S"`
+
+## 11a. 0% from idle — the decisive one
+
+**The question:** can this pump express a zero temporary basal at all?
+
+1. Confirm nothing is running: the YPSO tab shows `Temp basal —`, and `[ypso-state]` reads `tbr=none`
+   with byte 10 at 100.
+2. From AAPS set a temporary basal of **0% for 30 min** (or a 0.0 U/h absolute rate, which the plugin
+   converts to 0%).
+3. Read the log for `setTempBasalPercent: asked 0% ...`.
+
+**Confirm:**
+
+- **Accepted or refused**, from `confirmed=true/false`. This is the answer the phase exists for.
+- If accepted: byte 10 reads **0** and the YPSO tab shows a 0% temporary basal running.
+- ⚠ **If accepted, does delivery actually stop?** Leave it 15 minutes and compare the reservoir before
+  and after. At a 1.2 U/h base a 0% TBR should consume **nothing**. Anything else means the pump
+  accepted the command and did not honour it, which is worse than a refusal because it is silent.
+- ⚠⚠ **And does the pump still call itself delivering?** Record `[ypso-state]`'s `delivering=` and
+  `suspendRecord=`. If a 0% TBR makes `isDelivering` false, `syncSuspendedState` will open a
+  `PUMP_SUSPEND` record **on top of a temporary basal AAPS set deliberately** — two records for one
+  state, one of them claiming the pump has stopped. Nothing has ever exercised that interaction, and
+  this is the first thing that would.
+
+## 11b. Replace a running temporary basal, non-zero — the other axis
+
+**The question:** does the pump accept *any* replacement while a TBR runs, or must it be cancelled
+first?
+
+1. Cancel anything running. Confirm `tbr=none`.
+2. Set **150% for 30 min**. Confirm accepted, byte 10 reads 150.
+3. **Without cancelling**, set **80% for 30 min**.
+
+**Confirm:**
+
+- Accepted or refused, from `confirmed=`.
+- If accepted: byte 10 reads **80** and the effective rate is 0.8 x base. ⚠ Check the *duration* too —
+  §4h records that this pump **rewrites the TBR history entry in place** rather than appending, so
+  establish whether the replacement restarted the 30 minutes or inherited what was left of the first.
+- If refused: the message must be the same `The pump refused the temporary basal command` seen in the
+  field. A different message means a different fault, and 11b has not reproduced anything.
+
+## 11c. Reproduce the field failure exactly — the control
+
+Set **400% for 30 min**, and once confirmed running, ask for **0% for 60 min** — the live sequence.
+**This must be refused**, or the bench does not reproduce the field and nothing concluded from 11a and
+11b can be carried back to the phone.
+
+This step is why the other two mean anything, and it is the same reason Phase 10 carries a control:
+four checks in `PORTING_NOTES` turned out to be incapable of failing, and every one read as a pass.
+
+## 11d. Cancel-then-set — the proposed fix, by hand before it is written
+
+Only if 11b refused (H-REPLACE).
+
+1. Set **400% for 30 min**. Confirm running.
+2. **Cancel** from AAPS. Confirm byte 10 back to 100 and `tbr=none`.
+3. Immediately set **0% for 60 min**.
+
+**Confirm the whole sequence completes and byte 10 reads 0.** If it does, `setTbrConfirmed` can do the
+same internally whenever it finds a TBR already running, and the fix is a few lines against a
+primitive that already works. Time the three steps — they happen inside one held connection, and a
+zero temp that takes a few seconds longer to apply is still a zero temp, but the cost belongs in the
+notes.
+
+⚠ **Do not write the fix before this passes by hand.** Doing it manually first means a failure here is
+information about the pump; a failure after the code is written is ambiguous between the pump and the
+patch.
+
+## 11e. Does a zero temp survive its own duration?
+
+Only if 0% is accepted somewhere above. Set **0% for 30 min** and leave it through at least two status
+polls and one history sync.
+
+**Confirm:** byte 10 stays 0, the AAPS record stays open with the right remaining duration, no
+`PUMP_SUSPEND` record appears beside it, and the reservoir does not move. Then let it **expire on its
+own** and confirm the pump returns to base rate and AAPS closes the record. §8.6's renewal logic was
+written for the suspend record and has never been watched across a 0% TBR that AAPS itself set.
+
+## What this phase does not answer
+
+- **Whether 0% is the right instrument even if it works.** If the pump honours 0% but reports itself
+  as not delivering, the driver may be better off treating a requested zero temp as something else
+  entirely. A design decision for once the facts are in.
+- **What other units or firmware do.** Everything here is one pump on V05.02.03.
+- **Whether the loop can be trusted meanwhile.** It cannot, for closed-loop use, until a zero temp
+  either works or is deliberately replaced by something that does.
+
+## Phase 11 is passed when
+
+11a and 11b have each produced a definite accepted-or-refused answer, 11c has reproduced the field
+refusal on the bench, and — if H-REPLACE — 11d has shown cancel-then-set working by hand. A zero
+temporary basal that is *accepted* must additionally be shown in 11a to actually stop delivery against
+the reservoir, and not to open a competing suspend record.
+
+**Until then this driver is not fit for closed-loop use with insulin**, and that sentence is a finding
+from a real trial rather than a precaution.
+
+## Results
+
+| Step | What | Expected | Result |
+|---|---|---|---|
+| 11a 0% from idle | 0% / 30 min from `tbr=none` | unknown — the question | ⏳ **NOT RUN** |
+| 11b replace non-zero | 150% running → 80% | unknown — the question | ⏳ **NOT RUN** |
+| 11c field control | 400% running → 0% | **refused**, matching the field | ⏳ **NOT RUN** |
+| 11d cancel-then-set | 400% → cancel → 0% | accepted | ⏳ **NOT RUN** |
+| 11e zero temp endures | 0% / 30 min, watched | byte 10 stays 0, reservoir static | ⏳ **NOT RUN** |

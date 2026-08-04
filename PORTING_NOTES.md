@@ -7,8 +7,21 @@ Driver for an **unlocked plaintext research YpsoPump** on current AndroidAPS (3.
 > is the record of what the pump was observed doing and why the code is shaped the way it is,
 > including every wrong turn, because the wrong turns are the part that is expensive to rediscover.
 
-**Status, 2026-08-04. Phases 1 to 9 have all run on hardware and passed. Phase 10 is written, has
-never run, and is the only open gate** — and it is the first one whose subject is not the pump.
+**Status, 2026-08-04. Phases 1 to 9 have all run on hardware and passed. Two gates are open, and the
+more serious of them was found by putting insulin in the pump.**
+
+⚠⚠ **The driver ran a closed loop on a person for roughly ten minutes and the trial was ended by a
+defect no bench phase had reached: the pump refuses a 0% temporary basal while another is running
+(§4h).** oref1 issues a zero temp with every SMB and uses it to back off insulin, so this is the loop
+losing the ability to deliver *less* on demand. AAPS's accounting stayed correct throughout — the 400%
+that was running is exactly what `currentTemp` said — and nothing was dosed blind; the high temp simply
+ran to its end because nothing could replace it. **Phase 11 is written to separate the two possible
+causes and is the first thing to run.** Until it passes, **this driver is not fit for closed-loop use
+with insulin.**
+
+The shape of that finding is this file's oldest lesson arriving one more time: every phase from 1 to 9
+tested a capability **on its own**, and the failure was in a **combination** — replacing a temporary
+basal rather than setting one.
 
 This header is the current state of the driver, not a changelog. Each claim names the section that
 holds the evidence at full length, including the wrong turns that produced it.
@@ -48,8 +61,18 @@ licensed the option; it did not change anything for anyone who has not picked on
 
 ## What is still open
 
-⚠⚠ **1. Phase 10 — the interrupted bolus. Written, unrun, and the code predicts it will fail.**
-Every gate about what the *pump* does is closed. This one is about **what AAPS's own database holds
+⚠⚠ **1. Phase 11 — a running temporary basal cannot be replaced by 0%.** Found on insulin, on a
+person (§4h). The refusal is the pump's: `tbrPercentRange` is `0..500`, so 0 clears the guard and the
+write itself fails. **Cancel to 100% works**, and that asymmetry is the lead — the pump will change a
+running temporary basal to *none*, but apparently not to *another*. Only one combination has ever been
+exercised, so two hypotheses survive: 0% is never accepted, or nothing can be replaced while running.
+Phase 11 is a 2×2 written to separate them, with a control that must reproduce the field refusal on
+the bench. If it is the replacement rule, the fix is cancel-then-set — a few lines against a primitive
+that already works — and 11d requires it demonstrated by hand before the code exists. **This is the
+one that decides whether the driver can loop at all.**
+
+⚠⚠ **2. Phase 10 — the interrupted bolus. Written, unrun, and the code predicts it will fail.**
+This one is about **what AAPS's own database holds
 after a bolus is interrupted** — the link dropping, or the app being killed, mid-delivery.
 `openPendingBolus` writes a committed row with `pumpId` null; `settlePendingBolus` is the only thing
 that ever promotes it; and **nothing else in AAPS consumes `temporaryId` on a bolus**. So an unsettled
@@ -58,17 +81,21 @@ inserts a *second* row for the same insulin. One bolus, two live rows, both coun
 produced exactly one such permanent phantom record, which is why this is a prediction rather than a
 worry (§4g, Phase 10).
 
-**2. What the event log does at 3000 entries** — roughly three months at this user's rate of profile
+**3. What the event log does at 3000 entries** — roughly three months at this user's rate of profile
 changes, so a dated concern rather than a theoretical one. If sequences restart there, a monotonic
 watermark stops being sound. The behaviour is traced rather than guessed at, and the probe makes a wrap
 audible instead of silent (§8.5).
 
-**3. A real DST or timezone transition.** `canHandleDST()` is false and `timezoneOrDSTChanged` queues
+**4. A real DST or timezone transition.** `canHandleDST()` is false and `timezoneOrDSTChanged` queues
 the clock write, so the path exists and is unit tested; no actual transition has happened while the
 driver was running (§8.6).
 
-None of the three is a capability gap. **6b — the last pump-facing gate — closed on 2026-08-03,
-verified twice:** 2h33m on the 08-02 build (four renewal cycles), then HEAD 3.4.2.6 flashed onto the
+**Only the first is a capability gap, and it is the one that was found last.** Items 2 to 4 are about
+records and time; item 1 is the pump declining a command the loop depends on. That ordering is worth
+noticing — the three cheap ones were found by reading, and the expensive one needed a person wearing
+the thing.
+
+**6b — the last gate found by bench testing — closed on 2026-08-03, verified twice:** 2h33m on the 08-02 build (four renewal cycles), then HEAD 3.4.2.6 flashed onto the
 still-stopped pump and left to poll unattended (three more), with **zero uncovered time at every
 transition including across the reinstall**, adjudicated on `temporaryBasals.duration` and not on a log
 line (§8.6).
@@ -907,6 +934,49 @@ running reports success with "no end entry to record" — correct on both counts
 **A 100% request is treated as a cancellation**, because 100 is how this pump expresses "none".
 Setting it would otherwise leave AAPS believing a temporary basal was running while byte 10 says
 none is.
+
+### ⚠⚠ [verified] A running temporary basal cannot be replaced by 0% — found on insulin, 2026-08-04
+
+**This is the only finding in this file that came from the driver dosing a person, and it is the
+reason that stopped.** Everything above tests one temporary basal at a time. Nothing tested
+*replacing* one, and that is where the pump says no:
+
+```
+13:17:06  setTempBasalAbsolute: 4.8U/h against the pump's 1.2U/h = 400% for 30min
+13:17:08  setTempBasalPercent: asked 400% for 30min, confirmed=true          ← from tbr=none, fine
+13:20:46  setTempBasalAbsolute: 0.0U/h against the pump's 1.2U/h = 0% for 60min
+13:20:46  setTempBasalPercent: asked 0% for 60min, confirmed=false, The pump refused the temporary basal command
+13:22:04  … identically again, 78 s later
+```
+
+**The refusal is the pump's.** `tbrPercentRange` is `0..500`, so 0 clears the range guard — a value
+outside it produces a different message that names the range. The failure is `!suspendStartTbr(...)`
+in `setTbrConfirmed`: the write itself.
+
+**Why it is a loss of control and not a missing feature.** oref1 issues a zero temporary basal
+alongside **every SMB**, because the microbolus stands in for basal delivery, and a zero temp is also
+how the loop backs off when glucose falls. A pump that refuses one cannot be told to deliver less on
+demand. During the live event AAPS's own accounting was never wrong — `currentTemp` correctly showed
+the 400% running, so IOB was right and nothing was dosed blind — but the 400% ran to its natural end
+because nothing could replace it.
+
+⚠ **Cancel works, and that asymmetry is the whole lead.** `cancelTbrConfirmed()` writes 100% and was
+seen succeeding repeatedly the same day, including immediately after these refusals. So the pump will
+change a running temporary basal to *none*; what it would not do is change one to *another*.
+
+**Two hypotheses, and only one combination has ever been exercised** (0% while 400% ran), so the log
+cannot separate them: either 0% is never accepted, or no new temporary basal is accepted while one is
+running. `SALINE_TEST_PROCEDURE.md` **Phase 11** is written to settle it with a 2×2 — 0% from idle
+against a non-zero replacement — plus a control that must reproduce the field refusal on the bench.
+
+**If it is the replacement rule, the fix is small** and belongs in `setTbrConfirmed`: cancel first,
+then set, against a primitive that already works. Phase 11d requires that sequence to be demonstrated
+**by hand before the code is written**, because a failure by hand is information about the pump and a
+failure afterwards is ambiguous between the pump and the patch.
+
+⚠ **Until Phase 11 passes, this driver is not fit for closed-loop use with insulin.** Manual and
+open-loop use are a separate question; what is established is that the loop cannot reliably reduce
+delivery.
 
 ### ⚠ The maximum percentage — and a guard that prevented its own test
 
