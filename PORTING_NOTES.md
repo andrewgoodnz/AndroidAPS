@@ -1105,6 +1105,22 @@ because AAPS expresses "back to profile rate" as `cancelTempBasal`, never as a 1
 hardware phase ever asked for exactly 100%. Both paths now call the lock-free `cancelTbrLocked()`,
 extracted for exactly the reason `deliverOneBolus` was.
 
+#### ✅ [verified] 11d passed 2026-08-05 — both directions, first attempt each
+
+The loop supplied both cases within six minutes. **400% → 0%** and **0% → 397%**, each accepted on the
+first attempt with the cancel visible between request and confirmation, each recorded under the pump's
+own sequence, and the database holding one live row per period with **no null-`pumpId` phantoms**. The
+command that had been refused 25 times overnight now succeeds.
+
+⚠ **It costs 6–14 seconds**, against ~3 s for a plain set, and the spread is all in the cancel's
+read-back (3.4 s versus 11.3 s). The slow one was also the one reporting *"no end entry found"* — it
+was looking for a history entry the pump had not written yet. Comfortably inside a five-minute loop
+cycle, and nothing can interleave because the whole sequence is under one lock, but worth knowing
+before anyone tightens a timeout.
+
+⚠ **The failure branch is still untested** — a cancel that does not confirm, where the set must not be
+attempted. Both cancels confirmed, so that path never ran.
+
 ⚠ **The evidence for this fix is Phase 11d on hardware, and nothing else.** It has no unit test, and
 deliberately so: the decision is one condition, and a test asserting that a running TBR causes a
 cancel would only restate the code — the shape this file has already been caught by four times. What

@@ -3089,6 +3089,50 @@ between the request and the confirmation.** If the set is refused *after* a conf
 a new finding — a settle-time problem, not the occupancy rule — and `TBR_SETTLE_MS` is the first thing
 to look at.
 
+### ✅ **PASSED 2026-08-05 — both directions, first attempt each**
+
+The loop supplied both cases within six minutes of each other, exactly as this step predicted it would.
+
+**Downward, 400% → 0%:**
+
+```
+06:15:11.049  A 400% temporary basal is already running; cancelling it before setting 0%
+06:15:11.052  TBR cancel: writing 16B … payload: 64 00 00 00 9B FF FF FF 00 00 00 00 FF FF FF FF
+06:15:22.347  TBR cancel confirmed by read-back: byte 10 is back to 100, but no end entry found
+06:15:22.641  Starting TBR: 0% for 60min
+06:15:24.590  TBR confirmed by read-back: 0% with 60min left, logged as seq=161510 v1=0 v2=60
+06:15:24.656  Recorded TBR 0% under pumpId=161510, new=true
+```
+
+**Upward, 0% → 397%:**
+
+```
+06:20:30.334  A 0% temporary basal is already running; cancelling it before setting 397%
+06:20:33.742  TBR cancel confirmed by read-back: byte 10 is back to 100, logged as seq=161510 type=10
+06:20:34.034  Starting TBR: 397% for 30min
+06:20:36.033  TBR confirmed by read-back: 397% with 30min left, logged as seq=161511 v1=397 v2=30
+06:20:36.090  Recorded TBR 397% under pumpId=161511, new=true
+```
+
+**The records are right too**, checked against the database rather than the log — one live row per period,
+the old one closed when replaced, and **no row with a null `pumpId`**, so the fix invents no phantoms:
+
+```
+(127, 06:15:23,   0.0%,  5.22 min, pumpId 161510)   ← closed when the 397% replaced it
+(130, 06:20:34, 397.0%, 30.00 min, pumpId 161511)   ← live
+```
+
+⚠ **The cost, and it is not symmetric.** End to end the downward case took **13.6 s** and the upward
+one **5.8 s**. The difference is entirely in the cancel's read-back — 11.3 s versus 3.4 s — and the
+slow one is also the one that reported *"no end entry found so the stop cannot be recorded"*, i.e. it
+was looking for a history entry the pump had not written yet. **A replacement therefore holds the
+connection for something like 6–14 seconds**, against ~3 s for a plain set. That is well inside the
+loop's five-minute cycle and nothing else can interleave (the whole sequence is under one lock), but
+it is worth knowing before anyone tightens a timeout.
+
+**What this does not cover:** the failure branch — a cancel that does not confirm, where the set must
+not be attempted. It did not arise, because both cancels confirmed. It stays untested.
+
 ⚠ **The fix has no unit test, deliberately.** The decision it makes ("is one running? then cancel
 first") is a single condition, and a test asserting that null aborts, running cancels, and idle
 proceeds would only restate the code — the shape this file has been caught by four times already. The
@@ -3131,7 +3175,7 @@ from a real trial rather than a precaution.
 | 11a 0% from idle | 0% / 30 min from `tbr=none` | unknown — the question | ✅ **ACCEPTED — 2026-08-04 20:18** |
 | 11b replace non-zero | a TBR running → a different one | unknown — the question | ❌ **REFUSED — 2026-08-04 20:49** |
 | 11c field control | reproduce the field refusal | **refused** | ✅ **REPRODUCED — same message** |
-| 11d cancel-then-set | replace a running TBR directly | accepted, cancel visible in the log | 📝 **FIX WRITTEN 2026-08-05, NOT YET RUN** |
+| 11d cancel-then-set | replace a running TBR directly | accepted, cancel visible in the log | ✅ **PASSED 2026-08-05, both directions** |
 | 11e zero temp endures | 0% / 30 min, watched | byte 10 stays 0, reservoir static | ⚠ **ENDED EARLY — see below** |
 
 ### ✅❌ **RESOLVED 2026-08-04: it is H-REPLACE. 0% was never special.**

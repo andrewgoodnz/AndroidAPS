@@ -15,11 +15,15 @@ default** and cannot happen until the bolus speed is changed by hand.
 true, because the one period of real insulin use verified nothing: it was aborted after about ten
 minutes by the defect it found (below). Treat this driver as saline-verified and no more.
 
-## ⚠⚠ Not fit for closed-loop use with insulin — read this before anything else
+## ⚠⚠ Read this before closing the loop with insulin
 
 **On 2026-08-04 this driver ran a closed loop on a person, and the trial was ended after about ten
-minutes by a defect no bench test had reached.** The pump **refused a 0% temporary basal while a 400%
-one was running**, twice. Zero temps are not incidental to oref1 — one accompanies every SMB, and it
+minutes by a defect no bench test had reached.** It has since been diagnosed, fixed and verified on
+saline — the detail is below and worth reading, because the *way* it was missed says more than the
+defect does. **What remains open is Phase 10**, the interrupted bolus, which can leave one dose counted
+twice.
+
+The pump **refused a 0% temporary basal while a 400% one was running**, twice. Zero temps are not incidental to oref1 — one accompanies every SMB, and it
 is how the loop backs off insulin when glucose falls — so this is the loop losing the ability to
 deliver *less* on demand.
 
@@ -38,19 +42,28 @@ hand. The pump went back on saline the same day.
 (to 100%) — that path works and always has. So the loop can start a temp basal and it can cancel one,
 but it cannot *adjust* one, and oref1 adjusts constantly.
 
-**The fix is written (2026-08-05) and is not yet verified on hardware.** `setTbrConfirmed` now reads
-the pump's state before writing; if a temporary basal is running it cancels, requires that cancel to
-confirm, and only then sets. If the cancel fails the set is not attempted and the request is reported
-as failed, leaving the old rate running rather than claiming a change that did not happen.
+### ✅ Fixed and verified on saline, 2026-08-05
+
+`setTbrConfirmed` now reads the pump's state before writing; if a temporary basal is running it
+cancels, **requires that cancel to confirm**, and only then sets. If the cancel fails the set is not
+attempted and the request is reported as failed, leaving the old rate running rather than claiming a
+change that did not happen.
+
+**Phase 11d passed the same morning, both directions, first attempt each** — 400% → 0% and 0% → 397%,
+with the cancel visible in the log between request and confirmation, records under the pump's own
+sequence numbers, and no phantom rows. The command that had been refused 25 times overnight now
+succeeds. It costs **6–14 seconds** instead of ~3, all of it in the cancel's read-back.
 
 Writing it also uncovered a **latent deadlock** in the neighbouring "100% means cancel" branch, which
 called the public cancel from inside a non-reentrant lock. Unreachable in practice — AAPS never asks
 for exactly 100% — but it would have hung the command queue if it ever had been.
 
-⚠ **Until Phase 11d passes on hardware, do not close the loop with insulin in this pump.** The fix has
-no unit test (see `SALINE_TEST_PROCEDURE.md` 11d for why that is deliberate rather than an oversight),
-so a hardware run is the only evidence there will be. Manual and open-loop use are a separate question
-this finding does not settle.
+⚠ **What this does and does not license.** The specific defect that ended the insulin trial is fixed
+and demonstrated on hardware. It is **not** a general clearance: the fix has no unit test (deliberately
+— see `SALINE_TEST_PROCEDURE.md` 11d), its failure branch is still untested, and it has perhaps a
+quarter of an hour of running behind it. **Phase 10 remains open**, so an interrupted bolus is still a
+record to check by hand. Whether that adds up to enough for insulin is a human decision, and it has
+already been taken once and reversed.
 
 ⚠ **A second gate is open and it is not about the pump.** **Phase 10 — what AAPS's database holds
 after a bolus is interrupted** by a dropped link or a killed app — is written and has never been run,

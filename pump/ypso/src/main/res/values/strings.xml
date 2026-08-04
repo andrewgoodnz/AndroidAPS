@@ -37,7 +37,7 @@ It writes no treatment record; the history sync will pick up whatever the pump l
       complains about bare substitutions besides. "zero temp basal" says the same thing and cannot
       render wrong.
     -->
-    <string name="ypso_research_pump_banner">RESEARCH PUMP DRIVER — verified on saline only. ⚠ NOT for closed-loop use with insulin: this pump can refuse a zero temp basal (Phase 11). Plaintext — cannot connect to a standard YpsoPump.</string>
+    <string name="ypso_research_pump_banner">RESEARCH PUMP DRIVER — verified on saline only. ⚠ An interrupted bolus may be counted twice (Phase 10, unrun). Plaintext — cannot connect to a standard YpsoPump.</string>
 
     <string name="ypso_pairing_title">Pair YpsoPump</string>
     <string name="ypso_pairing_summary">Scan for your pump and bond to it. Confirm the code shown on the pump.</string>
