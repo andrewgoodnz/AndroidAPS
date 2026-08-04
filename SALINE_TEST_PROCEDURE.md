@@ -2830,6 +2830,13 @@ asked to replace it with 0% and was refused by the pump both times**:
 guard — a percentage outside it produces a different message naming the range. The failure comes from
 `!suspendStartTbr(...)` inside `setTbrConfirmed`, which is the write itself.
 
+⚠ **What the field capture cannot tell us, because of the filter it was taken with.** The live log was
+captured with `PUMP:V PUMPBTCOMM:V "*:S"`, which omits `YpsoBleManager` — so the `Starting TBR: 0% for
+60min` line and whatever the ATT layer said about it are simply not in the only recording of this
+event. `startTbr` returns false both when a write fails **and** when the characteristic is missing, and
+those are very different faults. Nothing below should assume which one happened; *Before starting*
+fixes the filter so the next capture can say.
+
 **Why this ends a loop trial rather than joining a list.** A zero temporary basal is not an occasional
 request in oref1: it accompanies **every SMB**, because the microbolus replaces basal delivery, and it
 is the loop's primary instrument for backing off insulin when glucose falls. A pump that will not
@@ -2871,8 +2878,35 @@ rules out neither.
 - Study phone (Lotus) off. NSClient uploading off.
 - Base basal must be a known non-zero rate or the percentage arithmetic is meaningless. Record it —
   every expected rate below is a multiple of it.
-- logcat running before the pump is touched:
-  `adb logcat -v time PUMP:V PUMPBTCOMM:V "*:S"`
+- logcat running before the pump is touched, and **with the BLE tags included**:
+
+  ```bash
+  adb logcat -v time PUMP:V PUMPBTCOMM:V YpsoBleManager:V YpsoPumpManagerImpl:V "*:S"
+  ```
+
+  ⚠ **Not the shorter `PUMP:V PUMPBTCOMM:V` filter.** The field capture used that one, and it is why
+  the most useful line about this defect is missing from the only recording of it: `startTbr` logs
+  `Starting TBR: n% for Nmin` immediately before the write, and `writeCommandPayload` reports what the
+  ATT layer did with it. Without those, `confirmed=false` cannot distinguish **the write being
+  rejected** from **the write never being attempted** (`startTbr` also returns false when the
+  characteristic is missing, logging `CHAR_TBR_START_STOP not found`).
+
+### ⚠ One thing to settle while you are here: does this pump NAK at all?
+
+§0 states that a successful GATT write proves nothing because **this pump does not NAK a bad write** —
+a wrong auth password produced a perfectly successful write that only failed on the next read. That
+rule is load-bearing: it is why every write in this driver is confirmed by a read-back.
+
+**A refusal at write time would be the first counter-example.** So for every refusal below, record
+which layer produced it:
+
+| What the log shows | What it means |
+|---|---|
+| `Starting TBR: …` then an ATT/GATT failure | the pump **did** reject a write — new, and §0's rule needs qualifying |
+| `Starting TBR: …` then nothing, then `confirmed=false` | the write was accepted and the read-back disagreed — the ordinary pattern |
+| no `Starting TBR: …` at all | the driver never wrote; look at the characteristic, not the pump |
+
+This costs nothing to collect and answers a question older than this phase.
 
 ## 11a. 0% from idle — the decisive one
 
