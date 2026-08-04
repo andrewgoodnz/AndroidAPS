@@ -296,6 +296,35 @@ profiles, not running TBRs. So the profile self-corrects and a TBR set against t
 Turn the other controller off, or keep it out of range, before connecting. `PORTING_NOTES.md` §4h has
 the reasoning and the capture.
 
+### A basal of 1.25 U/h shows on the pump as 1.26 — that is the pump's step, not a fault
+
+**This pump cannot store every rate.** Its basal step widens as the rate rises:
+
+| Rate band | Step the pump can store | Worst-case error |
+|---|---|---|
+| 0 – 1 U/h | 0.01 | ±0.005 U/h (±0.12 U/day) |
+| **1 – 2 U/h** | **0.02** | ±0.01 U/h (±0.24 U/day) |
+| 2 – 15 U/h | 0.1 | ±0.05 U/h (±1.2 U/day) |
+| 15 – 40 U/h | 0.5 | ±0.25 U/h |
+
+So in the 1–2 band the storable rates are 1.24, **1.26**, 1.28 … and **1.25 does not exist**. It sits
+exactly halfway, and AAPS's shared rounding helper breaks ties upward, so a 1.25 U/h profile is
+programmed as 1.26. The bias on a tie is therefore always toward *slightly more* insulin — 0.01 U/h
+here, a quarter of a unit a day.
+
+None of this is specific to this driver: the step table is the pump's, and `Round.roundTo` is the same
+helper every AAPS pump driver uses. **It is written to the log every time it happens**, naming each
+slot it moved:
+
+```
+setNewBasalProfile: rounded to the pump's step hour 0 1.250→1.26, hour 1 1.250→1.26, …
+```
+
+⚠ **The one thing worth knowing** is that `isThisProfileSet` rounds through the *same* function, which
+is why a profile that had to be rounded still reads as "set" instead of being rewritten on every loop
+iteration for ever. If those two ever diverge, that is the symptom — an endless profile write, not a
+wrong rate. Pick profile rates on the pump's step if you would rather see your own numbers.
+
 ### Smaller ones
 
 - **A low reservoir is not a pump alert.** The mylife controller computes it on the phone; nothing
