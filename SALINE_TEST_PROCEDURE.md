@@ -3199,16 +3199,52 @@ the rate it claims — 0.45 U/h being 150% of the 0.3 U/h base.
 pump reading `tbr=none` afterwards at 21:19:46 and the loop then setting a fresh 400% from idle. A
 non-zero temporary basal is honoured for its whole programmed duration.
 
-⚠ **So the early ending looks specific to 0%, not general to temporary basals** — a more troubling
-shape, because 0% is the one the loop depends on for backing off. The comparison is now controlled
-(same session, same 30-minute request, same polling) but it is still **one observation of each**:
+### ✅ [verified] RETRACTED, 22:44 the same night — a 0% temporary basal *does* run its full duration
 
-| | asked | recorded | source of the recorded figure |
+The loop set its own 0% for 30 minutes at 22:14:43, and this one was watched continuously across the
+whole thing — through the ~20.7-minute point where the first one died, and out the other side:
+
+```
+22:14:44  tbr=0% 30min   reservoir 80.48
+22:24:44  tbr=0% 20min   reservoir 80.48     ← past nothing yet
+22:29:39  tbr=0% 15min   reservoir 80.48
+22:39:42  tbr=0%  5min   reservoir 80.48     ← 25 min in, well past 20.757, still running
+22:44:36  tbr=none       reservoir 80.48     ← expired naturally, on time
+```
+
+`temporaryBasals` row 86 records **29.905 min of a 30-minute request** — full duration, the residue
+being AAPS noticing at the next poll. And the reservoir did not move by **0.01 U across the entire 30
+minutes**, where 0.3 U/h would have consumed 0.15 U.
+
+**So the suspicion is withdrawn.** A zero temporary basal is accepted, suspends delivery completely,
+and runs for exactly as long as it was asked to. The cancel-then-set fix may safely assume a zero
+temp, once accepted, stays.
+
+⚠ **What that leaves is a genuine one-off, and it should stay on the record as one.** Row 78 really did
+end at 20.757 minutes, and row 86 is a direct counter-example under the same conditions in the same
+session. So the earlier ending was **not a property of 0% TBRs** — it was something that happened once,
+whose cause was never identified and whose logcat window had rotated by the time it mattered. Do not
+build anything on it, and do not delete it: if it recurs, this row is the prior.
+
+| | asked | recorded | outcome |
 |---|---|---|---|
-| 0% | 30 min | **20.757 min** | AAPS's own reckoning at 20:38:50 |
-| 150% | 30 min | **30.000 min** | the requested value, untouched |
+| 0% (161453) | 30 min | 20.757 min | ⚠ unexplained one-off |
+| 150% (161454) | 30 min | 30.000 min | full |
+| 400% (161455) | 30 min | 25.052 min | cancelled by the loop |
+| **0% (161456)** | 30 min | **29.905 min** | **full — the retraction** |
 
-What would settle it is a **0% left alone and polled continuously across its full duration**, with the
-reservoir read at both ends and logcat dumped the moment it disappears. Until that exists, treat "a
-zero temp may quietly end early" as **suspected and unconfirmed** — and do not build the
-cancel-then-set fix on an assumption that a zero temp, once accepted, stays.
+### ⚠ The refusal is not about the value: an identical request is refused too
+
+Three more refusals arrived while that 0% ran, and two of them asked for **0% while 0% was already
+running**:
+
+```
+22:24:45  asked 0% for 60min  → refused   (0% running, 20 min left)
+22:29:41  asked 0% for 60min  → refused   (0% running, 15 min left)
+22:39:42  asked 0% for 30min  → refused   (0% running,  5 min left)
+```
+
+The last is the sharpest: **0% for 30 minutes refused while 0% for 30 minutes was running** — the same
+percentage and the same duration. So this is not "the pump will not change a rate"; it is **"the pump
+will not accept any new temporary basal while one is running"**, full stop. That simplifies the fix —
+`setTbrConfirmed` does not need to compare anything, it only needs to know whether a TBR is active.
