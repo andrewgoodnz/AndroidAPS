@@ -3110,6 +3110,22 @@ identical to the field's. Taken with 11a this settles the 2×2: **H-ZERO is refu
 confirmed.** The pump will change a running temporary basal to *none* (cancel works) but not to
 another value.
 
+#### The overnight tally — 12 out of 12, and 7 out of 7, with no overlap
+
+Left running from 20:18 to 23:52 against real glucose data, the loop produced a clean separation:
+
+| Attempt | Count | Outcome |
+|---|---|---|
+| set while a TBR was **running** | **12** | **all refused** |
+| set from **`tbr=none`** | **7** | **all accepted** — 0%, 150%, 400%, 0%, 0%, 300%, 213% |
+| cancel a running TBR | 1 | accepted |
+
+**No attempt in either group went the other way.** Percentages spanned 0–400% and durations 30 and 60
+minutes, so the rule is not about magnitude, direction, or length — it is only about whether a
+temporary basal is already running. That is the number to quote when the fix is written, and it is why
+`setTbrConfirmed` needs no comparison logic: a single "is one running?" check is sufficient and
+complete.
+
 ### What the loop can and cannot do — observed over three hours of saline looping
 
 The refusal is narrower than "the loop cannot drive this pump". Watching a real closed loop from
