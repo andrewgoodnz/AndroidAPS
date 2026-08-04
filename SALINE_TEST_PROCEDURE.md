@@ -3019,23 +3019,52 @@ Set **400% for 30 min**, and once confirmed running, ask for **0% for 60 min** �
 This step is why the other two mean anything, and it is the same reason Phase 10 carries a control:
 four checks in `PORTING_NOTES` turned out to be incapable of failing, and every one read as a pass.
 
-## 11d. Cancel-then-set — the proposed fix, by hand before it is written
+## 11d. Cancel-then-set — ⚠ **the fix is now written; this validates it**
 
-Only if 11b refused (H-REPLACE).
+**This step was originally "do it by hand before writing the code", and that rule has been overtaken.**
+It existed to avoid a failure that could not be attributed — pump or patch. What removed the ambiguity
+was not a manual run but the overnight ledger: **25 refusals and 24 successes with no exception in
+either group**, which pins the pump's behaviour far more tightly than one hand-run of three steps
+would have. Both halves of the fix were also exercised repeatedly by the loop itself: 16 sets from
+idle, 8 cancels, all confirmed by read-back.
 
-1. Set **400% for 30 min**. Confirm running.
-2. **Cancel** from AAPS. Confirm byte 10 back to 100 and `tbr=none`.
-3. Immediately set **0% for 60 min**.
+**What was written (`YpsoPumpManagerImpl.setTbrConfirmed`, 2026-08-05):** read the status first; if a
+temporary basal is running, `cancelTbrLocked()` and require that cancel to confirm; only then issue
+the set. If the status cannot be read, or the cancel does not confirm, **the set is not attempted** —
+the old rate keeps running and AAPS is told the request failed, which is the honest report.
 
-**Confirm the whole sequence completes and byte 10 reads 0.** If it does, `setTbrConfirmed` can do the
-same internally whenever it finds a TBR already running, and the fix is a few lines against a
-primitive that already works. Time the three steps — they happen inside one held connection, and a
-zero temp that takes a few seconds longer to apply is still a zero temp, but the cost belongs in the
-notes.
+⚠ **Two things in that patch are not covered by the overnight evidence, and are what this step is now
+for:**
 
-⚠ **Do not write the fix before this passes by hand.** Doing it manually first means a failure here is
-information about the pump; a failure after the code is written is ambiguous between the pump and the
-patch.
+1. **Cancel and set back to back inside one connection.** Every observed cancel was followed by a
+   *poll*, then a set on a later connection. Nothing has yet cancelled and immediately set within the
+   same held session. If the pump needs longer than `TBR_SETTLE_MS` to accept a new TBR after a
+   cancel, this is where it shows.
+2. **The failure branch.** The set must not be attempted when the cancel fails.
+
+### The procedure
+
+1. Set **400% for 30 min** from AAPS. Confirm running (byte 10 = 400).
+2. **Without cancelling**, set **0% for 60 min**. Before the fix this was refused; it must now
+   succeed.
+3. **Confirm:** byte 10 reads 0, the AAPS record shows a 0% TBR, and the log shows the whole sequence
+   in one session — `A 400% temporary basal is already running; cancelling it before setting 0%`, then
+   the cancel's read-back, then `TBR confirmed by read-back: 0%`.
+4. **Time it.** All of it happens inside one held connection; a zero temp that takes a few seconds
+   longer to apply is still a zero temp, but the cost belongs in the notes.
+5. Repeat once in the other direction (a low rate running, a high one requested) so the fix is not
+   only exercised toward zero.
+
+**11d is passed when a replacement succeeds on the first attempt, with the cancel visible in the log
+between the request and the confirmation.** If the set is refused *after* a confirmed cancel, that is
+a new finding — a settle-time problem, not the occupancy rule — and `TBR_SETTLE_MS` is the first thing
+to look at.
+
+⚠ **The fix has no unit test, deliberately.** The decision it makes ("is one running? then cancel
+first") is a single condition, and a test asserting that null aborts, running cancels, and idle
+proceeds would only restate the code — the shape this file has been caught by four times already. The
+part worth testing is the *ordering*, and that needs a fake BLE layer which does not exist. **So the
+evidence for this fix is 11d on hardware, and nothing else.**
 
 ## 11e. Does a zero temp survive its own duration?
 
@@ -3073,7 +3102,7 @@ from a real trial rather than a precaution.
 | 11a 0% from idle | 0% / 30 min from `tbr=none` | unknown — the question | ✅ **ACCEPTED — 2026-08-04 20:18** |
 | 11b replace non-zero | a TBR running → a different one | unknown — the question | ❌ **REFUSED — 2026-08-04 20:49** |
 | 11c field control | reproduce the field refusal | **refused** | ✅ **REPRODUCED — same message** |
-| 11d cancel-then-set | TBR → cancel → new TBR | accepted | ⏳ **NOT RUN** |
+| 11d cancel-then-set | replace a running TBR directly | accepted, cancel visible in the log | 📝 **FIX WRITTEN 2026-08-05, NOT YET RUN** |
 | 11e zero temp endures | 0% / 30 min, watched | byte 10 stays 0, reservoir static | ⚠ **ENDED EARLY — see below** |
 
 ### ✅❌ **RESOLVED 2026-08-04: it is H-REPLACE. 0% was never special.**

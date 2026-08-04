@@ -1084,10 +1084,38 @@ Phase 11 ran on the bench a few hours later and separated the two hypotheses:
 So the rule is: this pump will start a temporary basal, and will cancel one to 100%, but will **not
 change a running one to another value**. Nothing about zero was ever special.
 
-**The fix belongs in `setTbrConfirmed`: cancel first when a temporary basal is already running, then
-set.** It builds on `cancelTbrConfirmed`, which works. Phase 11d requires the sequence demonstrated
-**by hand before the code is written**, because a failure by hand is information about the pump and a
-failure afterwards is ambiguous between the pump and the patch.
+#### ✅ [written 2026-08-05] The fix — cancel first, and one latent deadlock found on the way
+
+`setTbrConfirmed` now reads the status before writing; if a temporary basal is running it calls
+`cancelTbrLocked()`, requires that cancel to confirm, and only then issues the set. If the status
+cannot be read, or the cancel does not confirm, **the set is not attempted** — the old rate keeps
+running and AAPS is told the request failed, which is the honest report and avoids naming the wrong
+cause for a refusal that would then be inevitable.
+
+**It reads the status rather than cancelling blindly.** A cancel with nothing running does succeed, so
+unconditional cancelling would work, but it spends a write on the common case — and the read is worth
+having anyway, because putting the pre-state in the log next to the decision is what made this
+diagnosable at all.
+
+⚠⚠ **Writing it uncovered a latent deadlock in the path next door.** The existing "100% means cancel"
+branch called the **public** `cancelTbrConfirmed()` from inside its own `withConnection` — and
+`pumpMutex` is a plain `Mutex`, which is **not reentrant**, as the chunked-bolus code says in as many
+words. That branch would have hung the command queue until its timeout. It had never been reached
+because AAPS expresses "back to profile rate" as `cancelTempBasal`, never as a 100% set, so no
+hardware phase ever asked for exactly 100%. Both paths now call the lock-free `cancelTbrLocked()`,
+extracted for exactly the reason `deliverOneBolus` was.
+
+⚠ **The evidence for this fix is Phase 11d on hardware, and nothing else.** It has no unit test, and
+deliberately so: the decision is one condition, and a test asserting that a running TBR causes a
+cancel would only restate the code — the shape this file has already been caught by four times. What
+is worth testing is the *ordering*, and that needs a fake BLE layer that does not exist. Two things
+the overnight ledger does **not** cover: cancel-and-set back to back inside one connection (every
+observed cancel was followed by a poll, not an immediate set), and the failure branch.
+
+**11d was originally "demonstrate it by hand before writing the code".** That rule was overtaken by
+the ledger — 25 refusals and 24 successes with no exception in either group pins the pump's behaviour
+far more tightly than one hand-run of three steps, and both halves of the fix had already been
+exercised repeatedly by the loop itself.
 
 ⚠ **And the reason nine phases missed it is structural, not careless.** When a temporary basal is
 running, AAPS's Actions tab replaces the `TEMPBASAL` button with `CANCEL n%` — there is no "set a

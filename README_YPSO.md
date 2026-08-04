@@ -38,12 +38,19 @@ hand. The pump went back on saline the same day.
 (to 100%) — that path works and always has. So the loop can start a temp basal and it can cancel one,
 but it cannot *adjust* one, and oref1 adjusts constantly.
 
-**The fix is therefore small and known:** `setTbrConfirmed` should cancel first when it finds a
-temporary basal already running, then set — building on a primitive that already works. Phase 11d
-requires that sequence demonstrated by hand before the code is written.
+**The fix is written (2026-08-05) and is not yet verified on hardware.** `setTbrConfirmed` now reads
+the pump's state before writing; if a temporary basal is running it cancels, requires that cancel to
+confirm, and only then sets. If the cancel fails the set is not attempted and the request is reported
+as failed, leaving the old rate running rather than claiming a change that did not happen.
 
-Until that fix exists and is tested: **do not close the loop with insulin in this pump.** Manual and
-open-loop use are a separate question this finding does not settle.
+Writing it also uncovered a **latent deadlock** in the neighbouring "100% means cancel" branch, which
+called the public cancel from inside a non-reentrant lock. Unreachable in practice — AAPS never asks
+for exactly 100% — but it would have hung the command queue if it ever had been.
+
+⚠ **Until Phase 11d passes on hardware, do not close the loop with insulin in this pump.** The fix has
+no unit test (see `SALINE_TEST_PROCEDURE.md` 11d for why that is deliberate rather than an oversight),
+so a hardware run is the only evidence there will be. Manual and open-loop use are a separate question
+this finding does not settle.
 
 ⚠ **A second gate is open and it is not about the pump.** **Phase 10 — what AAPS's database holds
 after a bolus is interrupted** by a dropped link or a killed app — is written and has never been run,

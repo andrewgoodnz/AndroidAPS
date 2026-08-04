@@ -1599,10 +1599,50 @@ class YpsoPumpManagerImpl private constructor(
 
         // 100% is how this pump expresses "none", so a request for it is a cancellation however it
         // arrived. Treating it as a set would leave AAPS thinking a temporary basal was running.
+        //
+        // ⚠ This called the *public* `cancelTbrConfirmed` until 2026-08-05, from inside this
+        // `withConnection` — a guaranteed deadlock on a non-reentrant mutex. It had never been
+        // reached because AAPS expresses "back to profile rate" as `cancelTempBasal`, not as a 100%
+        // set, so nothing in nine hardware phases ever asked for exactly 100%.
         if (percentage == SystemStatusData.TBR_PERCENT_NONE) {
             log("setTbr($percentage%) is this pump's 'no TBR' value — cancelling instead")
-            val cancelled = cancelTbrConfirmed()
+            val cancelled = cancelTbrLocked()
             return@withConnection cancelled.copy(durationMinutes = durationMinutes)
+        }
+
+        // ⚠⚠ [verified 2026-08-04/05] This pump refuses **any** new temporary basal while one is
+        // already running, so a replacement has to be a cancel followed by a set (§4h, Phase 11).
+        //
+        // The rule is about occupancy and nothing else. Twenty-five refusals were collected across a
+        // night of real looping, spanning 0–400% and both 30- and 60-minute durations, including
+        // 0% refused while 0% was running — the *same* value and duration. Against that, sixteen
+        // sets from `tbr=none` and eight cancels all succeeded, with no exception in either group.
+        // So there is nothing to compare: the only question is whether one is running.
+        //
+        // Read first rather than cancelling blindly. A cancel with nothing running does succeed, but
+        // it spends a write on the common case, and the read is worth having anyway — it puts the
+        // pre-state in the log next to the decision, which is what made this diagnosable at all.
+        val before = suspendGetSystemStatus()
+        if (before == null) {
+            return@withConnection tbrFailure(
+                percentage, durationMinutes,
+                "The status did not read back before the write, so whether a temporary basal is already running is UNKNOWN — not attempting a set that would be refused"
+            )
+        }
+        updateStatusFromSystem(before)
+
+        if (before.isTbrRunning) {
+            log("A ${before.tbrPercent}% temporary basal is already running; cancelling it before setting $percentage% (this pump will not replace one)")
+            val cancelled = cancelTbrLocked()
+            if (!cancelled.confirmed) {
+                // Do not fall through to the set: the pump would refuse it, and reporting that
+                // refusal would name the wrong cause. The old rate is still running and AAPS must
+                // be told the request failed while it does.
+                return@withConnection tbrFailure(
+                    percentage, durationMinutes,
+                    "Could not cancel the running ${before.tbrPercent}% first, so $percentage% was not attempted — ${cancelled.errorMessage}"
+                )
+            }
         }
 
         val baselineSequence = newestEventSequence()
@@ -1653,9 +1693,22 @@ class YpsoPumpManagerImpl private constructor(
      * Reports success when the pump already had none running: the caller's intent — no temporary
      * basal — is satisfied, and failing would make AAPS retry something already true.
      */
-    suspend fun cancelTbrConfirmed(expectedSequence: Long? = null): ConfirmedTbr = withConnection {
+    suspend fun cancelTbrConfirmed(expectedSequence: Long? = null): ConfirmedTbr =
+        withConnection { cancelTbrLocked(expectedSequence) }
+
+    /**
+     * The cancel itself, **with the connection lock already held**.
+     *
+     * Extracted for the same reason `deliverOneBolus` was: [pumpMutex] is not reentrant, so
+     * [setTbrConfirmed] — which must cancel before it can set (§4h) — would deadlock the moment it
+     * called the public method from inside its own `withConnection`. Taking the lock per step is not
+     * an alternative either: it would let a status read or another command land between the cancel
+     * and the set, which is precisely the window where the pump has no temporary basal and AAPS
+     * believes it has one.
+     */
+    private suspend fun cancelTbrLocked(expectedSequence: Long? = null): ConfirmedTbr {
         if (!suspendCancelTbr()) {
-            return@withConnection tbrFailure(
+            return tbrFailure(
                 SystemStatusData.TBR_PERCENT_NONE, 0, "The pump refused the temporary basal cancel"
             )
         }
@@ -1663,7 +1716,7 @@ class YpsoPumpManagerImpl private constructor(
 
         val status = suspendGetSystemStatus()
         if (status == null) {
-            return@withConnection tbrFailure(
+            return tbrFailure(
                 SystemStatusData.TBR_PERCENT_NONE, 0,
                 "The status did not read back after the cancel — whether a temporary basal is still running is UNKNOWN, check the pump"
             )
@@ -1671,7 +1724,7 @@ class YpsoPumpManagerImpl private constructor(
         updateStatusFromSystem(status)
 
         if (status.isTbrRunning) {
-            return@withConnection tbrFailure(
+            return tbrFailure(
                 SystemStatusData.TBR_PERCENT_NONE, 0,
                 "Pump still reports ${status.tbrPercent}% after the cancel"
             )
@@ -1684,7 +1737,7 @@ class YpsoPumpManagerImpl private constructor(
                     ?: ", but no end entry found so the stop cannot be recorded")
         )
 
-        ConfirmedTbr(
+        return ConfirmedTbr(
             percentage = SystemStatusData.TBR_PERCENT_NONE,
             durationMinutes = 0,
             pumpSequence = record?.sequence,
