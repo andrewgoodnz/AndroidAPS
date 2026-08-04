@@ -3232,6 +3232,43 @@ build anything on it, and do not delete it: if it recurs, this row is the prior.
 | 150% (161454) | 30 min | 30.000 min | full |
 | 400% (161455) | 30 min | 25.052 min | cancelled by the loop |
 | **0% (161456)** | 30 min | **29.905 min** | **full — the retraction** |
+| **0% (161457)** | 30 min | **~30.08 min** | **full — set 22:44:39, `tbr=none` at 23:14:44** |
+
+**Two zero temps out of two have now run to term**, so the retraction stands on a pair rather than a
+single counter-example.
+
+### ⚠⚠ [verified] What it actually costs: 15 minutes of **zero** basal against the loop's intent
+
+The clearest measurement of the night, 22:44–23:14, and the one to quote when deciding whether this
+driver may loop. The loop set a 0% zero temp for 30 minutes at 22:44:39. Glucose then began to rise,
+and the loop tried to escalate — and could not:
+
+```
+22:59:42  tbr=0% 15min left  →  asked 213%  →  REFUSED
+23:04:41  tbr=0% 10min left  →  asked 253%  →  REFUSED
+23:09:45  tbr=0%  5min left  →  asked 287%  →  REFUSED
+23:14:44  tbr=none (expired) →  asked 300%  →  ✅ ACCEPTED, seq=161458
+```
+
+**For 15.05 minutes the pump delivered nothing at all while the loop was asking for two to three times
+basal.** The reservoir confirms it independently: static at **80.48 U** for the entire half hour, so
+this is not a bookkeeping artefact — no insulin moved.
+
+Three things this makes concrete:
+
+1. **The blocked interval is bounded by whatever TBR happens to be running**, not by anything the loop
+   controls. AAPS sets temporary basals for 30 minutes, and cannot replace them, so **the worst case is
+   up to 30 minutes of the wrong rate** — and when that rate is 0%, it is 30 minutes of no basal at all.
+2. **The loop's requests escalate while it is blocked** (213 → 253 → 287 → 300) because the deviation
+   it is correcting keeps growing. The correction is not lost, it is *deferred and enlarged*.
+3. **It all lands at once.** The instant the 0% expired, 300% was accepted on the first attempt. So the
+   pattern is a suspension, followed by a large catch-up — which is the oscillation this defect
+   produces, rather than a simple under-delivery.
+
+⚠ **Direction of harm depends on which way it is stuck**, and both have now been seen: stuck at 400%
+wanting 0% on insulin (over-delivery, the hypo direction, §4h), and stuck at 0% wanting 300% here
+(under-delivery, then a catch-up). **The first is the dangerous one. This one is the one that shows
+how long it lasts.**
 
 ### ⚠ The refusal is not about the value: an identical request is refused too
 
