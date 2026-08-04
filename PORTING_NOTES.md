@@ -112,6 +112,30 @@ next: 9c's re-run caught the **instrument** logging a stale inter-chunk gap for 
 produced no entry (§8.6). Not a vacuous check — a truthful-looking number computed from the wrong
 input, in the log rather than in the driver.
 
+### ⚠ The third variety, and the most expensive: the untested *combination*
+
+The two above are about a check that could not fail and a number computed from the wrong input. Phase
+11 is a third kind, and it cost more than either: **a test that was never written at all, because
+nobody noticed there was a pair.**
+
+Every phase from 1 to 9 removed one refusal and tested that capability **on its own**. Setting a
+temporary basal passed. Cancelling one passed, repeatedly, across several days. *Replacing* one was
+never tried — and that is what the pump refused, on insulin, on a person (§4h).
+
+What makes it worth a heading is that the blind spot was **structural, not careless**. The procedure's
+own rule — *remove one refusal at a time, each with its own saline test, never in a batch* — is a good
+rule that produced a driver whose capabilities are individually well evidenced, and it says nothing
+about the pairs. Worse, the still-to-run list already contained the sibling case (a bolus while a TBR
+runs) rated **"Low risk, real"**, and that rating was reached by exactly the reasoning that would have
+cleared the TBR-replace case: both operations work alone, both are identified by sequence, so the pair
+looks safe.
+
+`SALINE_TEST_PROCEDURE.md` now carries a **combination matrix** — `command × the pump's state when it
+arrives` — with what has been run, what has not, and the two entries promoted out of "someday" by this
+finding: a **basal profile write while a temporary basal runs** (a TBR is a percentage, so rewriting
+the profile underneath it silently changes the delivered rate), and **6e's unrun second half**,
+stopping the pump while a real TBR runs. Every "low risk" adjective on that axis has been withdrawn.
+
 ### And a companion lesson, learned the same day it was written down
 
 The YPSO tab's banner has now been wrong three times, and the third one is the interesting one.
