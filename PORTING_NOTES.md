@@ -112,6 +112,25 @@ next: 9c's re-run caught the **instrument** logging a stale inter-chunk gap for 
 produced no entry (§8.6). Not a vacuous check — a truthful-looking number computed from the wrong
 input, in the log rather than in the driver.
 
+### And a companion lesson, learned the same day it was written down
+
+The YPSO tab's banner has now been wrong three times, and the third one is the interesting one.
+
+It read "profile write UNTESTED" until Phase 4 passed. It read "SALINE TEST BUILD — not for use with
+insulin" until a build was made for a phone that would carry insulin. Both were **verdicts**, and the
+fix on 2026-08-04 was to replace them with **facts**, on the argument that a fact cannot go stale:
+*"verified on saline only, never against a person."*
+
+**The second half was false the same afternoon**, when the driver ran a closed loop on somebody for ten
+minutes. "Verified on saline only" survived — the verification is what it is, and that trial verified
+nothing because it was aborted by the defect it found. "Never against a person" did not, because it was
+a fact **about something that could still happen**.
+
+So the rule needs its second half: prefer a fact to a verdict, **and prefer a fact about the past to a
+fact about a streak**. Where a live status genuinely has to be shown — and "not fit for closed-loop
+use" has to be — tie it to a **named phase** so it is checkable and somebody knows what would end it,
+rather than leaving a mood on the screen for the next reader to discount.
+
 That is why each phase's confirmation check is written down *before* its code, and why Phase 10 carries
 a control step whose only job is to prove the query can tell one row from two.
 

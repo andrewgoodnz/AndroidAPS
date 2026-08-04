@@ -11,9 +11,9 @@ It also delivers a **slow ("chunked") bolus** — a large dose given as several 
 seconds apart, for comfort — which passed its own hardware phase on 2026-08-04. It is **off by
 default** and cannot happen until the bolus speed is changed by hand.
 
-**Every test to date has been on saline, off-body, cannula to air.** Nothing here has moved insulin
-into a person. What stops it doing so is the cartridge, not the code — see
-[Before insulin](#before-insulin).
+**Every *test* to date has been on saline, off-body, cannula to air** — and that is still literally
+true, because the one period of real insulin use verified nothing: it was aborted after about ten
+minutes by the defect it found (below). Treat this driver as saline-verified and no more.
 
 ## ⚠⚠ Not fit for closed-loop use with insulin — read this before anything else
 
@@ -701,9 +701,21 @@ do the driver's job for it.
 this method* rather than blank: the reservoir reads `-1` throughout a change, so a mid-prime reading
 is byte-identical to one taken after it.
 
-**None of the pump-facing gaps is a capability gap.** The driver can do what it needs to do. What is
-missing is observation — and the decision to move from saline to insulin is a human one, taken by the
-person whose body it is, not a task in a checklist.
+**This paragraph used to say that none of the gaps was a capability gap, and that the driver could do
+what it needed to do.** That was written on 2026-08-04, hours before the pump refused a command the
+loop depends on. It is left here in corrected form rather than deleted, because the error in it is
+instructive: every gap *known at the time* was about records, timing and observation, and the
+conclusion drawn was that nothing remained but a human decision. What was actually missing was a test
+of two capabilities **together**, and no amount of confidence about the individual ones could stand in
+for it.
+
+So: the temporary-basal replacement gap **is** a capability gap, it is open, and it is the one that
+decides whether this driver can close a loop at all. The rest — the 3000-entry log wrap, an untested
+DST change, Phase 10's interrupted-bolus records — remain observation.
+
+The decision to put insulin in the pump is still a human one, taken by the person whose body it is and
+not a task in a checklist. It has now been taken once and reversed the same day, which is the system
+working.
 
 ---
 

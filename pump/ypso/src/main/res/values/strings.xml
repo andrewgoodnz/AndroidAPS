@@ -18,13 +18,26 @@ It writes no treatment record; the history sync will pick up whatever the pump l
     <string name="ypso_ext_probe_running">Probe running — this takes about two minutes. Watch the log.</string>
 
     <!--
-      The banner at the top of the YPSO tab. Both sentences are facts about the driver rather than
-      verdicts about how it may be used, because the sentence this replaced ("SALINE TEST BUILD …
-      Not for use with insulin") was a verdict, and it went stale the moment a build was made for a
-      phone that will carry insulin. A safety line that is visibly false teaches the reader to skip
-      the next one. "Verified on saline only" stays true whatever anybody puts in the cartridge.
+      The banner at the top of the YPSO tab, and a small lesson in its own history.
+
+      It read "SALINE TEST BUILD … Not for use with insulin" until that became a verdict nobody had
+      revisited. It was replaced on 2026-08-04 with facts chosen to be immune to going stale — and
+      one of them, "never against a person", was false **the same afternoon**, when the driver ran a
+      closed loop on somebody for ten minutes. Writing a fact rather than a verdict is not enough if
+      the fact is about something that can still happen.
+
+      What is here now: "verified on saline only" is durable, because the verification is what it is
+      and that trial verified nothing (it was aborted by the defect it found). The second sentence is
+      a live status deliberately tied to a **named phase**, so it is checkable rather than a mood —
+      when Phase 11 passes, this line is meant to change.
     -->
-    <string name="ypso_research_pump_banner">RESEARCH PUMP DRIVER — verified on saline only, never against a person. This build talks plaintext and cannot connect to a standard YpsoPump.</string>
+    <!--
+      ⚠ No percent sign in this string. It is used directly as android:text, never through
+      String.format, so a literal "%" is shown raw and "%%" is shown as two of them — and aapt
+      complains about bare substitutions besides. "zero temp basal" says the same thing and cannot
+      render wrong.
+    -->
+    <string name="ypso_research_pump_banner">RESEARCH PUMP DRIVER — verified on saline only. ⚠ NOT for closed-loop use with insulin: this pump can refuse a zero temp basal (Phase 11). Plaintext — cannot connect to a standard YpsoPump.</string>
 
     <string name="ypso_pairing_title">Pair YpsoPump</string>
     <string name="ypso_pairing_summary">Scan for your pump and bond to it. Confirm the code shown on the pump.</string>
