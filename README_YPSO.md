@@ -243,6 +243,24 @@ reads as suspended). Dana and Diaconn guess the other way.
 If you want the loop up faster after a restart, open the YPSO tab and press **Refresh** — the
 suspension ends on the first successful status read, not on a timer.
 
+### ⚠⚠ Never let two controllers reach this pump — the cost is now measured
+
+Two AAPS installs (or AAPS and mylife Lotus) on one pump do not merely produce confusing logs. On
+2026-08-04 the main phone came back into Bluetooth range while the test tablet was connected, and the
+two spent several minutes **overwriting each other's basal profile** — the tablet saw its base rate go
+`0.3 → 1.2 → 0.3 U/h` without anybody touching it.
+
+That matters more here than on most pumps, because **a temporary basal on this pump is a percentage**.
+AAPS computes the insulin from `its own profile × the percentage`, so while the two controllers
+disagree about the profile, every TBR is multiplied by the wrong base. At 400%, a 1.2 versus 0.3 U/h
+disagreement is a **four-fold** error in what AAPS thinks is being delivered — and in the direction
+where the pump's real base is *higher* than AAPS believes, AAPS under-counts the insulin going in and
+doses more on top.
+
+`isThisProfileSet` notices the divergence and AAPS rewrites the profile, so it heals — but it heals
+*afterwards*, and nothing protects the window. Turn the other controller off, or keep it out of range,
+before connecting. `PORTING_NOTES.md` §4h has the reasoning in full.
+
 ### Smaller ones
 
 - **A low reservoir is not a pump alert.** The mylife controller computes it on the phone; nothing

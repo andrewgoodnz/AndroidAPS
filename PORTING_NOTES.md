@@ -986,6 +986,45 @@ running reports success with "no end entry to record" — correct on both counts
 Setting it would otherwise leave AAPS believing a temporary basal was running while byte 10 says
 none is.
 
+### Why the TBR is recorded as a **percentage** and not an absolute rate — and what that depends on
+
+Asked directly on 2026-08-04, and the rationale had never been written down. The driver records with
+`isAbsolute = false, rate = percentage`, and that is the right choice **for this pump specifically**.
+
+**Because the pump genuinely applies a percentage to its own hourly profile.** Delivery at any moment
+is `pump_profile(hour) × percent`, and it changes on its own at every hour boundary where the profile
+steps. AAPS interprets a percent TBR the same way — `convertedToAbsolute` is
+`profile.getBasal(time) * rate / 100`, **re-evaluated at each time** rather than fixed at the moment
+the TBR was set.
+
+**Recording an absolute rate would freeze what the pump does not freeze.** AAPS would hold one
+number for the whole duration while the pump stepped its delivery at each hour boundary, and the two
+would disagree for the rest of the TBR. That is item I on the still-to-run list — *"the same
+percentage becomes a different absolute rate"* — and it is filed as inherent behaviour precisely
+because percentage recording makes AAPS track it instead of fighting it. **Choosing absolute would
+convert an inherent, tracked behaviour into a silent recording error.**
+
+⚠ **The correctness condition is that AAPS's profile and the pump's stored profile agree**, because
+`profile.getBasal(time)` reads AAPS's. While they differ, every percentage is multiplied by the wrong
+base:
+
+| Divergence | AAPS believes | Reality | Direction |
+|---|---|---|---|
+| pump base **lower** than AAPS's | more insulin than is delivered | under-delivery | over-states IOB → doses less → **safe side** |
+| pump base **higher** than AAPS's | less insulin than is delivered | over-delivery | under-states IOB → doses more → **hypo direction** |
+
+At 400% a 1.2 vs 0.3 U/h disagreement is a **four-fold** error in what AAPS thinks is going in.
+
+⚠⚠ **And the way that divergence actually arises is two controllers.** Observed the same day: the
+main phone came back into Bluetooth range while the tablet was also connected, and the two spent
+several minutes overwriting each other's basal profile on the same pump — the tablet's `[ypso-state]`
+shows `rate=0.3U/h`, then `1.2U/h`, then `0.3U/h` again. Any percentage TBR set during that window is
+interpreted against whichever profile its own controller last believed. `isThisProfileSet` is the
+guard that notices and heals it, but it heals *afterwards*; there is no protection during the window.
+
+**This is the strongest practical argument for the rule §0 already states** — never let two
+controllers reach this pump — and it is now a measured consequence rather than a tidiness preference.
+
 ### ⚠⚠ [verified] A running temporary basal cannot be replaced by 0% — found on insulin, 2026-08-04
 
 **This is the only finding in this file that came from the driver dosing a person, and it is the
