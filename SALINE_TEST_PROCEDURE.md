@@ -3042,18 +3042,47 @@ for:**
    cancel, this is where it shows.
 2. **The failure branch.** The set must not be attempted when the cancel fails.
 
+### ⚠⚠ This step cannot be driven from the AAPS UI — and that is the whole point
+
+**The obvious procedure — "set 400%, then without cancelling set 0%" — is impossible by hand.** The
+moment a temporary basal is running, AAPS's Actions tab replaces `TEMPBASAL` with `CANCEL n%`. There
+is no affordance for setting a second one, which is exactly why nine bench phases never reached this
+defect. **A procedure that asks a tester to do it manually repeats the mistake it exists to document.**
+
+**The instrument is the loop.** oref1 calls `setTempBasalAbsolute` directly and bypasses the button,
+which is how all 25 refusals were produced in the first place. So the test is to install the fixed
+build, let the loop run against live glucose, and wait for the cycle where it wants a different rate
+while one is running — historically every 5–20 minutes.
+
 ### The procedure
 
-1. Set **400% for 30 min** from AAPS. Confirm running (byte 10 = 400).
-2. **Without cancelling**, set **0% for 60 min**. Before the fix this was refused; it must now
-   succeed.
-3. **Confirm:** byte 10 reads 0, the AAPS record shows a 0% TBR, and the log shows the whole sequence
-   in one session — `A 400% temporary basal is already running; cancelling it before setting 0%`, then
-   the cancel's read-back, then `TBR confirmed by read-back: 0%`.
-4. **Time it.** All of it happens inside one held connection; a zero temp that takes a few seconds
-   longer to apply is still a zero temp, but the cost belongs in the notes.
-5. Repeat once in the other direction (a low rate running, a high one requested) so the fix is not
-   only exercised toward zero.
+1. Install the build carrying the fix on the test tablet, saline, off-body. Confirm the version in the
+   AAPS header matches the commit you think you are testing.
+2. Let the closed loop run against real BG data. **You may seed the precondition by hand**: the UI
+   *will* let you set a temporary basal from idle (say **150% for 30 min**), and the loop will then
+   supply the replacement attempt on its own within a few cycles. That shortens the wait without
+   requiring the impossible step.
+3. Watch the log for the first replacement attempt — a `Starting TBR: N%` while a different one is
+   running.
+
+**Confirm, in one session and in this order:**
+
+```
+[ypso-state] … tbr=M% K min                       ← one is running
+A M% temporary basal is already running; cancelling it before setting N%
+TBR cancel confirmed by read-back: byte 10 is back to 100
+TBR confirmed by read-back: N% with … min left    ← the set that used to be refused
+setTempBasalPercent: asked N% …, confirmed=true
+```
+
+4. **Time the whole sequence.** It happens inside one held connection, and the extra cancel costs a
+   round trip; a zero temp that takes a few seconds longer is still a zero temp, but the cost belongs
+   in the notes.
+5. **Both directions.** Confirm at least one replacement upward (low running, high requested) and one
+   downward (high running, 0% requested). The overnight ledger showed the pump refusing both, so the
+   fix must be seen to handle both.
+6. **The database, not the log.** Confirm `temporaryBasals` holds one live row for the new rate, that
+   the old one is closed, and that no phantom rows appeared.
 
 **11d is passed when a replacement succeeds on the first attempt, with the cancel visible in the log
 between the request and the confirmation.** If the set is refused *after* a confirmed cancel, that is
