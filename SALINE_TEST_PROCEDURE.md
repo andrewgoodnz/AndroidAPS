@@ -3122,7 +3122,11 @@ Left running from 20:18 to 23:52 against real glucose data, the loop produced a 
 
 **No attempt in either group went the other way.** Percentages spanned 0–400% and durations 30 and 60
 minutes, so the rule is not about magnitude, direction, or length — it is only about whether a
-temporary basal is already running. That is the number to quote when the fix is written, and it is why
+temporary basal is already running. ⚠ That last point needed one more observation to be honest: every
+60-minute request had been *refused*, which alone could not distinguish "duration is irrelevant" from
+"this pump dislikes 60 minutes". At 03:14:56 the loop set **0% for 60 minutes from idle and it was
+accepted** (`v2=60`, countdown correct), so the pump does honour the longer duration and the rule
+really is only about occupancy. That is the number to quote when the fix is written, and it is why
 `setTbrConfirmed` needs no comparison logic: a single "is one running?" check is sufficient and
 complete.
 
