@@ -3237,6 +3237,18 @@ build anything on it, and do not delete it: if it recurs, this row is the prior.
 **Two zero temps out of two have now run to term**, so the retraction stands on a pair rather than a
 single counter-example.
 
+⚠ **And the 30.000 figures are the pump's, not AAPS's — which settles the earlier "whose number is
+this" worry.** Row 86 was read twice: at 22:52 it held **29.905 min**, and by 23:31 the same row held
+**30.000**. Something revised it *upward* after the fact, which can only be the history sync
+reconciling the record to the pump's own entry (`v2=30`, whole minutes). So the sequence is: AAPS
+truncates to what it observed at the next poll, then the sync corrects it to what the pump says.
+
+That matters twice over. It makes the full-duration result **pump-sourced and authoritative** rather
+than AAPS's reckoning. And it sharpens the anomaly: rows 86 and 88 were both corrected to 30.000,
+while **row 78 still reads 20.757 and has never been corrected** — so either the pump agrees that one
+ended early, or its entry fell out of the sync's read window before it could be reconciled. Worth
+checking against the pump's own log next time somebody has it in front of them.
+
 ### ⚠⚠ [verified] What it actually costs: 15 minutes of **zero** basal against the loop's intent
 
 The clearest measurement of the night, 22:44–23:14, and the one to quote when deciding whether this
