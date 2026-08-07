@@ -3408,6 +3408,69 @@ while **row 78 still reads 20.757 and has never been corrected** — so either t
 ended early, or its entry fell out of the sync's read window before it could be reconciled. Worth
 checking against the pump's own log next time somebody has it in front of them.
 
+### ✅ [verified] 2026-08-07 — `duration` is a running estimate, and it is rewritten more than once
+
+The "whose number is this" worry above is now settled harder than it was, and in the direction that
+dissolves most of the anomaly. A single row was observed three times across 96 minutes:
+
+| observed at | `duration` | `dateCreated` |
+|---|---|---|
+| 08:02 | 120.000 min | 07:51:38 |
+| 08:21 | *(pump reported 88 min left — 32 min elapsed of 120)* | — |
+| 18:18 | **55.220 min** | **08:44:16** |
+
+Same row, `pumpId=161534`, rewritten twice. So `duration` is not a fact about the pump at all until
+the record is closed and reconciled — it is **AAPS's estimate as of the last time something touched
+it**, and `dateCreated` moves with it. A row read mid-life reports its *programmed* duration; a row
+read after the loop replaced it reports *elapsed to the replacement*.
+
+⚠ **Therefore a short `duration` is never, by itself, evidence that a temporary basal ended early.**
+Both times this session that a zero temp appeared to stop short — the 20.757 one-off above and a
+0%/120 min on 05 Aug that read 30.081 — the reading was taken from a row still being revised. The
+second one was chased as far as asking the operator whether they had cancelled it by hand; that
+question should not have been asked, because the observation never had the meaning attributed to it.
+The 20.757 row stays on the record, but its "unexplained" label should now be read as *probably the
+same artefact*, not as a rival explanation with equal standing. It was never reconciled, so it cannot
+be promoted past "probably".
+
+The general rule, which cost two false alarms to learn: **read a temporary basal's duration only from
+a closed, reconciled row**, and treat anything else as a snapshot of AAPS's bookkeeping.
+
+### ✅✅ [verified] 2026-08-05 → 08-07 — the fix holds over 58 hours of unattended closed loop
+
+The strongest evidence for the cancel-before-set fix is no longer 11d's two hand-run cases. The rig
+ran closed loop on saline, off-body, against real Nightscout glucose, from 05 Aug to 17:52 on 07 Aug
+with no operator intervention in the driver. From the database:
+
+- **124 live temporary basals**, spanning **32 distinct rates** from 107% to the 400% cap
+- **45 replacements** — a running temporary basal cut short with the next one beginning within
+  seconds — **every one of them on a real pump sequence id**
+- **no period of the loop stuck at a rate it was trying to leave**, which is the symptom the refusal
+  produced before the fix and the reason it was caught at all
+
+Set against the pre-fix ledger of **25 refusals and 0 successes** while a temporary basal was
+running, this is the result that matters. ⚠ Note the limit precisely: the database records successes,
+so it proves 45 replacements worked; it cannot by itself prove zero refusals occurred. The
+corroboration is the rate diversity — a refused loop sits pinned at one figure for 15–20 minutes, and
+nothing in these two days does.
+
+### ✅ [verified] The empty-cartridge path, exercised for real rather than by procedure
+
+Not planned, and worth having. At 14:03 on 07 Aug the cartridge ran dry under sustained high temps:
+
+```
+14:03:00  ANNOUNCEMENT  "Alert: Cartridge Empty"   pumpId=161650
+14:18:46  first synthesised 0% temporary basal (pumpId is a timestamp, not a sequence)
+16:55:10  INSULIN_CHANGE                            pumpId=161663
+17:52     suspend record opened, 60 min; status byte0=3 Stopped, reservoir unknown (no cartridge)
+```
+
+The alert decoded and announced, and the driver then represented the stopped pump as a chain of
+contiguous zero temporary basals carrying synthesised ids. That chain is the correct shape — AAPS
+must show *something* covering the gap — and its ids are distinguishable from pump-sourced ones,
+which is what let the two be told apart here. Eight such rows exist in this window and none of them
+should be read as loop decisions.
+
 ### ⚠⚠ [verified] What it actually costs: 15 minutes of **zero** basal against the loop's intent
 
 The clearest measurement of the night, 22:44–23:14, and the one to quote when deciding whether this
