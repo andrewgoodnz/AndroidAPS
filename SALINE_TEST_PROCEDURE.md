@@ -3718,15 +3718,38 @@ it did anything. 53 of 120 real temporary basals over 08-05 → 08-07 met that p
 asserting that a millisecond clock reading is not `161723` is a check incapable of failing — the exact
 pattern that produced four false passes in `PORTING_NOTES`. The hardware sequence below can fail.
 
+### ⚠⚠ This step cannot be driven from the AAPS UI either — the same trap as 11d
+
+The first draft of this procedure said "set 200%, then **without cancelling it** set 0%". That is not
+possible by hand: **while a temporary basal runs, the AAPS button reads `CANCEL n%`, not
+`TEMPBASAL`.** There is no way to ask for a replacement from the UI, which is precisely why the
+Phase 11 defect survived nine bench phases — and 11d already had to be rewritten for this exact
+reason. It was written into this procedure a second time anyway.
+
+**Only the loop can set a temporary basal over a running one.** So the loop is the instrument here,
+as it was in 11d. What the tester supplies is the starting condition and the cancel; oref1 supplies
+the step in the middle.
+
 ### The procedure
 
-1. From idle, set **200% for 30 min**. Confirm `tbr=200%` and note the sequence — call it **A**.
-2. **Without cancelling it**, set **0% for 30 min**. The Phase 11 fix should fire:
-   `A 200% temporary basal is already running; cancelling it before setting 0%`. Note the new
-   sequence — call it **B**.
-   ⚠ *This step is what builds the trap*: AAPS closes row A by stamping `endId = B` on it, which is
-   what used to poison B's own cancel.
-3. Press **Cancel TBR** in AAPS. Once — not three times.
+1. **Closed loop enabled**, pump running, glucose arriving. Confirm the loop is actually issuing
+   temporary basals — the log has shown `setTempBasalPercent … confirmed=true` within the last
+   ~10 minutes.
+2. By hand, set a temporary basal the loop will want to change and that will not expire while you
+   wait: **200% for 2 hours** if glucose is flat or falling, **0% for 2 hours** if it is rising. The
+   point is to be wrong on purpose, so the loop's next cycle asks for something else.
+3. **Wait for the fix to fire.** Watch for the line — it is unambiguous and it names both rates:
+
+```
+A 200% temporary basal is already running; cancelling it before setting N% (this pump will not replace one)
+```
+
+   This is the step that builds the trap: AAPS closes the 200% row by stamping `endId` = the new
+   temporary basal's `pumpId`, which is what used to poison that new one's own cancel. Typically one
+   loop cycle, so under ~5 minutes.
+
+4. **Now press `CANCEL n%` in AAPS. Once — not three times.** Three presses is what happened on
+   2026-08-09 and it only produced three identical `new=false` lines.
 
 ### Confirm
 
@@ -3773,7 +3796,7 @@ order by timestamp desc limit 4;
 | 12b bolus under 300% | 2026-08-09 | ✅ **ACCEPTED**, 3.93 s, TBR survived, exactly 1.00 U |
 | 12c profile write under 200% | 2026-08-09 | ✅ **SUCCEEDED**, TBR survived, both calculations agreed |
 | 12d hand-stop under 250% | | ⏳ **NOT RUN** |
-| 12e cancel after a supersede | | ⏳ **NOT RUN** — regression test for the end-id collision |
+| 12e cancel after a supersede | 2026-08-09 | ⚠ **NOT RUN as written.** The fix was verified *incidentally* on the exact failing record: on the first poll after the new build started, `id=424` — whose `pumpId=161723` was already `id=422`'s `endId`, the precise collision — closed with `Recorded TBR stop under endPumpId=1786251332647, new=true`, duration 120.00 → 28.09 min. That is the right outcome on the right row, but it was not driven under the recipe below, so it is evidence rather than a recorded pass |
 
 ### ✅ 2026-08-09 — items H and H2 both close, and the gate really is specific to temporary basals
 
