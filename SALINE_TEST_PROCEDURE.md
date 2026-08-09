@@ -45,8 +45,8 @@ this driver is not fit for closed-loop use with insulin.
 | B | ~~**Fix `insertAnnouncement`'s dedupe key**~~ | ✅ **CLOSED 2026-08-04.** The alert path now calls `insertTherapyEventIfNewWithTimestamp(event.timestamp, ANNOUNCEMENT, …)`, so the key is `(type, the pump's entry time)` and re-reading a window is a genuine no-op. It also brings the path under `confirmActivePump(timestamp, …)`, which `now()` had been sailing past. Fixed inside `pump/ypso`, adding no shared-file surface | §8.5 |
 | C | ~~**Phase 5c — cartridge out and priming**~~ | ✅ **CLOSED 2026-08-03.** Cartridge out reads `byte0=3` with the reservoir `FF FF FF FF` (−1) — the first sighting of reservoir `-1`, handled correctly. The *priming* row is recorded as **unreachable by this method**: liveness cannot be proved because the reservoir reads −1 throughout, so a mid-prime reading is byte-identical to one taken after it | **Phase 5c**, §8.3 |
 | D | ~~**Phase 5e — reservoir empty mid-delivery**~~ | ✅ **CLOSED 2026-08-03.** Reads `byte0=3` with the reservoir a **known `0`** — not the `-1` of a cartridge change, so the pump does distinguish empty from absent. Alert count 147 → 148, `104 Cartridge Empty`, urgent. **Phase 5's table is complete** | **Phase 5e**, §8.3 |
-| E | **Reconnect mid-bolus** | 📝 **Written as Phase 10a/10c, 2026-08-04, not yet run.** Take the link away during a bolus. The pump finishes regardless; what is untested is whether AAPS's *record* settles. ⚠ The code says it does **not** — an unsettled provisional has no `pumpId`, so the history sync cannot find it and inserts a second row. Phase 10 states that prediction and then goes to look | **Phase 10**, §4g |
-| F | **Kill AAPS mid-bolus** | 📝 **Written as Phase 10b/10d, 2026-08-04, not yet run.** Force-stop during delivery. The provisional is a committed row so it should survive; what is untested is whether anything ever reconciles it. This decides whether `PumpSyncStorage` is needed, and Phase 10b records what each outcome would mean **before** the run | **Phase 10**, §4g |
+| E | **Reconnect mid-bolus** | ❌⚠ **FAILED 2026-08-09 — the predicted double-count, confirmed.** An 8 U bolus interrupted 5.4 s in left an orphaned provisional (`id=195`, no `pumpId`) and the history sync inserted `id=198` beside it: **two live rows, 16.00 U for one 8 U bolus**. The driver's own `success=false` is correct per §0 and AAPS alarmed; it is the record that fails. Fix deliberately — see Phase 10 results. Original entry: 📝 *Written as Phase 10a/10c, 2026-08-04, not yet run.* Take the link away during a bolus. The pump finishes regardless; what is untested is whether AAPS's *record* settles. ⚠ The code says it does **not** — an unsettled provisional has no `pumpId`, so the history sync cannot find it and inserts a second row. Phase 10 states that prediction and then goes to look | **Phase 10**, §4g |
+| F | **Kill AAPS mid-bolus** | ❌⚠ **FAILED 2026-08-09, with one good answer inside it.** ✅ The provisional **survived** `am force-stop` (`id=199`, live, queried with AAPS dead), so `addBolusWithTempId` is durable and the §4g window is genuinely covered — the worst predicted outcome is ruled out. ❌ But nothing reconciles it: **two live rows, 16.00 U**. Same failure as E, so one fix serves both. Original entry: 📝 *Written as Phase 10b/10d, 2026-08-04, not yet run.* Force-stop during delivery. The provisional is a committed row so it should survive; what is untested is whether anything ever reconciles it. This decides whether `PumpSyncStorage` is needed, and Phase 10b records what each outcome would mean **before** the run | **Phase 10**, §4g |
 | G | **Change the phone's timezone** | ⏳ **UNTESTED, and going into therapy use untested.** The driver should queue a clock sync and the pump's clock should follow. `canHandleDST()` is false and `timezoneOrDSTChanged` queues the write, so the path exists and has never been exercised end to end. The failure mode if it is wrong is history timestamps an hour out, which §5 has already produced once | §8.6 |
 | H | **A bolus while a TBR runs** | ✅ **CLOSED 2026-08-09 — accepted in both directions.** 1.0 U under a running 0% (4.11 s) and under a running 300% (3.93 s); the TBR survived both, mid-delivery and after, and each cost exactly 1.00 U. A 0% temp does **not** make the pump report itself as not delivering, so the alternative refusal mechanism is disproved rather than merely unseen. The history below is kept because the reasoning matters: ⏳ *UNTESTED, and the "low risk" that used to be written here is withdrawn.* The reasoning was that both operations work alone and both are identified by sequence — which is *exactly* the reasoning that would have rated "replace a running TBR" low risk the day before it failed on a person. Nothing on the command × pump-state axis is low risk until it has been run. 📝 **Written as Phase 12a/12b, 2026-08-09, not yet run.** ⚠ It does **not** need SMB — a manual bolus exercises the same axis, so the Nightscout BG source blocking SMB never blocked this | **Phase 12**, combination matrix |
 | H2 | **A basal profile write while a TBR runs** | ✅ **CLOSED 2026-08-09 — the write succeeded and both calculations agreed.** All 24 slots went 1.26 → 1.00 under a running 200%, read back and confirmed; the TBR survived with its countdown intact and the pump then reported `rate=2.0U/h`, exactly the new base × 200%. The agreement §4h could only argue for is now observed. Original entry: ⏳ *UNTESTED, identified 2026-08-04.* The delivered rate does change across the write, because the pump applies the percentage to the new base. It should stay *consistent*: the driver records the TBR as a percentage (`isAbsolute = false`), so AAPS applies the same percentage to the same new profile, and `writeBasalProfile` verifies all 24 slots. **Nothing checks for a running TBR before writing, though**, and the agreement is two independent calculations rather than an enforced invariant. Realistic trigger: an exercise profile change landing while the loop holds a TBR. 📝 **Written as Phase 12c, 2026-08-09, not yet run** | **Phase 12**, combination matrix, §4h |
@@ -2908,11 +2908,11 @@ are worth believing.
 
 | Step | Bolus | Interruption | Result |
 |---|---|---|---|
-| 10a link dies and returns | 10 U | `svc bluetooth disable`, 90 s | ⏳ **NOT RUN** |
-| 10b AAPS killed | 10 U | `am force-stop` | ⏳ **NOT RUN** |
-| 10c real range loss | 10 U | pump carried away, 90 s | ⏳ **NOT RUN** |
-| 10d chunked sequence killed | 6 U @ 3 U/min | `am force-stop` at 40 s | ⏳ **NOT RUN** |
-| 10e control, uninterrupted | 2 U | none | ⏳ **NOT RUN** |
+| 10a link dies and returns | 8 U | `svc bluetooth disable`, 90 s | ❌⚠ **FAILED 2026-08-09 — two live rows, 16.00 U for one 8 U bolus** |
+| 10b AAPS killed | 8 U | `am force-stop` | ❌⚠ **FAILED 2026-08-09 — same, 16.00 U. Provisional durability confirmed** |
+| 10c real range loss | 10 U | pump carried away, 90 s | ⏳ **NOT RUN** — needs a human to carry the pump |
+| 10d chunked sequence killed | 6 U @ 3 U/min | `am force-stop` at 40 s | ⏳ **NOT RUN** — needs the bolus-speed setting changed |
+| 10e control, uninterrupted | 2 U | none | ✅ **PASSED 2026-08-09** — exactly one row, both ids |
 
 ---
 
@@ -3927,3 +3927,132 @@ respect — `id=424` from earlier the same afternoon still carries **28.09 min**
 basal the pump stopped at ~16:34, because the stop was unrecordable when it happened and was only
 closed at 16:55:32 when the fixed build started. That over-count is residue from the defect, not a
 live one, and it is in the 08-09 data permanently.
+
+---
+
+# Phase 10 results — 2026-08-09. Items E and F both FAIL, exactly as predicted
+
+Run by Claude over adb while the tester was away, on saline, off-body, pump 10074292. Every bolus was
+entered through the AAPS bolus dialog by UI automation, with the dialog contents read back and
+verified before each press; every interruption was fired from `adb`; every verdict comes from the
+database, not the log.
+
+## ⚠ Deviation from the written procedure: 8 U, not 10 U
+
+`treatmentssafety_maxbolus` is **8.0** on this tablet, so the dialog will not accept 10 U. The
+tester's max-bolus safety limit was **not** changed to run a test. 8 U at the pump's ~33.3 U/min is
+**14.4 s** of delivery, so an interruption at +6 s still lands mid-delivery with ~8 s left to run,
+which is what the step needs. The reason 2 U was rejected — 3.6 s is too short to interrupt — does
+not apply at 8 U.
+
+## The headline arithmetic
+
+```
+Pump actually delivered:  2 + 8 + 8  =  18.00 U
+   reservoir 86.33 -> 67.93 = 18.40, less 0.40 U of basal over the 24 min   ✔
+AAPS now records:                        34.00 U
+Over-count:                              16.00 U
+```
+
+**The pump did exactly what it was told, three times. AAPS's records are wrong by 89%.**
+
+## 10e — the control. ✅ PASSED
+
+```
+17:31:38.797  Bolus 2.0 U requested. Newest event sequence before sending: 161726
+17:31:38.827  Provisionally recorded 2.0U under temporaryId=1786253498798
+17:31:39.335  probe=during-bolus
+17:31:44.311  Bolus confirmed from the pump's log: seq=161727 → 2.0 U
+17:31:44.362  Settled temporaryId=1786253498798 under pumpId=161727        5.57 s
+```
+
+Database: **exactly one live row**, 2.00 U, carrying both `temporaryId` and `pumpId`. The superseded
+provisional is `id=194`, `referenceId=193` — versioned away, not left live.
+
+This is what makes the two failures below mean something: **the query can tell one row from two.**
+
+## 10a — the link dies mid-delivery. ❌ FAILED (item E)
+
+Bluetooth killed **5.4 s** after the send, held down 90 s.
+
+```
+17:36:45.621  Bolus 8.0 U requested. Newest event sequence before sending: 161727
+17:36:45.789  Bolus sent. Expecting ~14s at the pump's 33.3 U/min, giving up after 74s
+17:36:52.165  BLE disconnected (reason=1)          ← the cut
+17:36:52.172  Link lost; reconnecting in 5s (attempt 1)
+17:36:57.198  BLE connect failed with status -100
+17:37:07.350  Bolus NOT CONFIRMED: no new bolus entry in the pump's event log.
+              The pump reported at least 3.19 U before the log was read.
+```
+
+**The driver's own behaviour here is correct and should not be "fixed".** It reported
+`success=false` on a delivery it could not confirm, which is what §0 requires, and AAPS raised a
+modal alarm — *"Bolus reported an error… Not confirmed: the pump's log…"* — so the user is told
+rather than left to notice.
+
+**The record is what fails.** After reconnection and a history sync:
+
+```
+id=195  17:36:45  8.00U  pumpId=None    tempId=1786253805622   ← orphaned provisional
+id=198  17:36:44  8.00U  pumpId=161728  tempId=None            ← history sync's own insert
+                          both isValid=1, referenceId null — sum 16.00 U
+```
+
+Precisely the §4g prediction: the unsettled provisional has no `pumpId`, so the history sync cannot
+match it, and inserts a second row beside it.
+
+## 10b — AAPS killed mid-delivery. ❌ FAILED (item F), but one good answer inside it
+
+`am force-stop` **5.8 s** after the send; `pidof` empty immediately after.
+
+**✅ The provisional survived the kill.** Queried with AAPS still dead:
+
+```
+id=199  v=0  valid=1  ref=None  17:52:48  8.00U  pumpId=None  tempId=1786254768202
+```
+
+That rules out the worst of the three predicted outcomes — "no provisional row at all", which would
+have been a durability defect in `addBolusWithTempId` and would have had to be understood before
+anything else was built. `addBolusWithTempId` commits, and the row keeps counting toward IOB through
+a process death. **The window §4g exists to cover is genuinely covered.**
+
+**❌ Nothing then reconciles it.** After restart and sync:
+
+```
+id=200  17:52:47  8.00U  pumpId=161729  tempId=None
+id=199  17:52:48  8.00U  pumpId=None    tempId=1786254768202
+                          sum 16.00 U
+```
+
+## What this decides, and what it deliberately does not
+
+Both interruption modes produce the same failure, so the fix does not need to distinguish them.
+
+Per this phase's own outcome table, two rows means **something must reconcile the orphan** — and it
+says, in the same breath, *"Decide deliberately; do not reach for the framework because it is there."*
+That decision was **not** made here, and this was left unfixed on purpose. The candidates, restated
+now that both runs are in:
+
+| candidate | note |
+|---|---|
+| `PumpSyncStorage` | Persists pending entries and settles them after a restart. The framework answer. Larger surface than the problem |
+| Settle from the pump's log at the next connection | Narrower. The driver already knows the `temporaryId` and the amount; the pump's entry is right there — 10a and 10b both had the matching `BolusDelivered` in the very next sync |
+| Invalidate the orphan and let the sync's row stand | Simplest. Loses the IOB coverage during the gap, which is the whole reason the provisional is written first |
+
+⚠ **The second looks strongest on this evidence** — in both runs the pump's own entry (`seq=161728`,
+`seq=161729`) arrived in the first sync after reconnection, timestamped within a second of the
+provisional. But that is an observation, not a decision, and it is the tester's to make.
+
+## ⚠ The tablet's database is now wrong by 16 U
+
+`id=195` and `id=199` are live orphans and `id=198`/`id=200` are their duplicates. Nothing cleans
+these up automatically. On saline it costs nothing; the rows should be invalidated in AAPS
+Treatments before this database is used for anything that reads IOB.
+
+## What blocked this phase for the whole afternoon
+
+Phase 10a was run once before this and produced an orphan that never reconciled — because history
+sync had been wedged since 16:25 by a zero-duration temporary basal (`seq=161696`, 12b's 300%
+cancelled after 17 seconds). See the separate finding. **Until that was fixed, 10a could not
+distinguish "the orphan is never reconciled" from "the sync never ran"**, and would have been
+recorded as the wrong failure.
