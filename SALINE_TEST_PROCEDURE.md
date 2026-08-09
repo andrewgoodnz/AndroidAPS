@@ -48,9 +48,9 @@ this driver is not fit for closed-loop use with insulin.
 | E | **Reconnect mid-bolus** | 📝 **Written as Phase 10a/10c, 2026-08-04, not yet run.** Take the link away during a bolus. The pump finishes regardless; what is untested is whether AAPS's *record* settles. ⚠ The code says it does **not** — an unsettled provisional has no `pumpId`, so the history sync cannot find it and inserts a second row. Phase 10 states that prediction and then goes to look | **Phase 10**, §4g |
 | F | **Kill AAPS mid-bolus** | 📝 **Written as Phase 10b/10d, 2026-08-04, not yet run.** Force-stop during delivery. The provisional is a committed row so it should survive; what is untested is whether anything ever reconciles it. This decides whether `PumpSyncStorage` is needed, and Phase 10b records what each outcome would mean **before** the run | **Phase 10**, §4g |
 | G | **Change the phone's timezone** | ⏳ **UNTESTED, and going into therapy use untested.** The driver should queue a clock sync and the pump's clock should follow. `canHandleDST()` is false and `timezoneOrDSTChanged` queues the write, so the path exists and has never been exercised end to end. The failure mode if it is wrong is history timestamps an hour out, which §5 has already produced once | §8.6 |
-| H | **A bolus while a TBR runs** | ⏳ **UNTESTED, and the "low risk" that used to be written here is withdrawn.** The reasoning was that both operations work alone and both are identified by sequence — which is *exactly* the reasoning that would have rated "replace a running TBR" low risk the day before it failed on a person. Nothing on the command × pump-state axis is low risk until it has been run | **combination matrix** |
-| H2 | **A basal profile write while a TBR runs** | ⏳ **UNTESTED, identified 2026-08-04.** The delivered rate does change across the write, because the pump applies the percentage to the new base. It should stay *consistent*: the driver records the TBR as a percentage (`isAbsolute = false`), so AAPS applies the same percentage to the same new profile, and `writeBasalProfile` verifies all 24 slots. **Nothing checks for a running TBR before writing, though**, and the agreement is two independent calculations rather than an enforced invariant. Realistic trigger: an exercise profile change landing while the loop holds a TBR | **combination matrix**, §4h |
-| H3 | ⚠ **6e — stop the pump while a real TBR runs** | ⏳ **Written, unrun, no pass marker.** The procedure calls it "the interaction with the least analysis behind it" and says the row exists to be observed rather than confirmed. After Phase 11, an unanalysed interaction between the suspend record and a running TBR is not a curiosity | **6e** |
+| H | **A bolus while a TBR runs** | ⏳ **UNTESTED, and the "low risk" that used to be written here is withdrawn.** The reasoning was that both operations work alone and both are identified by sequence — which is *exactly* the reasoning that would have rated "replace a running TBR" low risk the day before it failed on a person. Nothing on the command × pump-state axis is low risk until it has been run. 📝 **Written as Phase 12a/12b, 2026-08-09, not yet run.** ⚠ It does **not** need SMB — a manual bolus exercises the same axis, so the Nightscout BG source blocking SMB never blocked this | **Phase 12**, combination matrix |
+| H2 | **A basal profile write while a TBR runs** | ⏳ **UNTESTED, identified 2026-08-04.** The delivered rate does change across the write, because the pump applies the percentage to the new base. It should stay *consistent*: the driver records the TBR as a percentage (`isAbsolute = false`), so AAPS applies the same percentage to the same new profile, and `writeBasalProfile` verifies all 24 slots. **Nothing checks for a running TBR before writing, though**, and the agreement is two independent calculations rather than an enforced invariant. Realistic trigger: an exercise profile change landing while the loop holds a TBR. 📝 **Written as Phase 12c, 2026-08-09, not yet run** | **Phase 12**, combination matrix, §4h |
+| H3 | ⚠ **6e — stop the pump while a real TBR runs** | ⏳ **Written, unrun, no pass marker.** The procedure calls it "the interaction with the least analysis behind it" and says the row exists to be observed rather than confirmed. After Phase 11, an unanalysed interaction between the suspend record and a running TBR is not a curiosity. 📝 **Restated with explicit confirmations as Phase 12d, 2026-08-09, not yet run** | **Phase 12**, 6e |
 | I | **A temp basal across an hour boundary** | ⏳ **UNTESTED.** The same percentage becomes a different absolute rate. Inherent behaviour rather than a defect, but worth seeing once | Phase 3 |
 | J | **Restore a profile you care about** | ⏳ **UNTESTED.** A write you cannot reverse is not finished. Matters at the moment of switching pumps, not during steady use | Phase 4 |
 | K | **Chunked bolus for comfort** | ✅ **DONE — Phase 9 passed on hardware 2026-08-04.** "Bolus speed" is a loop in the phone, not a pump setting: Lotus sends ordinary `type=2` boluses on a timer — **1 U/5 s = 12 U/min, 0.5 U/5 s = 6, 0.4 U/8 s = 3** — confirmed in the pump's log (five entries, 8 s apart, summing to 2.00 U). Needs no new pump capability. Built to six design decisions written down before the code; 9c failed first, found a permanent phantom IOB record, was fixed and re-run clean | **Phase 9**, §8.6 |
@@ -110,6 +110,9 @@ dismissed:**
    risk: both operations work alone, both are identified by sequence, so the pair looks safe. Phase 11
    is the counter-example. **Nothing on this axis is low risk until it has been run**; the honest
    entry is "untested", with no adjective.
+
+📝 **All three of the above are now written up as Phase 12 (2026-08-09), not yet run.** Item H is 12a
+and 12b, H2 is 12c, and 6e's second half is restated with explicit confirmations as 12d.
 
 **What this matrix does not cover** is the pump's state changing *during* a command rather than
 before it — an alarm raised mid-bolus, a cartridge pulled mid-write. Phase 9e reached one such case by
@@ -2693,6 +2696,16 @@ database says so.**
 - logcat running in a restart loop **before the pump is touched**, per the instrumentation notes:
   `adb logcat -v time PUMP:V PUMPBTCOMM:V YpsoBleManager:V YpsoPumpManagerImpl:V "*:S"`
 
+### ⚠ This phase does not need SMB, and never did
+
+Recorded 2026-08-09, because the belief that it did is what kept the phase unrun for five days. With
+glucose arriving from Nightscout, `isAdvancedFilteringEnabled` is false and AAPS constrains SMB off,
+so **the loop cannot originate a bolus on this rig**. That blocks the loop from making one; it does
+not block *you*. Every step here — 10a through 10e — is a bolus you press yourself in the AAPS bolus
+dialog, and the interruption is applied by hand or by `adb`. The same is true of Phase 12a/12b.
+
+The top open question in this whole document has been runnable the entire time.
+
 ### Why a 10 U bolus, and not 2 U
 
 The prompt for item E says a 2 U bolus. At the pump's own ~33.3 U/min a 2 U bolus is **3.6 seconds**
@@ -3543,3 +3556,161 @@ The last is the sharpest: **0% for 30 minutes refused while 0% for 30 minutes wa
 percentage and the same duration. So this is not "the pump will not change a rate"; it is **"the pump
 will not accept any new temporary basal while one is running"**, full stop. That simplifies the fix —
 `setTbrConfirmed` does not need to compare anything, it only needs to know whether a TBR is active.
+
+---
+
+# Phase 12 — the command × pump-state axis, the class Phase 11 broke on
+
+**Status: ⏳ WRITTEN 2026-08-09, NOT RUN.**
+
+Phase 11 established something narrower and more useful than "the pump refuses 0%": **this pump
+refuses a command because of the state it is in, not because of what the command says.** An identical
+request — 0% for 30 min while 0% for 30 min ran — was refused. Nothing about the value mattered.
+
+That finding has a consequence nobody has tested. If the pump gates *temporary basals* on pump state,
+the obvious question is what else it gates. Three interactions sit on that same axis and all three are
+untested:
+
+| | interaction | item |
+|---|---|---|
+| 12a/12b | a **bolus** while a temporary basal runs | H |
+| 12c | a **basal profile write** while a temporary basal runs | H2 |
+| 12d | the pump **stopped by hand** while a temporary basal runs | H3 (6e's second half) |
+
+### ⚠ The driver makes no state check before either command — this is verified, not assumed
+
+- `deliverBolusConfirmed` validates the amount, baselines the event log with `newestEventSequence()`,
+  and sends. It never calls `suspendGetSystemStatus()`. It does not know whether a TBR is running.
+- `writeBasalProfile` reads the active program, reads the existing 24 slots, writes, and diffs the
+  read-back. There is **no check for a running temporary basal anywhere in it.**
+
+This is the *same blind spot* that produced the Phase 11 defect: a command sent into a pump state the
+driver never looked at. The fix added a status read before a TBR write and nowhere else.
+
+**So if the pump refuses either of these, the driver will not get a clean refusal — it will get a
+confirmation that never arrives, and fail on a timeout.** That distinction matters, and 12a is
+designed to record which one happened.
+
+### Why this is not "probably fine"
+
+The withdrawn note on item H used to say the risk was low because both operations work alone and both
+are identified by sequence. That is **exactly** the reasoning that would have rated "replace a running
+TBR" low risk the day before it failed on a person. Nothing on this axis is low risk until it is run.
+
+## Before starting
+
+- Saline cartridge, **off body**, pump 10074292, debug build on the tablet.
+- Reservoir above 30 U — 12a–12c together use under 5 U, but 12d may need a restart.
+- Have `[ypso-state]` streaming so `tbr=`, `delivering=` and `suspendRecord=` are visible throughout:
+
+```
+adb -s 192.168.1.39:5555 logcat -v time PUMP:V YpsoPumpManagerImpl:V "*:S" | grep -vE "skipping (Alert|Bolus|Tbr|Unknown)"
+```
+
+- ⚠ **Phase 10e is the control for 12a and 12b** — a bolus from idle, uninterrupted. If 10e has not
+  been run, run it first. An anomaly here needs something to be an anomaly against.
+
+## 12a. A bolus while a **0%** temporary basal runs — item H, the sharper half
+
+**Why 0% first.** If a 0% TBR makes the pump report `delivering=false`, a bolus may be refused on the
+grounds that the pump is not delivering — a different mechanism from the Phase 11 one, and one that
+testing only the high-rate case would miss entirely.
+
+1. From idle, set **0% for 30 min**. Confirm it took: `tbr=0%`, byte 10 reads 0.
+2. Record `[ypso-state]`'s `delivering=` and `suspendRecord=` **now**, before the bolus.
+3. Deliver a **1.0 U** bolus from the AAPS bolus dialog. 1 U is enough to confirm and cheap on the
+   cartridge; the interruption timing that needs 10 U belongs to Phase 10.
+4. Watch for `Bolus 1.0 U requested. Newest event sequence before sending: N`.
+
+**Confirm:**
+
+- **Accepted or refused** — and *how*. A clean rejection and `deliverOneBolus` timing out with no
+  confirmation are different findings. Record which, with the elapsed time.
+- If accepted: the reservoir falls by 1.0 U, one bolus row appears, `pumpId` set, `temporaryId`
+  settled.
+- ⚠ **Is the 0% temporary basal still running afterwards?** Check `tbr=` and byte 10. If a bolus
+  silently cancels the TBR, every bolus given in a low-glucose state would restore full basal without
+  AAPS knowing — the inverse of the Phase 11 harm, and worse because it is silent.
+- The TBR's `duration` in the database: unchanged, or rewritten?
+
+## 12b. A bolus while a **high** temporary basal runs — item H
+
+1. From idle, set **300% for 30 min**. Confirm `tbr=300%`.
+2. Deliver **1.0 U**.
+3. Same confirmations as 12a.
+
+**Additionally:** the reservoir should fall by 1.0 U **plus** the elevated basal for the interval.
+Compute the expected figure before reading it. A bolus that lands but suppresses the basal for its
+duration is a real under-delivery, and it is only visible against a computed expectation.
+
+### What each outcome means
+
+| outcome | meaning |
+|---|---|
+| both accepted, TBR survives | ✅ item H closes. The gate is specific to temporary basals |
+| refused while a TBR runs | ⚠⚠ **Severe.** Meal boluses fail whenever the loop holds a temp — 84% of the time over 08-05→08-07. Needs the same cancel-before-send treatment as Phase 11, but a bolus cannot simply cancel the TBR without restoring it afterwards. Do not improvise the fix; record it and design it |
+| accepted but the TBR is cancelled | ⚠⚠ **Silent.** AAPS goes on showing a TBR the pump no longer has. Worse than a refusal |
+| accepted, TBR survives, delivery wrong | ⚠ Under- or over-delivery against the computed expectation. Measure before concluding |
+
+## 12c. A basal profile write while a temporary basal runs — item H2
+
+Realistic trigger: an exercise profile switch landing while the loop holds a temp. This happens
+without anyone intending it.
+
+1. From idle, set **200% for 30 min**. Confirm it took, and record the base rate for the current hour.
+2. With it running, apply a profile change in AAPS that alters the current hour's basal — a percentage
+   change is easiest, and it rewrites all 24 slots.
+3. Watch for `BASAL PROGRAM x BEFORE OVERWRITE` and `written and confirmed: all 24 slots`.
+
+**Confirm:**
+
+- **Did the write succeed at all** while a TBR ran, or was it refused?
+- ⚠ **Is the temporary basal still running, and at what percentage?** The driver records TBRs as
+  percentages (`isAbsolute = false`), so AAPS should apply 200% to the *new* base and the pump should
+  do the same. **That agreement is two independent calculations, not an enforced invariant** — this
+  step is where it is checked.
+- The delivered rate the pump reports against `new base × 200%`. Record both figures.
+- ⚠ If the write is refused, note that **nothing retries it**. AAPS would believe the profile is set.
+  Check `isThisProfileSet` afterwards.
+
+## 12d. The pump stopped by hand while a temporary basal runs — item H3, 6e's second half
+
+6e is written and has no pass marker; its own text calls this "the interaction with the least analysis
+behind it". After Phase 11, an unanalysed interaction between the suspend record and a running
+temporary basal is not a curiosity.
+
+1. From idle, set **250% for 60 min**. Confirm it took.
+2. **On the pump's own buttons**, stop the pump. Do not touch AAPS.
+3. Let the driver poll at least twice.
+4. **Restart the pump on its buttons.**
+
+**Confirm:**
+
+- `[ypso-state]`: `mode=STOPPED`, `delivering=false`, and what `suspendRecord=` shows.
+- ⚠ **Does a `PUMP_SUSPEND` therapy event open on top of a temporary basal AAPS believes is running?**
+  Two records for one state, one of them claiming the pump has stopped.
+- What the database holds: is the temporary basal row closed, left open, or left running past the
+  stop? Query `temporaryBasals` and `therapyEvents` together.
+- After the restart: does the temporary basal resume, and do AAPS and the pump agree about whether it
+  is running? Record both sides.
+- ⚠ Recall that after any restart the driver reads the pump as suspended until it answers — do not
+  mistake that for a finding here.
+
+## Phase 12 is passed when
+
+- 12a and 12b have a recorded accept/refuse with timings, and the TBR's survival is confirmed either
+  way.
+- 12c records whether the write succeeded and whether the two rate calculations agreed.
+- 12d records what the database holds across a hand-stop, with no interpretation left implicit.
+- **Any refusal is written up before a fix is attempted.** Phase 11's fix was right because the
+  refusal was characterised first — 25 refusals against 0 successes, both directions, before a line
+  changed.
+
+## Results
+
+| step | date | outcome |
+|---|---|---|
+| 12a bolus under 0% | | ⏳ **NOT RUN** |
+| 12b bolus under 300% | | ⏳ **NOT RUN** |
+| 12c profile write under 200% | | ⏳ **NOT RUN** |
+| 12d hand-stop under 250% | | ⏳ **NOT RUN** |
