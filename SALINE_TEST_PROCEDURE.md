@@ -4244,3 +4244,51 @@ deliberately selected a chunked speed.
 | 12d hand-stop under a running TBR | 2026-08-09 | ✅ **PASSED** — one record, closed then reopened correctly |
 | 10d chunked sequence killed | 2026-08-09 | ❌ **FAILED** — one orphan (correct) but never reconciled; 2.80 U recorded against 2.40 U delivered |
 | 10c real range loss | | ⏳ **NOT RUN** — needs a human to carry the pump out of range |
+
+## ✅ 10c PASSED — 2026-08-10, and range loss really does reach the driver differently
+
+Tester carried the pump out of range mid-bolus; the phone's adapter was left up throughout.
+
+```
+08:41:01.934  Bolus 5.0 U requested. Newest event sequence before sending: 161803
+08:41:01.988  Provisionally recorded 5.0U under temporaryId=1786308061935
+08:41:14.015  Disconnected: reason=10                     ← supervision timeout, not an adapter kill
+08:41:18.486  Bolus NOT CONFIRMED … The pump reported at least 2.49 U before the log was read
+08:41:18.497  … the pending marker is left in place
+08:41:40      BLE connect failed with status 133          ← device not found; out of range
+08:41:57      BLE connect failed with status 133
+08:45:13.870  Reconciled … temporaryId=1786308061935 settled to 5.0U under pumpId=161804, new=true
+```
+
+```
+id=227  08:41:02  5.00U  pumpId=161804  tempId=1786308061935   valid=1  ref=None
+id=228, id=229    superseded versions under ref=227
+                        LIVE ROWS: 1     5.00 U
+```
+
+### The difference the step exists to expose is real, and it is visible in two numbers
+
+§10c predicted that range loss reaches `ReconnectManager` differently from `svc bluetooth disable`,
+because the adapter stays up and the link times out instead. It does, and the driver's own log
+distinguishes them without ambiguity:
+
+| | disconnect reason | reconnect failure |
+|---|---|---|
+| `svc bluetooth disable` (10a) | `reason=1` | `status -100` |
+| carried out of range (10c) | **`reason=10`** | **`status 133`** |
+
+`reason=10` is a supervision timeout and `133` is the GATT "device not found" — the pump is simply not
+there to answer. **10a passed and this passed too, so the difference did not become a finding**; but
+it is now recorded, because the next person to see `status 133` should know it means distance rather
+than a broken adapter.
+
+### And it exercised a branch the scripted runs never did
+
+⚠ **The pump reported at least 2.49 U of the 5.0 U before the log went out of reach**, and the driver
+still refused to claim it: `success=false`, provisional left standing at the **requested** 5.0 U, and
+the marker held. Reconciliation four minutes later settled it to the pump's own figure — **5.0 U, so
+the bolus did complete** after the link died, which is §4g's premise observed once more rather than
+argued.
+
+Note the timing: **the reconciliation happened on the first connection after the pump came back**, not
+on a timer. Nothing had to be scheduled.
