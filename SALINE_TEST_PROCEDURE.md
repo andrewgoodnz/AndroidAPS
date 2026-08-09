@@ -2912,7 +2912,7 @@ are worth believing.
 | 10b AAPS killed | 8 U | `am force-stop` | ❌→✅ **FAILED then FIXED 2026-08-09.** The marker survived the kill and reconciled: **8.00 U in one row** |
 | 10c real range loss | 5 U | pump carried away | ✅ **PASSED 2026-08-10** — one live row, 5.00 U, reconciled on the first connection back. `reason=10` / `status 133`, distinct from 10a's `reason=1` / `-100` |
 | 10d chunked sequence killed | 2 U @ 3 U/min | `am force-stop` on a chunk write | ❌→✅ **FAILED twice, then FIXED 2026-08-10.** 2.80 U against 2.40 U under the marker design; **4 rows and 1.60 U for 1.60 U delivered** once the sync settles the stranded row instead. Marker deleted |
-| 10e control, uninterrupted | 2 U | none | ✅ **PASSED 2026-08-09** — exactly one row, both ids |
+| 10e control, uninterrupted | 2 U | none | ✅ **PASSED 2026-08-09, re-run 2026-08-10** on the marker-free build — exactly one row of 2.00 U, both ids, no orphans and no duplicate pumpIds |
 
 ---
 
@@ -4454,3 +4454,31 @@ id=292  10:18:38  2.00U  pumpId=161834  tempId=1786313918127      1 row, 2.00 U
 That is the whole architectural price, and it buys the **deletion** of a mechanism rather than the
 addition of one: the `PendingBolus` preference, `reconcilePendingBolus`, the per-chunk marker writes
 and the SDK `beforeSend` baseline parameter are all gone.
+
+### ✅ [verified] 2026-08-10 — the control re-run after a cartridge refill
+
+Run on the build with the marker deleted, after the cartridge was refilled to 118.17 U.
+
+```
+10:43:50.314  Bolus 2.0 U requested. Newest event sequence before sending: 161845
+10:43:55.995  Settled temporaryId=1786315430315 to 2.0U under pumpId=161847
+              deliverBolus: asked 2.0U, pump delivered 2.0U, success=true
+
+id=294  10:43:55  2.00U  pumpId=161847  tempId=1786315430315    1 live row
+```
+
+The ordinary path is unchanged by the Phase 10 work: the provisional is opened, the pump confirms,
+and `settlePendingBolus` promotes it in place. `settleStrandedProvisional` never runs, because there
+is nothing stranded — which is the point.
+
+**The refill itself also decoded correctly**, and is worth recording because §8.5's unconditional
+type-25 mapping makes it easy to get wrong:
+
+```
+CartridgeChanged seq=161840  →  INSULIN_CHANGE at 10:36:37
+Unknown          seq=161844  →  "Prime of 2.0U at seq=161844 below tube-change threshold, not recorded"
+```
+
+One `INSULIN_CHANGE` and **no `CANNULA_CHANGE`** — so CAGE was not restarted, which is right for a
+tubing prime with no cannula fill. A 2.0 U prime sits below the tube-change threshold and is
+deliberately not recorded as a tubing change either.
