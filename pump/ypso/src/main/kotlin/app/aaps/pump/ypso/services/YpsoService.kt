@@ -1141,13 +1141,27 @@ class YpsoService : DaggerService() {
      */
     private fun settleStrandedProvisional(event: PumpHistoryEvent.BolusDelivered, serial: String): Boolean {
         val now = dateUtil.now()
-        val candidates = persistenceLayer
+        val live = persistenceLayer
             .getBolusesFromTimeToTime(now - STRANDED_PROVISIONAL_WINDOW_MS, now, true)
             .filter { it.isValid && it.referenceId == null }
+
+        // ⚠ If a row already carries this pump entry, the entry is already recorded and there is
+        // nothing to settle. Skipping this check let a stale orphan be married to an entry another
+        // row already owned, putting one pumpId on two rows — the very corruption this is meant to
+        // prevent. Observed 2026-08-10 on the first hardware run of this function.
+        if (live.any { it.ids.pumpId == event.position }) return false
+
+        val candidates = live
             .filter { it.ids.temporaryId != null && it.ids.pumpId == null }
             .filter { abs(it.amount - event.amount) < BOLUS_AMOUNT_EPSILON }
+            .filter { abs(it.timestamp - event.timestamp) <= STRANDED_MATCH_TOLERANCE_MS }
 
-        val stranded = candidates.minByOrNull { it.timestamp } ?: return false
+        // ⚠ Nearest in time, never "oldest". The first version took the oldest candidate and that is
+        // exactly backwards: stranded rows left by *earlier* failures are the oldest ones present, so
+        // "oldest" reliably picks the wrong bolus. A provisional is written a second or two before
+        // the pump logs its entry, and correctClockIfDrifted holds the pump within 10 s of the phone,
+        // so the right row is the one closest in time — by a wide margin, or not at all.
+        val stranded = candidates.minByOrNull { abs(it.timestamp - event.timestamp) } ?: return false
         val temporaryId = stranded.ids.temporaryId ?: return false
 
         // The provisional's own timestamp, never the pump entry's and never now(): the transaction
@@ -1165,8 +1179,9 @@ class YpsoService : DaggerService() {
         aapsLogger.info(
             LTag.PUMP,
             "History sync: seq=${event.position} settled a stranded provisional rather than inserting beside it — " +
-                "temporaryId=$temporaryId, ${event.amount}U, new=$settled" +
-                (if (candidates.size > 1) " (${candidates.size} candidates at this amount; took the oldest)" else "")
+                "temporaryId=$temporaryId, ${event.amount}U, new=$settled, " +
+                "${abs(stranded.timestamp - event.timestamp) / 1000}s apart" +
+                (if (candidates.size > 1) " (${candidates.size} candidates; took the nearest in time)" else "")
         )
         return settled
     }
@@ -1603,6 +1618,19 @@ class YpsoService : DaggerService() {
          * representation, not a real difference.
          */
         private const val BOLUS_AMOUNT_EPSILON = 0.005
+
+        /**
+         * How far apart a provisional and the pump entry it settles may be.
+         *
+         * The provisional is written a second or two before the pump logs its entry, and
+         * [correctClockIfDrifted] holds the pump within 10 s of the phone, so a genuine pair is
+         * seconds apart. Five minutes is slack for a slow chunk and a drifting clock; anything
+         * beyond it is a different bolus, and settling it would attach one pump entry to the
+         * wrong delivery. Failing to match is safe — the caller inserts, and the worst case is
+         * the double-count this whole mechanism exists to avoid, which is recoverable by hand.
+         * A wrong match is not.
+         */
+        private const val STRANDED_MATCH_TOLERANCE_MS = 5 * 60 * 1000L
 
         /**
          * Length of the 0% temporary basal that stands for a stopped pump — see [syncSuspendedState].
