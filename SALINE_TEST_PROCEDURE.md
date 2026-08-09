@@ -2908,8 +2908,8 @@ are worth believing.
 
 | Step | Bolus | Interruption | Result |
 |---|---|---|---|
-| 10a link dies and returns | 8 U | `svc bluetooth disable`, 90 s | ❌⚠ **FAILED 2026-08-09 — two live rows, 16.00 U for one 8 U bolus** |
-| 10b AAPS killed | 8 U | `am force-stop` | ❌⚠ **FAILED 2026-08-09 — same, 16.00 U. Provisional durability confirmed** |
+| 10a link dies and returns | 8 U | `svc bluetooth disable`, 90 s | ❌→✅ **FAILED then FIXED 2026-08-09.** 16.00 U before the fix, **8.00 U in one row** after, same rig |
+| 10b AAPS killed | 8 U | `am force-stop` | ❌→✅ **FAILED then FIXED 2026-08-09.** The marker survived the kill and reconciled: **8.00 U in one row** |
 | 10c real range loss | 10 U | pump carried away, 90 s | ⏳ **NOT RUN** — needs a human to carry the pump |
 | 10d chunked sequence killed | 6 U @ 3 U/min | `am force-stop` at 40 s | ⏳ **NOT RUN** — needs the bolus-speed setting changed |
 | 10e control, uninterrupted | 2 U | none | ✅ **PASSED 2026-08-09** — exactly one row, both ids |
@@ -4056,3 +4056,78 @@ sync had been wedged since 16:25 by a zero-duration temporary basal (`seq=161696
 cancelled after 17 seconds). See the separate finding. **Until that was fixed, 10a could not
 distinguish "the orphan is never reconciled" from "the sync never ran"**, and would have been
 recorded as the wrong failure.
+
+### ✅ [verified] 2026-08-09, later the same evening — items E and F both FIXED, re-run on hardware
+
+The fix is a persisted marker plus a reconciliation pass that runs **before** the history sync. Both
+interruption modes were re-run on the same rig that had produced 16.00 U an hour earlier.
+
+**10a re-run — link cut 5.6 s into an 8 U bolus:**
+
+```
+18:20:22.410  Bolus 8.0 U requested. Newest event sequence before sending: 161730
+              marker persisted: ypso_pending_bolus = 1786256422412|8.0|161730
+18:20:28      svc bluetooth disable                          (90 s down)
+18:20:44      the pump's log did not confirm this bolus … the pending marker is left in place
+18:25:57.840  Reconciled … temporaryId=1786256422412 settled to 8.0U under pumpId=161731, new=true
+18:25:57.843  History sync: starting, watermark=161730       ← reconciliation went first
+```
+
+```
+id=201  v=2  valid=1  ref=None  18:20:21  8.00U  pumpId=161731  tempId=1786256422412
+id=203  v=1  valid=1  ref=201     (superseded)
+id=202  v=0  valid=1  ref=201     (superseded)
+                       LIVE ROWS: 1     8.00 U
+```
+
+⚠ **The timestamp is 18:20:21, not 18:25.** Settling with `now()` would have dragged a bolus
+delivered five minutes earlier forward to the moment of reconciliation and put it on the wrong part
+of the IOB curve. `temporaryId` *is* the phone clock at the moment of sending, so it is what gets
+passed back.
+
+**10b re-run — AAPS force-stopped 6.0 s into an 8 U bolus:**
+
+```
+18:30:24.015  Bolus 8.0 U requested. Newest event sequence before sending: 161735
+18:30:30      am force-stop  →  pidof empty
+              marker after the kill: ypso_pending_bolus = 1786257024016|8.0|161735   ← survived
+18:32:02.104  Reconciled … temporaryId=1786257024016 settled to 8.0U under pumpId=161736, new=true
+18:32:02.108  History sync: starting, watermark=161731
+```
+
+**That surviving marker is the whole reason it is persisted rather than held in memory.** An
+in-memory marker is exactly what a `force-stop` destroys, and 10b is the step that destroys it.
+
+**The session's arithmetic, which is the real verdict:**
+
+| bolus | interruption | live rows |
+|---|---|---|
+| 18:20:21 | Bluetooth killed mid-delivery | 1 — 8.00 U |
+| 18:28:56 | none (incidental control) | 1 — 8.00 U |
+| 18:30:23 | process killed mid-delivery | 1 — 8.00 U |
+| | **pump delivered 24.00 U, AAPS records 24.00 U** | |
+
+Against 16.00 U for a single 8 U bolus, twice, an hour earlier on the same rig.
+
+### What is still true after the fix
+
+- **A bolus the pump has no record of is still left alone**, at the requested amount, marker cleared.
+  Deleting it would assert nothing went in, which is the one thing this driver does not know (§0).
+- **The driver still reports `success=false` on an unconfirmed bolus and AAPS still alarms.** None of
+  that changed, and none of it should: the delivery genuinely was unconfirmed at the time. What
+  changed is that the record is corrected at the next connection instead of standing wrong for ever.
+- ⚠ **The two pre-fix orphans are still there** — `id=195` and `id=199`, with their duplicates
+  `id=198` and `id=200`. They carry no marker, so reconciliation cannot see them and never will.
+  They are 16 U of over-count that has to be invalidated by hand in AAPS Treatments.
+
+### The out-of-order case, detected but not repaired
+
+If reconciliation ever runs *after* the sync has imported the matching entry,
+`SyncBolusWithTempIdTransaction` would put one `pumpId` on two rows, which is no better than the
+failure. That case is detected against the watermark and **refuses to settle**, logging at error
+level, rather than making it worse. It cannot arise while reconciliation runs first; it is a guard
+against a future reordering, not a live path.
+
+⚠ It is a guard, **not a repair** — the driver cannot invalidate the duplicate, because that needs
+`PersistenceLayer` and no real-pump driver in this tree injects it. If the error line ever appears,
+the correction is manual.
