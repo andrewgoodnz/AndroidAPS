@@ -2911,7 +2911,7 @@ are worth believing.
 | 10a link dies and returns | 8 U | `svc bluetooth disable`, 90 s | ❌→✅ **FAILED then FIXED 2026-08-09.** 16.00 U before the fix, **8.00 U in one row** after, same rig |
 | 10b AAPS killed | 8 U | `am force-stop` | ❌→✅ **FAILED then FIXED 2026-08-09.** The marker survived the kill and reconciled: **8.00 U in one row** |
 | 10c real range loss | 5 U | pump carried away | ✅ **PASSED 2026-08-10** — one live row, 5.00 U, reconciled on the first connection back. `reason=10` / `status 133`, distinct from 10a's `reason=1` / `-100` |
-| 10d chunked sequence killed | 6 U @ 3 U/min | `am force-stop` at 40 s | ❌⚠ **FAILED 2026-08-09.** Orphan count correct (1, not N) but never reconciled — **2.80 U recorded against 2.40 U delivered**. Cause open |
+| 10d chunked sequence killed | 6 U @ 3 U/min | `am force-stop` at 40 s | ❌⚠ **FAILED 2026-08-09, reproduced 2026-08-10.** Orphan count correct (1, not N) but never reconciled — **2.80 U against 2.40 U delivered**, twice. A third run with the kill 3.3 s later passed cleanly: the trigger is the **marker's durability window**, not chunking |
 | 10e control, uninterrupted | 2 U | none | ✅ **PASSED 2026-08-09** — exactly one row, both ids |
 
 ---
@@ -4292,3 +4292,70 @@ argued.
 
 Note the timing: **the reconciliation happened on the first connection after the pump came back**, not
 on a timer. Nothing had to be scheduled.
+
+### ⚠⚠ [verified] 2026-08-10 — 10d re-run twice. It is reproducible, and it is **not** about chunking
+
+Both ends of the marker were instrumented first (`Pending marker WRITTEN` / `READ`), purely
+additively, so these runs report the cause as well as the frequency.
+
+| run | kill lands | marker on disk after kill | result |
+|---|---|---|---|
+| 10d #1 (08-09) | on chunk 6's write, **<1 s** after it | present | ❌ 7 rows, 2.80 U, 1 orphan |
+| 10d #2 | on chunk 6's write, **<1 s** after it | **absent** | ❌ 7 rows, 2.80 U, 1 orphan |
+| 10d #3 | in the gap after a chunk **settled** | absent, *correctly* | ✅ 6 rows, 2.40 U, **0 orphans** |
+
+```
+#2   09:05:26.225  Pending marker WRITTEN: '1786309526218|0.4|161813'
+     09:05:26      am force-stop                              ← same second
+     marker on disk: EMPTY
+     09:07:52      Pending marker READ: '' (nothing pending)
+     id=246  0.40U  pumpId=161815  tempId=None      ← the sync's insert
+     id=240  0.40U  pumpId=None    tempId=…526218   ← the orphan
+
+#3   09:12:46.744  Pending marker WRITTEN: '1786309966740|0.4|161820'
+     09:12:50      am force-stop                              ← 3.3 s later, after that chunk settled
+     6 chunks, all carrying both ids, 0 orphans
+```
+
+### The corrected diagnosis, which overturns what was written yesterday
+
+Yesterday this was recorded as "the chunked path does not inherit the fix". **That framing was wrong.**
+Run #3 chunked exactly the same way and came out perfect. The discriminator is not chunking — it is
+**how long the marker had between being written and the process dying**:
+
+| run | write → kill | outcome |
+|---|---|---|
+| 10b single bolus | **6 s** | ✅ marker survived, reconciled |
+| 10d #3 | n/a — already settled and cleared | ✅ nothing pending, nothing lost |
+| 10d #1 | **<1 s** | ❌ |
+| 10d #2 | **<1 s** | ❌ |
+
+**The defect is a durability window on the marker write, and chunking only multiplies the exposure.**
+A single bolus writes the marker once; a 15-chunk sequence writes it fifteen times, so it meets the
+window fifteen times as often. That is why it surfaced here and not in 10b.
+
+⚠ **This means the reassurance written yesterday — "leave bolus speed at `unlimited` and this cannot
+reach you" — is too strong and is withdrawn.** A single bolus whose process dies inside that same
+sub-second window loses its marker in exactly the same way. The exposure is narrow, but it is not
+zero, and it is not confined to chunked delivery.
+
+### What is still unexplained, and is not being guessed at
+
+Run #1's marker was **on disk** after the kill and yet read blank at reconciliation 90 s later. Run #2's
+never reached disk at all. Both failed identically. A lost write explains #2; it does not explain #1,
+and nothing here explains how a value present on disk becomes absent to the app that reads it next.
+`SharedPreferences` writing via `apply()` — asynchronous, with a `.bak` restore path on a torn write —
+is the obvious place to look, but it has **not** been demonstrated and no fix should be written on it.
+
+### The shape of the fix, when it is written
+
+The marker must be durable **before** the pump is told, not eventually. That means a synchronous
+commit rather than a fire-and-forget put, and it needs to be established that whatever `Preferences`
+does underneath actually offers one. A second, independent option is to stop relying on a single slot
+and derive the pending set from the database instead — the orphan is already identifiable as a live
+bolus with a `temporaryId` and no `pumpId` — but that needs `PersistenceLayer`, which no real-pump
+driver in this tree injects.
+
+**Neither has been chosen.** What is established is the trigger, the reproducibility, and that the
+reconciliation logic itself is sound — proved separately when a hand-restored marker made the
+out-of-order guard fire correctly.
