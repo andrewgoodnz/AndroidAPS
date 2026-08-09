@@ -3796,7 +3796,7 @@ order by timestamp desc limit 4;
 | 12b bolus under 300% | 2026-08-09 | ✅ **ACCEPTED**, 3.93 s, TBR survived, exactly 1.00 U |
 | 12c profile write under 200% | 2026-08-09 | ✅ **SUCCEEDED**, TBR survived, both calculations agreed |
 | 12d hand-stop under 250% | | ⏳ **NOT RUN** |
-| 12e cancel after a supersede | 2026-08-09 | ⚠ **NOT RUN as written.** The fix was verified *incidentally* on the exact failing record: on the first poll after the new build started, `id=424` — whose `pumpId=161723` was already `id=422`'s `endId`, the precise collision — closed with `Recorded TBR stop under endPumpId=1786251332647, new=true`, duration 120.00 → 28.09 min. That is the right outcome on the right row, but it was not driven under the recipe below, so it is evidence rather than a recorded pass |
+| 12e cancel after a supersede | 2026-08-09 | ✅ **PASSED**, precondition verified before the press, all four confirmations met |
 
 ### ✅ 2026-08-09 — items H and H2 both close, and the gate really is specific to temporary basals
 
@@ -3877,3 +3877,53 @@ At 16:27:13, immediately after 12c, the loop asked for 0% while the 200% still r
 
 Fourth confirmed firing, and the first outside 11d's scripted conditions. 13.8 s puts it at the top of
 the 6–14 s band, consistent with the cancel read-back being the variable part.
+
+### ✅ [verified] 2026-08-09 — 12e passed, and the precondition was confirmed *before* the press
+
+The value of this run is that the trap was verified to exist first. A cancel that succeeds on a row
+which was never poisoned proves nothing, and that is the failure mode this phase was written to avoid.
+
+**The precondition, read from the database before anything was pressed:**
+
+```
+id=430  0%    pumpId=161726  endId=None     ← live, the row to cancel
+id=428  200%  pumpId=161725  endId=161726   ← already consumed 161726 as its end marker
+```
+
+`161726` was simultaneously the live temporary basal's `pumpId` and the previous row's `endId`. That
+is the exact collision that discarded three cancels at 16:34–16:35. On the old build this press would
+have returned `new=false`.
+
+**The run:**
+
+```
+17:12:56.573  A 200% temporary basal is already running; cancelling it before setting 0%
+17:13:02.282  setTempBasalPercent: asked 0% for 120min, confirmed=true, seq=161726     (5.7 s)
+              ← the loop built the trap; only oref1 can, which is why 12e needs it as instrument
+17:20:16.057  cancelTempBasal: confirmed=true
+17:20:16.110  Recorded TBR stop under endPumpId=1786252816058, new=true
+```
+
+**All four confirmations met:**
+
+| confirmation | result |
+|---|---|
+| `new=true` | ✅ — the word the whole test turns on |
+| end id is a timestamp, not a sequence | ✅ `1786252816058`, not `161726` |
+| row closed with elapsed duration | ✅ `id=430` 119.00 → **7.23 min**, `endId` set |
+| no temporary basal active, pump at base | ✅ `tbr=none`, `rate=1.0U/h`, nothing active in the database |
+
+### ⚠ The 6–14 s band from 11d needs its lower bound widened
+
+The fix has now fired six times. The 17:12:56 firing completed in **5.7 s**, below the 6–14 s band
+recorded at 11d. Nothing is wrong — the spread was always the cancel read-back, and a pump that
+answers promptly finishes sooner. **The observed band is now 5.7–13.8 s**, and a timing outside it is
+worth a look rather than a fault. Recording it so the next person does not treat 5.7 s as an anomaly.
+
+### What 12e does not close
+
+It proves the *end id* no longer collides. It does not prove the record is right in every other
+respect — `id=424` from earlier the same afternoon still carries **28.09 min** of 0% for a temporary
+basal the pump stopped at ~16:34, because the stop was unrecordable when it happened and was only
+closed at 16:55:32 when the fixed build started. That over-count is residue from the defect, not a
+live one, and it is in the 08-09 data permanently.
