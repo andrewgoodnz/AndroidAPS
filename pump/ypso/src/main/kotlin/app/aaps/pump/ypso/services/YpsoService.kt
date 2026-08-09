@@ -1171,8 +1171,6 @@ class YpsoService : DaggerService() {
         return settled
     }
 
-    }
-
     /**
      * Identity used for every `PumpSync` call. Trimmed, because the pump's device-name
      * characteristic used to hand back a NUL terminator and a serial differing by an invisible
