@@ -2911,7 +2911,7 @@ are worth believing.
 | 10a link dies and returns | 8 U | `svc bluetooth disable`, 90 s | ❌→✅ **FAILED then FIXED 2026-08-09.** 16.00 U before the fix, **8.00 U in one row** after, same rig |
 | 10b AAPS killed | 8 U | `am force-stop` | ❌→✅ **FAILED then FIXED 2026-08-09.** The marker survived the kill and reconciled: **8.00 U in one row** |
 | 10c real range loss | 10 U | pump carried away, 90 s | ⏳ **NOT RUN** — needs a human to carry the pump |
-| 10d chunked sequence killed | 6 U @ 3 U/min | `am force-stop` at 40 s | ⏳ **NOT RUN** — needs the bolus-speed setting changed |
+| 10d chunked sequence killed | 6 U @ 3 U/min | `am force-stop` at 40 s | ❌⚠ **FAILED 2026-08-09.** Orphan count correct (1, not N) but never reconciled — **2.80 U recorded against 2.40 U delivered**. Cause open |
 | 10e control, uninterrupted | 2 U | none | ✅ **PASSED 2026-08-09** — exactly one row, both ids |
 
 ---
@@ -3795,7 +3795,7 @@ order by timestamp desc limit 4;
 | 12a bolus under 0% | 2026-08-09 | ✅ **ACCEPTED**, 4.11 s, TBR survived, exactly 1.00 U |
 | 12b bolus under 300% | 2026-08-09 | ✅ **ACCEPTED**, 3.93 s, TBR survived, exactly 1.00 U |
 | 12c profile write under 200% | 2026-08-09 | ✅ **SUCCEEDED**, TBR survived, both calculations agreed |
-| 12d hand-stop under 250% | | ⏳ **NOT RUN** |
+| 12d hand-stop under 250% | 2026-08-09 | ✅ **PASSED** (at 200% — the dialog clamps there). No overlap: the running TBR was closed before the suspend opened |
 | 12e cancel after a supersede | 2026-08-09 | ✅ **PASSED**, precondition verified before the press, all four confirmations met |
 
 ### ✅ 2026-08-09 — items H and H2 both close, and the gate really is specific to temporary basals
@@ -4131,3 +4131,116 @@ against a future reordering, not a live path.
 ⚠ It is a guard, **not a repair** — the driver cannot invalidate the duplicate, because that needs
 `PersistenceLayer` and no real-pump driver in this tree injects it. If the error line ever appears,
 the correction is manual.
+
+---
+
+# 12d and 10d — run 2026-08-09 evening
+
+## ✅ 12d PASSED — the suspend record does not overlap a running temporary basal
+
+Tester stopped and restarted the pump on its own buttons; everything else driven over adb.
+
+```
+19:07:06  TBR 200% for 60min set, seq=161738          (200%, not 250% — AAPS's dialog clamps there)
+          … the loop replaced it twice; seq=161740 (0%/120min) was running at the stop
+19:42:30  syncSuspendedState: Pump is not delivering (mode 'Stopped');
+          recorded a 0% basal so AAPS stops counting basal IOB, new=true
+19:42:30  mode=STOPPED delivering=false suspendRecord=open (59min of 60)  tbr=none
+19:43:01  TBR cancel: the open record is this driver's own 0% suspend record … left alone
+19:56:12  Pump is delivering again (mode 'Running'); closed the 0% suspend record, new=true
+```
+
+```
+id=454  19:42:30   0.0%  13.70min  pumpId=1786261350099  endId=1786262171959  PUMP_SUSPEND
+id=452  19:38:57   0.0%   3.00min  pumpId=161740         endId=1786261350099  NORMAL
+id=448  19:09:03   0.0%  29.94min  pumpId=161739         endId=161740         NORMAL
+id=446  19:07:04  200.0%  1.00min  pumpId=161738         endId=161739         NORMAL
+                                              active records at any point: 1
+```
+
+**The feared outcome did not happen.** `syncSuspendedState` closed the running temporary basal —
+stamping the suspend record's own id into `id=452`'s `endId` — *before* opening the suspend. One
+state, one record, and the two are distinguishable by `type` (`PUMP_SUSPEND` against `NORMAL`), which
+is what the §8.6 guard relies on.
+
+Two supporting observations:
+
+- ⚠ **The pump cancels the temporary basal itself when stopped** — it reports `tbr=none`, not a
+  suspended 0%. So the two sides agree for the right reason rather than by luck.
+- **The §8.6 asymmetry works on hardware.** At 19:43:01 a cancel arrived and the driver declined it,
+  because closing that record would have told AAPS basal had resumed on a stopped pump.
+
+## ❌ 10d FAILED — but not where it was expected to, and the cause is still open
+
+Bolus speed set to 3 U/min for this step and restored to `unlimited` afterwards. 6 U requested,
+`am force-stop` at **+40 s**.
+
+### ✅ The half the step was written to check: **exactly one orphan, not N**
+
+```
+id=210 ✔161748   id=212 ✔161749   id=214 ✔161750   id=216 ✔161751   id=218 ✔161752
+id=220  0.40U  pumpId=None  tempId=1786262516455        ← the chunk in flight, and the only orphan
+```
+
+Five chunks settled with their provisionals versioned away; only the one open when the process died
+was left. **The per-chunk settle is real**, and 9d's pass was not an artifact of an uninterrupted run.
+
+### ❌ The half that failed: the orphan was never reconciled
+
+```
+id=226  20:01:56  0.40U  pumpId=161753  tempId=None            ← the history sync's own insert
+id=220  20:01:56  0.40U  pumpId=None    tempId=1786262516455   ← still orphaned
+        LIVE rows 7, sum 2.80 U, against 2.40 U actually delivered
+```
+
+⚠ **This is the same double-count that Phase 10a and 10b now avoid.** The chunked path does not
+inherit the fix.
+
+### What was ruled out, and what is left
+
+The reconciliation logic is **not** the fault. Restoring the marker by hand and forcing a read proved
+the function runs, finds the right entry, and behaves correctly:
+
+```
+20:09:36  ⚠ Pending bolus temporaryId=1786262516455 matches seq=161753, but history sync has already
+          imported that entry (watermark 161753) … Settling now would put one pumpId on two rows,
+          so it is NOT done
+```
+
+That is the out-of-order guard firing exactly as designed — a branch that had never been exercised
+until this run, now confirmed.
+
+**The actual fault is that the marker read blank at the one moment it mattered.** It was on disk at
+20:01:57, immediately after the kill:
+
+```
+ypso_pending_bolus = 1786262516455|0.4|161752
+```
+
+and by the reconciliation at 20:03:33 it was empty. The timing shows the function returned instantly —
+8 ms between `correctClockIfDrifted` at 20:03:33.227 and `syncHistoryToAaps` at 20:03:33.235, where a
+populated marker would have spent ~20 s in `readHistory`. **Every branch that clears the marker logs,
+and none of them logged.** The only silent path is `if (raw.isBlank()) return`.
+
+⚠ **Nothing here explains what cleared it, and this is recorded as an open defect rather than a
+guess.** Candidates worth checking in order, none of them verified:
+
+1. Whether `settlePendingBolus` clears the marker on a chunk boundary in a way that races the next
+   chunk's `openPendingBolus` — the chunked path writes and clears it once per chunk, ~8 s apart,
+   which the single-bolus path never does.
+2. Whether the marker's `preferences.put` from a chunk coroutine is flushed before the process dies,
+   given it was read back from disk once but may have been re-written since.
+3. Whether AAPS's startup `setNewBasalProfile` at 20:03:11 — which this rig does on connect — reaches
+   a status read that consumed the marker before the 20:03:33 one.
+
+**Until it is understood, the single-bolus fix should not be assumed to cover chunked delivery.** The
+shipped default is `unlimited`, which does not chunk, so the exposure is limited to a user who has
+deliberately selected a chunked speed.
+
+## Results
+
+| step | date | outcome |
+|---|---|---|
+| 12d hand-stop under a running TBR | 2026-08-09 | ✅ **PASSED** — one record, closed then reopened correctly |
+| 10d chunked sequence killed | 2026-08-09 | ❌ **FAILED** — one orphan (correct) but never reconciled; 2.80 U recorded against 2.40 U delivered |
+| 10c real range loss | | ⏳ **NOT RUN** — needs a human to carry the pump out of range |
