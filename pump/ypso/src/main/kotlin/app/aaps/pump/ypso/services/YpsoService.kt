@@ -1034,7 +1034,13 @@ class YpsoService : DaggerService() {
         // or the process dies, the marker is what lets [reconcilePendingBolus] find the bolus
         // again. A marker with no row is harmless — reconciliation settles nothing and clears it.
         // A row with no marker is the Phase 10 failure, and is what this is here to prevent.
-        preferences.put(YpsoStringNonKey.PendingBolus, "$temporaryId|$requested|$baselineSequence")
+        val marker = "$temporaryId|$requested|$baselineSequence"
+        preferences.put(YpsoStringNonKey.PendingBolus, marker)
+        // ⚠ Diagnostic for the open 10d defect: a chunked sequence writes and clears this once per
+        // chunk, ~8 s apart, where a single bolus writes once. After the 2026-08-09 run the marker
+        // was on disk immediately after the kill and blank at reconciliation 90 s later, and nothing
+        // logged in between. Logging both ends is what tells a lost write from an early clear.
+        aapsLogger.debug(LTag.PUMP, "Pending marker WRITTEN: '$marker'")
         val created = pumpSync.addBolusWithTempId(
             timestamp = dateUtil.now(),
             amount = requested,
@@ -1142,6 +1148,10 @@ class YpsoService : DaggerService() {
      */
     private suspend fun reconcilePendingBolus() {
         val raw = preferences.get(YpsoStringNonKey.PendingBolus)
+        // Logged even when blank, on purpose: "nothing to do" and "the marker vanished" are
+        // indistinguishable in a log that only speaks up when there is work, and telling them
+        // apart is the whole open question in 10d.
+        aapsLogger.debug(LTag.PUMP, "Pending marker READ: '$raw'" + if (raw.isBlank()) " (nothing pending)" else "")
         if (raw.isBlank()) return
 
         val parts = raw.split("|")
