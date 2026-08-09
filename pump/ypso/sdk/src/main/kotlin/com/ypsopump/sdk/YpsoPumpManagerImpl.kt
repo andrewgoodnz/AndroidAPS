@@ -1028,7 +1028,7 @@ class YpsoPumpManagerImpl private constructor(
      */
     suspend fun deliverBolusConfirmed(
         amount: Double,
-        beforeSend: (Double, Long) -> Unit = { _, _ -> }
+        beforeSend: (Double) -> Unit = {}
     ): ConfirmedBolus = withConnection {
         if (amount <= 0.0) {
             return@withConnection bolusFailure(amount, "Bolus amount must be greater than zero")
@@ -1082,9 +1082,7 @@ class YpsoPumpManagerImpl private constructor(
      *   extra round trips inside a timing budget measured in seconds.
      * @param beforeSend runs **after the baseline read has succeeded and immediately before the
      *   bolus command is written**, which is where the caller opens its provisional IOB record. The
-     *   ordering is load-bearing — see the call site. It receives the amount and the **baseline
-     *   sequence**, the latter so the caller can persist enough to reconcile the bolus later if
-     *   this connection, or this process, does not survive to confirm it.
+     *   ordering is load-bearing — see the call site.
      */
     private suspend fun deliverOneBolus(
         amount: Double,
@@ -1092,7 +1090,7 @@ class YpsoPumpManagerImpl private constructor(
         alreadyDelivered: Double,
         sequenceTotal: Double,
         probeDeliveryModeOnce: Boolean,
-        beforeSend: (Double, Long) -> Unit
+        beforeSend: (Double) -> Unit
     ): ConfirmedBolus {
         // Baseline the event log first. This is what lets the bolus we are about to start be told
         // apart from every bolus already in the log, and without it a stale entry could be read
@@ -1122,10 +1120,7 @@ class YpsoPumpManagerImpl private constructor(
         // retraction: nothing now sits between the record and the write except the write itself,
         // which is exactly the window §4g exists to cover. A *failed* write still keeps the record,
         // because on this pump a failed write does **not** prove non-delivery (§3).
-        // The baseline goes out with the amount so the caller can persist it. Reconciliation
-        // after a lost connection needs to know which sequence to look *above*, and this is the
-        // only moment that number is known to be correct.
-        beforeSend(amount, baselineSequence)
+        beforeSend(amount)
 
         if (!suspendStartBolus(amount)) {
             return bolusFailure(amount, "The pump refused the bolus command")
@@ -1235,7 +1230,7 @@ class YpsoPumpManagerImpl private constructor(
      */
     suspend fun deliverChunkedBolusConfirmed(
         plan: BolusChunkPlan,
-        onChunkStarting: (Double, Long) -> Unit = { _, _ -> },
+        onChunkStarting: (Double) -> Unit = {},
         onChunkSettled: (ConfirmedBolus) -> Unit = {}
     ): ConfirmedBolus = withConnection {
         val total = plan.requestedCentiUnits / 100.0

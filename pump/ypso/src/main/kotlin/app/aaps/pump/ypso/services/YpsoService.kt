@@ -21,6 +21,7 @@ import app.aaps.core.interfaces.rx.events.EventDismissNotification
 import app.aaps.core.interfaces.rx.events.EventOverviewBolusProgress
 import app.aaps.core.interfaces.rx.events.EventPreferenceChange
 import app.aaps.core.interfaces.rx.events.EventPumpStatusChanged
+import app.aaps.core.interfaces.db.PersistenceLayer
 import app.aaps.core.interfaces.ui.UiInteraction
 import app.aaps.core.interfaces.utils.DateUtil
 import app.aaps.core.interfaces.utils.fabric.FabricPrivacy
@@ -89,6 +90,7 @@ class YpsoService : DaggerService() {
     @Inject lateinit var context: Context
     @Inject lateinit var ypsoPump: YpsoPump
     @Inject lateinit var pumpSync: PumpSync
+    @Inject lateinit var persistenceLayer: PersistenceLayer
     @Inject lateinit var dateUtil: DateUtil
     @Inject lateinit var fabricPrivacy: FabricPrivacy
     @Inject lateinit var uiInteraction: UiInteraction
@@ -619,9 +621,6 @@ class YpsoService : DaggerService() {
         } ?: aapsLogger.warn(LTag.PUMP, "Basal profile read returned nothing")
 
         correctClockIfDrifted()
-        // Before the sync, never after — see reconcilePendingBolus for why the order decides
-        // whether a recovered bolus becomes one row or two.
-        reconcilePendingBolus()
         syncHistoryToAaps()
 
         rxBus.send(EventYpsoPumpDataChanged())
@@ -951,8 +950,8 @@ class YpsoService : DaggerService() {
         // read its baseline, because a baseline read that fails means nothing is sent and there is
         // nothing to cover. See [openPendingBolus] and 9c.
         var temporaryId: Long? = null
-        val result = pumpManager.deliverBolusConfirmed(insulin) { requested, baselineSequence ->
-            temporaryId = dateUtil.now().also { openPendingBolus(detailedBolusInfo, requested, it, baselineSequence) }
+        val result = pumpManager.deliverBolusConfirmed(insulin) { requested ->
+            temporaryId = dateUtil.now().also { openPendingBolus(detailedBolusInfo, requested, it) }
         }
         temporaryId?.let { settlePendingBolus(detailedBolusInfo, result, it) }
         return result
@@ -986,10 +985,10 @@ class YpsoService : DaggerService() {
         var pendingTemporaryId: Long? = null
         return pumpManager.deliverChunkedBolusConfirmed(
             plan = plan,
-            onChunkStarting = { chunkUnits, baselineSequence ->
+            onChunkStarting = { chunkUnits ->
                 val temporaryId = dateUtil.now()
                 pendingTemporaryId = temporaryId
-                openPendingBolus(detailedBolusInfo, chunkUnits, temporaryId, baselineSequence)
+                openPendingBolus(detailedBolusInfo, chunkUnits, temporaryId)
             },
             onChunkSettled = { chunkResult ->
                 pendingTemporaryId?.let { settlePendingBolus(detailedBolusInfo, chunkResult, it) }
@@ -1024,23 +1023,7 @@ class YpsoService : DaggerService() {
      * The temporary id is the phone's clock at the moment of sending, which is unique per bolus and
      * is what [settlePendingBolus] matches on.
      */
-    private fun openPendingBolus(
-        detailedBolusInfo: DetailedBolusInfo,
-        requested: Double,
-        temporaryId: Long,
-        baselineSequence: Long
-    ) {
-        // Persisted before the AAPS row, and deliberately so: if anything below this line fails
-        // or the process dies, the marker is what lets [reconcilePendingBolus] find the bolus
-        // again. A marker with no row is harmless — reconciliation settles nothing and clears it.
-        // A row with no marker is the Phase 10 failure, and is what this is here to prevent.
-        val marker = "$temporaryId|$requested|$baselineSequence"
-        preferences.put(YpsoStringNonKey.PendingBolus, marker)
-        // ⚠ Diagnostic for the open 10d defect: a chunked sequence writes and clears this once per
-        // chunk, ~8 s apart, where a single bolus writes once. After the 2026-08-09 run the marker
-        // was on disk immediately after the kill and blank at reconciliation 90 s later, and nothing
-        // logged in between. Logging both ends is what tells a lost write from an early clear.
-        aapsLogger.debug(LTag.PUMP, "Pending marker WRITTEN: '$marker'")
+    private fun openPendingBolus(detailedBolusInfo: DetailedBolusInfo, requested: Double, temporaryId: Long) {
         val created = pumpSync.addBolusWithTempId(
             timestamp = dateUtil.now(),
             amount = requested,
@@ -1083,8 +1066,8 @@ class YpsoService : DaggerService() {
             aapsLogger.warn(
                 LTag.PUMP,
                 "The pump's log did not confirm this bolus, so the provisional ${result.requestedUnits}U record under " +
-                    "temporaryId=$temporaryId stands and keeps counting towards IOB. The pending marker is left in " +
-                    "place, so the next connection will try to settle it from the pump's log — see reconcilePendingBolus."
+                    "temporaryId=$temporaryId stands and keeps counting towards IOB. It is left stranded on purpose: " +
+                    "the next history sync settles it from the pump's own entry — see settleStrandedProvisional."
             )
             return
         }
@@ -1119,7 +1102,6 @@ class YpsoService : DaggerService() {
             return
         }
 
-        preferences.put(YpsoStringNonKey.PendingBolus, "")
         aapsLogger.info(
             LTag.PUMP,
             "Settled temporaryId=$temporaryId to ${result.deliveredUnits}U under pumpId=$sequence (the pump's own sequence)"
@@ -1127,109 +1109,68 @@ class YpsoService : DaggerService() {
     }
 
     /**
-     * Settles a bolus an earlier connection sent but never resolved — the Phase 10 failure.
+     * Settles a stranded provisional from the pump's own history instead of inserting beside it.
      *
-     * Phase 10a and 10b, run 2026-08-09, both ended the same way: the provisional record kept its
-     * `temporaryId` and never gained a `pumpId`, so the history sync could not match it and inserted
-     * a second row beside it. **Two live rows, 16.00 U, for a single 8 U bolus.** The pump had done
-     * exactly what it was told; only the records were wrong.
+     * **This is the Phase 10 fix, and it replaces the persisted marker that preceded it.**
      *
-     * This runs **before** [syncHistoryToAaps] on every status read, and that order is load-bearing
-     * rather than tidy. `SyncBolusWithTempIdTransaction` sets `pumpId` on the provisional without
-     * checking whether another row already carries it, so settling *after* the sync had imported the
-     * same entry would leave two rows sharing one `pumpId` — no better than the failure this exists
-     * to fix. Reconciling first means the sync finds the row already carrying that `pumpId` and
-     * updates it instead of inserting.
+     * A provisional is written before the pump is told, so the insulin counts toward IOB even if the
+     * phone dies mid-delivery (§4g). If it does die, that row is stranded: it carries a `temporaryId`
+     * and no `pumpId`. The history sync then reads the pump's own entry for the same bolus, cannot
+     * match it — `syncBolusWithPumpId` matches on `pumpId`, which a stranded row has not got — and
+     * **inserts a second row**. One bolus, counted twice. Measured 2026-08-09: **16.00 U for a single
+     * 8 U bolus, twice**, and **2.80 U for a 2.40 U chunked sequence**.
      *
-     * The match is by **sequence, not amount or time**: the bolus being looked for is the first
-     * `BolusDelivered` above the baseline recorded when the command went out, which is the same rule
-     * the live confirmation path uses. Amount would confuse two identical boluses, and the pump's
-     * clock is not safe to match on — §5 has already produced an entry 12 hours out.
+     * The first fix remembered the outstanding bolus in a preference and settled it on the next
+     * connection. It worked, but it made the record's correctness depend on a preference write
+     * surviving a process kill by milliseconds — and on 2026-08-10 it was shown not to. A kill inside
+     * the same second as the write lost the marker and the double-count came straight back.
+     *
+     * **Nothing has to survive the crash now.** The stranded row is already durable: a committed
+     * SQLite row, present after every force-stop Phase 10 threw at it. The reboot heals instead of
+     * duplicating, which is what a reader would expect it to do in the first place.
+     *
+     * ⚠ **Matching is deliberately conservative.** The pump's clock is not safe to match on — §5 has
+     * produced an entry 12 hours out — and amount alone is ambiguous, because every chunk of a
+     * chunked bolus is identical. A candidate must therefore be a live stranded row of the same
+     * amount within [STRANDED_PROVISIONAL_WINDOW_MS], and **the oldest** is taken, because the pump's
+     * entries arrive in delivery order and so did the provisionals. With no candidate this returns
+     * false and the caller inserts exactly as before: **an unmatched entry is recorded, never
+     * dropped**, because a bolus the driver cannot explain is still a bolus that went in.
+     *
+     * @return true when a stranded provisional was settled and the caller must not insert.
      */
-    private suspend fun reconcilePendingBolus() {
-        val raw = preferences.get(YpsoStringNonKey.PendingBolus)
-        // Logged even when blank, on purpose: "nothing to do" and "the marker vanished" are
-        // indistinguishable in a log that only speaks up when there is work, and telling them
-        // apart is the whole open question in 10d.
-        aapsLogger.debug(LTag.PUMP, "Pending marker READ: '$raw'" + if (raw.isBlank()) " (nothing pending)" else "")
-        if (raw.isBlank()) return
+    private fun settleStrandedProvisional(event: PumpHistoryEvent.BolusDelivered, serial: String): Boolean {
+        val now = dateUtil.now()
+        val candidates = persistenceLayer
+            .getBolusesFromTimeToTime(now - STRANDED_PROVISIONAL_WINDOW_MS, now, true)
+            .filter { it.isValid && it.referenceId == null }
+            .filter { it.ids.temporaryId != null && it.ids.pumpId == null }
+            .filter { abs(it.amount - event.amount) < BOLUS_AMOUNT_EPSILON }
 
-        val parts = raw.split("|")
-        val temporaryId = parts.getOrNull(0)?.toLongOrNull()
-        val requested = parts.getOrNull(1)?.toDoubleOrNull()
-        val baseline = parts.getOrNull(2)?.toLongOrNull()
-        if (temporaryId == null || requested == null || baseline == null) {
-            aapsLogger.error(
-                LTag.PUMP,
-                "Pending bolus marker '$raw' could not be read, so it is cleared. Any provisional record stands " +
-                    "and has to be checked by hand"
-            )
-            preferences.put(YpsoStringNonKey.PendingBolus, "")
-            return
-        }
+        val stranded = candidates.minByOrNull { it.timestamp } ?: return false
+        val temporaryId = stranded.ids.temporaryId ?: return false
 
-        // readHistory ignores its sincePosition argument and returns the newest N, so the filter
-        // below is what actually bounds the search — not the call.
-        val events = pumpManager.readHistory(baseline, PENDING_BOLUS_SEARCH_ENTRIES)
-        if (events.isEmpty()) {
-            aapsLogger.warn(
-                LTag.PUMP,
-                "Pending bolus temporaryId=$temporaryId: the pump's log could not be read, so nothing is decided. " +
-                    "The marker stands and the next connection tries again"
-            )
-            return
-        }
-
-        val entry = events.filterIsInstance<PumpHistoryEvent.BolusDelivered>()
-            .filter { it.position > baseline }
-            .minByOrNull { it.position }
-
-        if (entry == null) {
-            // Not a failure of this mechanism. The pump has no record of delivering it, and deleting
-            // the provisional would assert that nothing went in — the one thing this driver does not
-            // know (§0). The record stands at the requested amount.
-            aapsLogger.warn(
-                LTag.PUMP,
-                "Pending bolus temporaryId=$temporaryId (${requested}U requested): the pump logged no bolus above " +
-                    "sequence $baseline, so it has no record of one. The provisional record stands at the requested " +
-                    "amount and the marker is cleared"
-            )
-            preferences.put(YpsoStringNonKey.PendingBolus, "")
-            return
-        }
-
-        val watermark = preferences.get(YpsoLongNonKey.LastSyncedSequence)
-        if (entry.position <= watermark) {
-            aapsLogger.error(
-                LTag.PUMP,
-                "⚠ Pending bolus temporaryId=$temporaryId matches seq=${entry.position}, but history sync has already " +
-                    "imported that entry (watermark $watermark) and will have inserted its own row. Settling now would " +
-                    "put one pumpId on two rows, so it is NOT done — both rows are live and the total is double, which " +
-                    "has to be corrected by hand. Reconciliation runs before the sync precisely so this cannot happen"
-            )
-            preferences.put(YpsoStringNonKey.PendingBolus, "")
-            return
-        }
-
-        // The timestamp is the provisional's own, not now(). temporaryId *is* the phone clock at the
-        // moment of sending, and the transaction overwrites the row's timestamp with whatever is
-        // passed — so now() would drag a bolus delivered twenty minutes ago forward to the present
-        // and put it on the wrong part of the IOB curve.
+        // The provisional's own timestamp, never the pump entry's and never now(): the transaction
+        // overwrites the row's timestamp with whatever is passed, so either of those would move a
+        // bolus that has already been delivered onto the wrong part of the IOB curve.
         val settled = pumpSync.syncBolusWithTempId(
-            timestamp = temporaryId,
-            amount = entry.amount,
+            timestamp = stranded.timestamp,
+            amount = event.amount,
             temporaryId = temporaryId,
             type = null,
-            pumpId = entry.position,
+            pumpId = event.position,
             pumpType = PumpType.YPSOPUMP,
-            pumpSerial = pumpSerial()
+            pumpSerial = serial
         )
-        preferences.put(YpsoStringNonKey.PendingBolus, "")
         aapsLogger.info(
             LTag.PUMP,
-            "Reconciled a bolus this driver never got to confirm: temporaryId=$temporaryId settled to " +
-                "${entry.amount}U under pumpId=${entry.position}, new=$settled (${requested}U had been requested)"
+            "History sync: seq=${event.position} settled a stranded provisional rather than inserting beside it — " +
+                "temporaryId=$temporaryId, ${event.amount}U, new=$settled" +
+                (if (candidates.size > 1) " (${candidates.size} candidates at this amount; took the oldest)" else "")
         )
+        return settled
+    }
+
     }
 
     /**
@@ -1447,14 +1388,19 @@ class YpsoService : DaggerService() {
     private fun syncToAaps(event: PumpHistoryEvent) {
         val serial = ypsoPump.serialNumber.ifBlank { ypsoPump.pumpMac }
         when (event) {
-            is PumpHistoryEvent.BolusDelivered -> pumpSync.syncBolusWithPumpId(
-                timestamp = event.timestamp,
-                amount = event.amount,
-                type = null,
-                pumpId = event.position,
-                pumpType = PumpType.YPSOPUMP,
-                pumpSerial = serial
-            )
+            // ⚠ Settle a stranded provisional if this entry is one, rather than inserting beside it.
+            // This is the whole Phase 10 fix — see [settleStrandedProvisional].
+            is PumpHistoryEvent.BolusDelivered ->
+                if (!settleStrandedProvisional(event, serial)) {
+                    pumpSync.syncBolusWithPumpId(
+                        timestamp = event.timestamp,
+                        amount = event.amount,
+                        type = null,
+                        pumpId = event.position,
+                        pumpType = PumpType.YPSOPUMP,
+                        pumpSerial = serial
+                    )
+                }
 
             // ⚠⚠ AAPS's TB model carries `require(duration > 0)` in its constructor, so a zero
             // duration does not merely fail this one import: it throws out of
@@ -1644,16 +1590,21 @@ class YpsoService : DaggerService() {
         private const val YPSOPUMP_NAME_PREFIX = "YpsoPump_"
 
         /**
-         * How far back [reconcilePendingBolus] reads when hunting the bolus a lost connection never
-         * confirmed.
+         * How far back [settleStrandedProvisional] will look for a provisional to settle.
          *
-         * The entry it wants is normally the very next one above the baseline, so this is slack, not
-         * a target. It has to cover whatever the pump logged *after* the bolus while AAPS was away —
-         * temporary basals from a loop that kept running, a profile write pushing 24 entries in at
-         * once (§8.5) — without being so large that a reconnection pays for a long read. At ~200 ms
-         * an entry that is about ten seconds, once, on a connection that has just been re-made.
+         * Long enough to cover a phone that was off, a pump left out of range overnight, or a
+         * sync that could not run — the 08-09 runs took minutes, but nothing bounds it in
+         * general. Short enough that a stranded row from days ago, which the user has almost
+         * certainly dealt with by hand, cannot be matched to a bolus given today.
          */
-        private const val PENDING_BOLUS_SEARCH_ENTRIES = 50
+        private const val STRANDED_PROVISIONAL_WINDOW_MS = 12 * 60 * 60 * 1000L
+
+        /**
+         * Half a centi-unit. The pump reports whole centi-units and the provisional is recorded at
+         * the amount requested, so an exact match is expected; this only absorbs the float
+         * representation, not a real difference.
+         */
+        private const val BOLUS_AMOUNT_EPSILON = 0.005
 
         /**
          * Length of the 0% temporary basal that stands for a stopped pump — see [syncSuspendedState].
