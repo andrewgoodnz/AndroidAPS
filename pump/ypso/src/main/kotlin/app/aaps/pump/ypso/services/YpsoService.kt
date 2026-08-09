@@ -1330,16 +1330,48 @@ class YpsoService : DaggerService() {
                 pumpSerial = serial
             )
 
-            is PumpHistoryEvent.TbrStarted     -> pumpSync.syncTemporaryBasalWithPumpId(
-                timestamp = event.timestamp,
-                rate = event.percentage.toDouble(),
-                duration = event.durationMinutes * 60L * 1000L,
-                isAbsolute = false,
-                type = null,
-                pumpId = event.position,
-                pumpType = PumpType.YPSOPUMP,
-                pumpSerial = serial
-            )
+            // ⚠⚠ AAPS's TB model carries `require(duration > 0)` in its constructor, so a zero
+            // duration does not merely fail this one import: it throws out of
+            // syncTemporaryBasalWithPumpId, aborts the whole history sync, and takes the status
+            // read down with it. The watermark never advances past the offending entry, so every
+            // later sync meets it again — **one sub-minute temporary basal wedges history sync
+            // permanently**, and silently, since the only symptom is `readPumpStatus failed:
+            // Failed requirement.`
+            //
+            // Observed 2026-08-09 while running Phase 10a. seq=161696 was 12b's 300%, cancelled
+            // after 17 seconds. The pump rewrites the entry in place with the time it actually
+            // ran and records whole minutes, so 17 seconds reads back as 0. Sync had been stuck
+            // at watermark 161695 from that moment — which is also why 10a's orphaned provisional
+            // sat unreconciled and made the interruption look worse than it was.
+            //
+            // **Skipped, not clamped to a minute.** Clamping would put a duration into AAPS that
+            // the pump never reported, and §0 does not let this driver claim more than the pump
+            // confirmed: a fabricated minute over-states suppressed basal for a 0% and over-states
+            // delivery for a 400%. The live path has already recorded these accurately — AAPS held
+            // 0.28 min for seq=161696, better than either 0 or 60 seconds — so the ordinary case
+            // loses nothing. What is genuinely lost is a sub-minute temporary basal programmed on
+            // the pump itself, which no AAPS record would cover. That is a small, honest gap, and
+            // a far smaller error than an invented duration.
+            is PumpHistoryEvent.TbrStarted     ->
+                if (event.durationMinutes <= 0) {
+                    aapsLogger.warn(
+                        LTag.PUMP,
+                        "History sync: skipping TbrStarted seq=${event.position} — the pump reports it ran " +
+                            "${event.durationMinutes} whole minutes, and AAPS rejects a zero-duration temporary " +
+                            "basal. Importing it would abort the sync and wedge it here permanently"
+                    )
+                } else {
+                    pumpSync.syncTemporaryBasalWithPumpId(
+                        timestamp = event.timestamp,
+                        rate = event.percentage.toDouble(),
+                        duration = event.durationMinutes * 60L * 1000L,
+                        isAbsolute = false,
+                        type = null,
+                        pumpId = event.position,
+                        pumpType = PumpType.YPSOPUMP,
+                        pumpSerial = serial
+                    )
+                }
 
             // ⚠ `event.position` must NOT be the end id here either, for the reason set out at
             // length in cancelTempBasal: the pump rewrites the entry in place, so a TbrEnded
