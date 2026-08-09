@@ -3696,6 +3696,65 @@ temporary basal is not a curiosity.
 - ⚠ Recall that after any restart the driver reads the pump as suspended until it answers — do not
   mistake that for a finding here.
 
+## 12e. Cancel a temporary basal that superseded another — the regression test for the end-id collision
+
+**Status: ⏳ WRITTEN 2026-08-09, NOT RUN.** Added with the fix, not before it, because the defect was
+found on hardware rather than predicted.
+
+**Why this step exists.** On 2026-08-09 a 0% temporary basal at `seq=161723` was cancelled three times
+from the AAPS UI. The pump obeyed every time — `tbr=none`, base rate restored — and all three came
+back `new=false`. AAPS went on showing a temporary basal the pump did not have.
+
+The cause was a collision between two reasonable rules. This pump rewrites one history entry in place
+when a temporary basal stops, keeping its sequence and changing only the type (9 → 10), so the *end*
+sequence and the *start* sequence are the same number. AAPS separately closes a superseded temporary
+basal by stamping the new one's `pumpId` into the old row's `endId`, and then
+`SyncPumpCancelTemporaryBasalIfAnyTransaction` refuses any stop whose `endPumpId` already appears as
+some row's `endId`. Together: **a temporary basal that superseded another can never have its own stop
+recorded.** Row id=422 already carried `endId=161723`, so every cancel of 161723 was discarded before
+it did anything. 53 of 120 real temporary basals over 08-05 → 08-07 met that precondition.
+
+⚠ **This step cannot be replaced by a unit test.** `YpsoService` is a bound service, and a test
+asserting that a millisecond clock reading is not `161723` is a check incapable of failing — the exact
+pattern that produced four false passes in `PORTING_NOTES`. The hardware sequence below can fail.
+
+### The procedure
+
+1. From idle, set **200% for 30 min**. Confirm `tbr=200%` and note the sequence — call it **A**.
+2. **Without cancelling it**, set **0% for 30 min**. The Phase 11 fix should fire:
+   `A 200% temporary basal is already running; cancelling it before setting 0%`. Note the new
+   sequence — call it **B**.
+   ⚠ *This step is what builds the trap*: AAPS closes row A by stamping `endId = B` on it, which is
+   what used to poison B's own cancel.
+3. Press **Cancel TBR** in AAPS. Once — not three times.
+
+### Confirm
+
+- `cancelTempBasal: confirmed=true`, and `[ypso-state]` reads `tbr=none` with the base rate restored.
+- ⚠⚠ **`Recorded TBR stop under endPumpId=…, new=true`.** Before the fix this read `new=false`, and
+  that single word is the whole test.
+- **The `endPumpId` in that line is a timestamp (~1.8e12), not a pump sequence (~1.6e5).** If a
+  sequence number appears there, the fix has been reverted or bypassed.
+- **The AAPS UI offers `TEMPBASAL` again, not `CANCEL n%`.** This is the user-visible half and it is
+  what prompted the original report.
+- **In the database:** the row with `pumpId = B` has a non-null `endId`, its `duration` is the elapsed
+  time rather than the programmed 30 min, and **no temporary basal is active**:
+
+```sql
+select id, timestamp, rate, duration/60000.0 as min, pumpId, endId
+from temporaryBasals where isValid=1 and referenceId is null
+order by timestamp desc limit 4;
+```
+
+### What a failure means
+
+| outcome | meaning |
+|---|---|
+| `new=true`, row closed, UI offers TEMPBASAL | ✅ fixed |
+| `new=false` again | The end id is still colliding. Check what `endPumpId` was logged before concluding anything else |
+| `new=true` but the row stays open | A different defect, in the transaction rather than the id. Do not fold it into this one |
+
+
 ## Phase 12 is passed when
 
 - 12a and 12b have a recorded accept/refuse with timings, and the TBR's survival is confirmed either
@@ -3714,6 +3773,7 @@ temporary basal is not a curiosity.
 | 12b bolus under 300% | 2026-08-09 | ✅ **ACCEPTED**, 3.93 s, TBR survived, exactly 1.00 U |
 | 12c profile write under 200% | 2026-08-09 | ✅ **SUCCEEDED**, TBR survived, both calculations agreed |
 | 12d hand-stop under 250% | | ⏳ **NOT RUN** |
+| 12e cancel after a supersede | | ⏳ **NOT RUN** — regression test for the end-id collision |
 
 ### ✅ 2026-08-09 — items H and H2 both close, and the gate really is specific to temporary basals
 

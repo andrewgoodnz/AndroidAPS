@@ -1231,14 +1231,38 @@ class YpsoService : DaggerService() {
                 // outcome that actually harms: AAPS would keep assuming elevated basal delivery
                 // that has stopped, and over-count IOB for the rest of the original duration.
                 //
-                // The pump's sequence number is preferred as the id, so this stop and a later
-                // history sync of the same event agree. When the log gives us nothing, the
-                // timestamp stands in — a possible dedupe collision is a far smaller problem than a
-                // temporary basal AAPS thinks is still running. That trade was priced while the
-                // sync switch was off; it is on now, so the collision is reachable rather than
-                // hypothetical, and this wants rework anyway since the entry is known to mutate.
+                // ⚠⚠ The end id is deliberately NOT the pump's sequence number. This block used to
+                // prefer it, "so this stop and a later history sync of the same event agree", and
+                // that reasoning was wrong in a way that cost a silent record divergence.
+                //
+                // This pump rewrites one history entry in place when a temporary basal stops: the
+                // entry keeps its sequence and only changes type (9 → 10). So the "end" sequence
+                // and the "start" sequence are the same number — and that number is already on the
+                // row as `pumpId`. Re-using it as `endId` therefore adds no information at all.
+                //
+                // What it does do is break the *next* cancel. AAPS closes a superseded temporary
+                // basal by stamping the new one's `pumpId` into the old row's `endId`; then
+                // SyncPumpCancelTemporaryBasalIfAnyTransaction refuses any stop whose `endPumpId`
+                // already appears as some row's `endId` — "assume TBR has been cut already". The
+                // two rules collide head-on: **a temporary basal that superseded another can never
+                // have its own stop recorded**, because its sequence was consumed as the previous
+                // row's end marker.
+                //
+                // Observed on hardware 2026-08-09. A 0% at seq=161723 was cancelled three times;
+                // the pump obeyed every time (`tbr=none`, base rate restored) and all three came
+                // back `new=false`, because row id=422 already carried `endId=161723` from being
+                // superseded. AAPS went on showing a 0% temporary basal the pump did not have —
+                // and a stale *0%* record is the dangerous sign, since it under-counts delivery and
+                // the loop then over-delivers. 53 of 120 temporary basals over 08-05 → 08-07 met
+                // the precondition, so this was not a corner.
+                //
+                // A millisecond clock reading cannot collide with a pump sequence (~1.8e12 against
+                // ~1.6e5) and cannot collide with another end id at this resolution. Uniqueness is
+                // the only property AAPS asks of this value, and it is the only one the pump cannot
+                // supply. The suspend path at syncSuspendedState has always used `now` for exactly
+                // this reason.
                 val sequence = result.pumpSequence
-                val endPumpId = sequence ?: dateUtil.now()
+                val endPumpId = dateUtil.now()
                 // Only a mismatch worth warning about: AAPS held an id for a running temporary basal
                 // and the pump's log could not be made to agree. A cancel with nothing running finds
                 // no entry because there is none, which is not a fault and should not read like one.
@@ -1246,7 +1270,7 @@ class YpsoService : DaggerService() {
                     aapsLogger.warn(
                         LTag.PUMP,
                         "TBR is stopped but the entry AAPS expected (seq=$expectedSequence) was not in the log; " +
-                            "closing the AAPS record under a timestamp id instead of leaving it open"
+                            "the AAPS record is still being closed, because leaving it open is the outcome that harms"
                     )
                 }
                 val synced = pumpSync.syncStopTemporaryBasalWithPumpId(
@@ -1317,9 +1341,17 @@ class YpsoService : DaggerService() {
                 pumpSerial = serial
             )
 
+            // ⚠ `event.position` must NOT be the end id here either, for the reason set out at
+            // length in cancelTempBasal: the pump rewrites the entry in place, so a TbrEnded
+            // carries the *same* sequence as the TbrStarted it closes, and AAPS has very likely
+            // already consumed that sequence as the previous row's `endId`. Passing it makes
+            // SyncPumpCancelTemporaryBasalIfAnyTransaction return early and the row stays open.
+            // The event's own timestamp is the right id: unique, and it cannot be mistaken for a
+            // pump sequence. Re-processing is prevented by the watermark and by the transaction's
+            // own `endId == null` guard, not by this value.
             is PumpHistoryEvent.TbrEnded       -> pumpSync.syncStopTemporaryBasalWithPumpId(
                 timestamp = event.timestamp,
-                endPumpId = event.position,
+                endPumpId = event.timestamp,
                 pumpType = PumpType.YPSOPUMP,
                 pumpSerial = serial
             )
