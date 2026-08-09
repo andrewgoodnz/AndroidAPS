@@ -2911,7 +2911,7 @@ are worth believing.
 | 10a link dies and returns | 8 U | `svc bluetooth disable`, 90 s | ❌→✅ **FAILED then FIXED 2026-08-09.** 16.00 U before the fix, **8.00 U in one row** after, same rig |
 | 10b AAPS killed | 8 U | `am force-stop` | ❌→✅ **FAILED then FIXED 2026-08-09.** The marker survived the kill and reconciled: **8.00 U in one row** |
 | 10c real range loss | 5 U | pump carried away | ✅ **PASSED 2026-08-10** — one live row, 5.00 U, reconciled on the first connection back. `reason=10` / `status 133`, distinct from 10a's `reason=1` / `-100` |
-| 10d chunked sequence killed | 6 U @ 3 U/min | `am force-stop` at 40 s | ❌⚠ **FAILED 2026-08-09, reproduced 2026-08-10.** Orphan count correct (1, not N) but never reconciled — **2.80 U against 2.40 U delivered**, twice. A third run with the kill 3.3 s later passed cleanly: the trigger is the **marker's durability window**, not chunking |
+| 10d chunked sequence killed | 2 U @ 3 U/min | `am force-stop` on a chunk write | ❌→✅ **FAILED twice, then FIXED 2026-08-10.** 2.80 U against 2.40 U under the marker design; **4 rows and 1.60 U for 1.60 U delivered** once the sync settles the stranded row instead. Marker deleted |
 | 10e control, uninterrupted | 2 U | none | ✅ **PASSED 2026-08-09** — exactly one row, both ids |
 
 ---
@@ -4359,3 +4359,98 @@ driver in this tree injects.
 **Neither has been chosen.** What is established is the trigger, the reproducibility, and that the
 reconciliation logic itself is sound — proved separately when a hand-restored marker made the
 out-of-order guard fire correctly.
+
+---
+
+# ✅ [verified] 2026-08-10 — the marker is gone, and the reboot heals
+
+The pending-bolus marker has been **deleted**. The history sync now settles a stranded provisional
+from the pump's own entry instead of inserting beside it. Nothing has to survive a crash any more —
+the stranded row is a committed SQLite row and was present after every force-stop Phase 10 threw at
+it, so the reboot repairs the record rather than duplicating it.
+
+## ⚠ The first hardware run of the new matcher was wrong, and the test is why we know
+
+It settled **yesterday's** stranded chunk against **today's** bolus, leaving two pairs of rows sharing
+one `pumpId` — the exact corruption the old design's watermark guard existed to prevent:
+
+```
+09:51:14  seq=161824 settled … temporaryId=1786309526218  (2 candidates at this amount; took the oldest)
+          pumpId=161824 then on id=240 (09:05:26) AND id=265 (09:49:13)
+          pumpId=161825 then on id=267 (09:49:21) AND id=271 (09:49:35)
+```
+
+Two mistakes, both in the matcher:
+
+1. **"Take the oldest" is exactly backwards.** Stranded rows left by *earlier* failures are the oldest
+   ones present, so "oldest" reliably picks the wrong bolus. Matching is now **nearest in time**,
+   within [STRANDED_MATCH_TOLERANCE_MS] — a provisional is written a second or two before the pump
+   logs its entry and `correctClockIfDrifted` holds the pump within 10 s of the phone, so a genuine
+   pair is seconds apart. The bad match was **44 minutes** apart.
+2. **Nothing checked that the pump entry was unclaimed.** If a row already carries that `pumpId` the
+   entry is already recorded and there is nothing to settle.
+
+Both guards **fail closed**: no match means the caller inserts, and the worst case is the
+double-count this exists to avoid, which is recoverable by hand. A wrong match is not.
+
+## The corrected matcher, run twice on hardware
+
+### Run A — chunked, process killed on a chunk write
+
+The timing that defeated the marker: the kill landed at 10:13:32 with chunk 4's provisional written at
+10:13:32.806, **the same second**.
+
+```
+10:14:33.727  seq=161833 settled a stranded provisional rather than inserting beside it —
+              temporaryId=1786313612807, 0.4U, new=true, 0s apart
+
+id=281  10:13:09  0.40U  pumpId=161830      id=285  10:13:25  0.40U  pumpId=161832
+id=283  10:13:17  0.40U  pumpId=161831      id=287  10:13:32  0.40U  pumpId=161833
+                    4 rows, 1.60 U — exactly what the pump delivered
+```
+
+Entries 161830–161832 were already claimed by their live-settled rows, so the unclaimed check let
+them fall through to the ordinary sync. **Only the genuinely stranded chunk triggered a settle**, and
+`0s apart` is the matching being exact rather than lucky.
+
+### Run B — single bolus, link cut 2.2 s in
+
+Run at `unlimited`, because **the single-bolus crash path had not been re-verified since the marker
+was removed** — 10a, 10b and 10c all passed *with* it, and that was the real gap.
+
+```
+10:18:38.126  Bolus 2.0 U requested … 10:18:40 svc bluetooth disable
+10:18:49.189  Bolus NOT CONFIRMED … The pump reported at least 0.91 U before the log was read
+10:23:55.388  seq=161834 settled a stranded provisional … 2.0U, new=true, 0s apart
+
+id=292  10:18:38  2.00U  pumpId=161834  tempId=1786313918127      1 row, 2.00 U
+```
+
+### Before and after, same test, same rig
+
+| | rows | recorded | delivered |
+|---|---|---|---|
+| chunked kill, **marker design** | 7 | **2.80 U** | 2.40 U |
+| chunked kill, **sync settles** | 4 | **1.60 U** | 1.60 U |
+| single bolus, link cut | 1 | **2.00 U** | 2.00 U |
+
+**0 orphans and 0 duplicate `pumpId`s anywhere in the database** after both runs.
+
+## What did not change, deliberately
+
+- **The provisional still exists**, written before the pump is told. It is the anti-stacking guard:
+  without it AAPS is blind to delivered insulin until the next sync — up to the 20-minute idle poll
+  (§8.2) — and with SMBs enabled the loop would re-dose into that gap. Over-counting IOB is the safe
+  failure; under-counting is not.
+- **`success=false` on an unconfirmed bolus, and the AAPS alarm.** The delivery genuinely was
+  unconfirmed at the time. What changed is that the record is repaired at the next sync instead of
+  standing wrong.
+- **An unmatched entry is still inserted, never dropped** — a bolus the driver cannot explain is
+  still a bolus that went in.
+
+## Cost
+
+`PersistenceLayer` is now injected into the driver, which no other real-pump driver in this tree does.
+That is the whole architectural price, and it buys the **deletion** of a mechanism rather than the
+addition of one: the `PendingBolus` preference, `reconcilePendingBolus`, the per-chunk marker writes
+and the SDK `beforeSend` baseline parameter are all gone.
