@@ -2910,7 +2910,7 @@ are worth believing.
 |---|---|---|---|
 | 10a link dies and returns | 8 U | `svc bluetooth disable`, 90 s | ❌→✅ **FAILED then FIXED 2026-08-09.** 16.00 U before the fix, **8.00 U in one row** after, same rig |
 | 10b AAPS killed | 8 U | `am force-stop` | ❌→✅ **FAILED then FIXED 2026-08-09.** The marker survived the kill and reconciled: **8.00 U in one row** |
-| 10c real range loss | 10 U | pump carried away, 90 s | ⏳ **NOT RUN** — needs a human to carry the pump |
+| 10c real range loss | 5 U | pump carried away | ✅ **PASSED 2026-08-10** — one live row, 5.00 U, reconciled on the first connection back. `reason=10` / `status 133`, distinct from 10a's `reason=1` / `-100` |
 | 10d chunked sequence killed | 6 U @ 3 U/min | `am force-stop` at 40 s | ❌⚠ **FAILED 2026-08-09.** Orphan count correct (1, not N) but never reconciled — **2.80 U recorded against 2.40 U delivered**. Cause open |
 | 10e control, uninterrupted | 2 U | none | ✅ **PASSED 2026-08-09** — exactly one row, both ids |
 
@@ -4243,7 +4243,7 @@ deliberately selected a chunked speed.
 |---|---|---|
 | 12d hand-stop under a running TBR | 2026-08-09 | ✅ **PASSED** — one record, closed then reopened correctly |
 | 10d chunked sequence killed | 2026-08-09 | ❌ **FAILED** — one orphan (correct) but never reconciled; 2.80 U recorded against 2.40 U delivered |
-| 10c real range loss | | ⏳ **NOT RUN** — needs a human to carry the pump out of range |
+| 10c real range loss | 2026-08-10 | ✅ **PASSED** — one live row, reconciled on reconnect |
 
 ## ✅ 10c PASSED — 2026-08-10, and range loss really does reach the driver differently
 
