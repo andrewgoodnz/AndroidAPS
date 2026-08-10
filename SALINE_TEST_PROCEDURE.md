@@ -4482,3 +4482,57 @@ Unknown          seq=161844  →  "Prime of 2.0U at seq=161844 below tube-change
 One `INSULIN_CHANGE` and **no `CANNULA_CHANGE`** — so CAGE was not restarted, which is right for a
 tubing prime with no cannula fill. A 2.0 U prime sits below the tube-change threshold and is
 deliberately not recorded as a tubing change either.
+
+### ✅ [verified] 2026-08-10 14:18–14:25 — two stranded provisionals of the same amount, settled correctly
+
+Not a numbered step. Run during the soak because the soak itself **cannot** exercise the bolus path:
+SMBs are constrained off by the Nightscout glucose source, so in three hours of looping the driver
+issued 11 temporary basals and **zero boluses**. Duration cannot cover code that never executes.
+
+Three boluses, deliberately: one clean, one with the link cut, one with the process killed — and the
+last two were fired **without letting the first settle**, so two stranded provisionals of *identical
+amount* were live at once. That is the ambiguous case the matcher got wrong on the first attempt.
+
+```
+14:18:24  2.0U  clean                      → settled live,  pumpId=161862
+14:19:43  2.0U  svc bluetooth disable +2s  → stranded
+14:23:13  2.0U  am force-stop +1.2s        → stranded
+
+  both present in the database with AAPS dead:
+  id=315  14:19:43  2.00U  pumpId=None  tempId=1786328383671
+  id=316  14:23:13  2.00U  pumpId=None  tempId=1786328593803
+```
+
+On restart, the sync paired each to its own entry:
+
+```
+14:25:07.135  seq=161863 settled … temporaryId=1786328383671, 2.0U, new=true, 1s apart
+                                    (2 candidates; took the nearest in time)
+14:25:07.184  seq=161864 settled … temporaryId=1786328593803, 2.0U, new=true, 0s apart
+
+  id=313  14:18:24  2.00U  pumpId=161862
+  id=315  14:19:43  2.00U  pumpId=161863
+  id=316  14:23:13  2.00U  pumpId=161864
+            3 live rows, 6.00 U — exactly what the pump delivered
+```
+
+`seq=161862` was imported with **no** settle, because `id=313` already owned it — the unclaimed-entry
+guard doing its job in ordinary traffic rather than in a test.
+
+⚠ **One qualification, so this is not read as more than it is.** The entries arrived in delivery order
+and so did the provisionals, so "oldest" and "nearest in time" would have agreed here. This proves the
+matcher handles **simultaneous same-amount candidates**; it does not re-demonstrate the specific
+regression of 2026-08-10, which was a *stale* 44-minute-old orphan being the oldest. That state can no
+longer be manufactured, because the sync now settles promptly — the regression is prevented by
+construction rather than re-tested.
+
+### Why this was run instead of more soak hours
+
+Worth recording as a method note. **Passive soaking has never found a defect in this project; active
+testing has found every one** — the TBR-replace defect surfaced during a live insulin trial, the
+end-id collision because the user pressed Cancel, the history-sync wedge by running Phase 10a, and the
+matcher's mis-match by running Phase 10d again. The 58-hour soak *confirmed* a fix and discovered
+nothing.
+
+Soaking shows a thing holds. It does not find what is broken, and it cannot touch a path the loop
+never takes.
