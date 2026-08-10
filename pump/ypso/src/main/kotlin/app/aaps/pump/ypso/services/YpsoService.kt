@@ -849,28 +849,6 @@ class YpsoService : DaggerService() {
         pumpManager.readBasalProfile(profileId)?.blocks?.map { it.basalRate }
     }
 
-    /**
-     * `SALINE_TEST_PROCEDURE.md` **Phase 8a** — the extended-bolus probe. A bench instrument.
-     *
-     * ⚠ **This moves fluid.** Saline, off-body, cannula to air.
-     *
-     * Takes **no parameters**, and that is the safety property: every amount and duration it will
-     * ever try is a constant in `YpsoPumpManagerImpl`, so there is no call path that can ask it for
-     * a different dose.
-     *
-     * It runs a positive control (a 0.1 U standard bolus, to prove the path works in the pump's
-     * current state) and then sweeps extended-bolus durations, stopping at the first the pump
-     * accepts and cancelling it. **A rejected write delivers nothing**, so the sweep costs saline
-     * only for the duration that is accepted — at most 1.1 U in total.
-     *
-     * **No treatment record is written.** The history sync will import whatever the pump logged on
-     * the next status read, which is Phase 8c's question — and watching the real mechanism answer
-     * it is worth more than hand-coding a record and then checking the record.
-     */
-    fun probeExtendedBolus(): String = awaitResult("probeExtendedBolus", "The probe could not run") {
-        pumpManager.probeExtendedBolus()
-    }
-
     // ==================== WRITES ====================
 
     /**

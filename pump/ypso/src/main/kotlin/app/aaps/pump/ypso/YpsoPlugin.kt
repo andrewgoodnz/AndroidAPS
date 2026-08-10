@@ -46,7 +46,6 @@ import app.aaps.pump.ypso.keys.YpsoLongNonKey
 import app.aaps.pump.ypso.keys.YpsoStringKey
 import app.aaps.pump.ypso.keys.YpsoStringNonKey
 import app.aaps.pump.ypso.services.YpsoService
-import app.aaps.pump.ypso.ui.YpsoExtendedBolusProbeCommand
 import app.aaps.pump.ypso.ui.YpsoLoadHistoryCommand
 import app.aaps.pump.ypso.ui.YpsoOverviewFragment
 import app.aaps.pump.ypso.ui.YpsoSyncTimeCommand
@@ -297,17 +296,6 @@ class YpsoPlugin @Inject constructor(
     override fun executeCustomCommand(customCommand: CustomCommand): PumpEnactResult? =
         when (customCommand) {
             is YpsoLoadHistoryCommand -> pumpEnactResultProvider.get().success(ypsoService?.loadHistory() == true)
-
-            // Phase 8a's bench probe. `success` here means "the probe ran and produced a report",
-            // not "an extended bolus was delivered" — the report is the output and it is the thing
-            // to read. Deliberately not routed through setExtendedBolus, which stays refused: see
-            // YpsoExtendedBolusProbeCommand for why that flag is not one to flip early.
-            is YpsoExtendedBolusProbeCommand -> {
-                val report = ypsoService?.probeExtendedBolus() ?: "The pump service is not bound"
-                ypsoPump.lastExtendedBolusProbe = report
-                aapsLogger.info(LTag.PUMP, "Extended bolus probe report:\n$report")
-                pumpEnactResultProvider.get().success(true).enacted(false).comment(report)
-            }
 
             // The clock write. `confirmed` is what the pump's own clock read back as, not what
             // the GATT write returned, so reporting it as enacted is a claim about the pump

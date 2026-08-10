@@ -8,14 +8,6 @@
 
     <string name="ypso_not_supported">Not supported by this driver</string>
 
-    <string name="ypso_ext_probe">EXTENDED BOLUS PROBE (BENCH TEST)</string>
-    <string name="ypso_ext_probe_confirm_title">Extended bolus probe — saline only</string>
-    <string name="ypso_ext_probe_confirm_message">This DELIVERS up to 1.1 U: a 0.1 U standard bolus as a control, then 1.0 U as an extended bolus at the first duration the pump accepts (1, 15, 30 or 60 min). Rejected attempts deliver nothing. The extended bolus is cancelled after 30 seconds.
-
-SALINE ONLY, OFF-BODY, CANNULA TO AIR.
-
-It writes no treatment record; the history sync will pick up whatever the pump logs. Do not run this with insulin in the cartridge.</string>
-    <string name="ypso_ext_probe_running">Probe running — this takes about two minutes. Watch the log.</string>
 
     <!--
       The banner at the top of the YPSO tab, and a small lesson in its own history.
@@ -37,7 +29,6 @@ It writes no treatment record; the history sync will pick up whatever the pump l
       complains about bare substitutions besides. "zero temp basal" says the same thing and cannot
       render wrong.
     -->
-    <string name="ypso_research_pump_banner">RESEARCH PUMP DRIVER — verified on saline only. ⚠ An interrupted bolus may be counted twice (Phase 10, unrun). Plaintext — cannot connect to a standard YpsoPump.</string>
 
     <string name="ypso_pairing_title">Pair YpsoPump</string>
     <string name="ypso_pairing_summary">Scan for your pump and bond to it. Confirm the code shown on the pump.</string>

@@ -103,42 +103,6 @@ class YpsoOverviewFragment : DaggerFragment() {
             )
         }
 
-        // ⚠ The only button on this tab that DELIVERS. It exists to answer Phase 8a — whether this
-        // pump accepts a bolusType=2 command at all — and it is a bench instrument, so it asks
-        // first and says plainly what it is about to do.
-        binding.extendedBolusProbe.setOnClickListener {
-            val host = activity ?: return@setOnClickListener
-            OKDialog.showConfirmation(
-                host,
-                rh.gs(R.string.ypso_ext_probe_confirm_title),
-                rh.gs(R.string.ypso_ext_probe_confirm_message),
-                Runnable { runExtendedBolusProbe() }
-            )
-        }
-    }
-
-    /**
-     * Runs the Phase 8a probe on the command queue and shows the report it produced.
-     *
-     * The report is the output — not `result.success`, which only says the probe ran. What decides
-     * Phase 8a is the sequence of `t+Ns` lines inside it.
-     */
-    private fun runExtendedBolusProbe() {
-        binding.extendedBolusProbe.isEnabled = false
-        ToastUtils.infoToast(context, rh.gs(R.string.ypso_ext_probe_running))
-        commandQueue.customCommand(YpsoExtendedBolusProbeCommand(), object : app.aaps.core.interfaces.queue.Callback() {
-            override fun run() {
-                activity?.runOnUiThread {
-                    if (_binding == null) return@runOnUiThread
-                    binding.extendedBolusProbe.isEnabled = true
-                    OKDialog.show(
-                        activity ?: return@runOnUiThread,
-                        rh.gs(R.string.ypso_ext_probe_confirm_title),
-                        ypsoPump.lastExtendedBolusProbe.ifBlank { rh.gs(R.string.ypso_bolus_failed) }
-                    )
-                }
-            }
-        })
     }
 
     private fun setPumpClock() {
