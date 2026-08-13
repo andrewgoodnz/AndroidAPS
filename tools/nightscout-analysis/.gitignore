@@ -1,0 +1,7 @@
+# Never commit personal health data or generated reports.
+data/
+synth/
+*.json
+!package.json
+report*.md
+summary*.json
