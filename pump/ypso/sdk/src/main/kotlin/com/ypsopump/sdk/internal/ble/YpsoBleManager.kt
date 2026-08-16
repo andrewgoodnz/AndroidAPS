@@ -387,10 +387,20 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
 
     // ==================== PUBLIC API ====================
 
+    // Every read below must answer its callback on **both** paths. A `.with` without a matching
+    // `.fail` looks harmless — the value is optional either way — but the caller is a
+    // `suspendCancellableCoroutine` that resumes only when the callback fires. Dropping the link
+    // mid-read then leaves that coroutine parked forever holding `pumpMutex`, and every later
+    // connect and disconnect queues behind a lock nothing will release. That deadlocked the driver
+    // twice on 2026-08-15 (11:07 and 20:57), each time until the app was force-stopped.
+
     fun readDeviceName(callback: (String?) -> Unit) {
         charDeviceName?.let { char ->
             readCharacteristic(char).with { _, data ->
                 callback(data.getStringValue(0))
+            }.fail { _, status ->
+                log("readDeviceName failed with status $status")
+                callback(null)
             }.enqueue()
         } ?: callback(null)
     }
@@ -399,6 +409,9 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
         charManufacturer?.let { char ->
             readCharacteristic(char).with { _, data ->
                 callback(data.getStringValue(0))
+            }.fail { _, status ->
+                log("readManufacturer failed with status $status")
+                callback(null)
             }.enqueue()
         } ?: callback(null)
     }
@@ -408,6 +421,9 @@ internal class YpsoBleManager(context: Context) : BleManager(context) {
             readCharacteristic(char).with { _, data ->
                 val bytes = data.value
                 callback(bytes?.let { formatVersion(it) } ?: "Unknown")
+            }.fail { _, status ->
+                log("readSoftwareRevision failed with status $status")
+                callback(null)
             }.enqueue()
         } ?: callback(null)
     }

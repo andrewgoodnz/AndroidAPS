@@ -36,6 +36,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -45,6 +46,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 import kotlin.coroutines.resume
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -102,6 +104,37 @@ class YpsoPumpManagerImpl private constructor(
 
         /** Pump needs a moment after the auth write before it answers reads. */
         private const val POST_AUTH_SETTLE_MS = 300L
+
+        /**
+         * How long any one BLE call may go unanswered before [bleCall] gives up on it.
+         *
+         * ⚠ **This bound is what keeps [pumpMutex] releasable, and that is its real job.** Every
+         * pump operation runs under that lock, and each one parks a coroutine waiting on a Nordic
+         * callback. A callback that never arrives — the link dropping mid-read is enough — used to
+         * park the coroutine forever, so the lock was never released and every later connect *and*
+         * disconnect queued behind it. Killing the process was the only way out; it deadlocked
+         * twice on 2026-08-15 (11:07 and 20:57), each time until AAPS was force-stopped.
+         *
+         * 20 s against measured traffic: ordinary reads answer in well under a second, and the
+         * slowest whole session setup on record — auth plus three info reads plus a status read —
+         * took 32 s end to end. Deliberately under AAPS's own 120 s command-queue timeout, so the
+         * driver frees itself and can be retried before the queue gives up on it.
+         */
+        private const val BLE_CALL_TIMEOUT_MS = 20_000L
+
+        /**
+         * The same bound for history reads, which are legitimately long: one call walks the pump's
+         * log frame by frame, and a full 50 events plus 50 alerts has been measured at 30 s. Set to
+         * double that so a slow link cannot be mistaken for a lost callback.
+         */
+        private const val BLE_HISTORY_CALL_TIMEOUT_MS = 60_000L
+
+        /**
+         * And for the GATT connect itself, which is slower than anything it carries: `.retry(3, 200)`
+         * means up to four attempts, and a refusal has been measured taking 40 s to come back. 90 s
+         * leaves that plenty of room while still landing inside AAPS's 120 s queue timeout.
+         */
+        private const val BLE_CONNECT_TIMEOUT_MS = 90_000L
 
         /** Breathing room between writing the clock and reading it back. */
         private const val CLOCK_SETTLE_MS = 500L
@@ -445,9 +478,29 @@ class YpsoPumpManagerImpl private constructor(
 
         bleManager.onDisconnectCallback = { reason ->
             log("BLE disconnected (reason=$reason)")
-            if (_connectionState.value is PumpConnectionState.Ready) {
-                _connectionState.value = PumpConnectionState.Disconnected
-                emitEvent(PumpEvent.ConnectionLost("BLE disconnect $reason"))
+            when (_connectionState.value) {
+                // A session that was up and is now gone. AAPS hears about it, and the reconnect
+                // timer gets its chance if a bolus armed it.
+                is PumpConnectionState.Ready        -> {
+                    _connectionState.value = PumpConnectionState.Disconnected
+                    emitEvent(PumpEvent.ConnectionLost("BLE disconnect $reason"))
+                }
+
+                // ⚠ A drop *during setup* used to fall through here untouched, and that left the
+                // state at Connecting or Initializing for good. `YpsoService.isConnecting` reads
+                // both as "a connect is in progress", so AAPS went on waiting for an attempt that
+                // had already died — 33 minutes of it on 2026-08-15 before the app was
+                // force-stopped. Clear it, so the next command starts a fresh attempt instead.
+                //
+                // No ConnectionLost event: nothing was established, so there is no session to
+                // report losing, and AAPS reads that event as the end of a working link.
+                is PumpConnectionState.Connecting,
+                is PumpConnectionState.Initializing -> {
+                    log("Link dropped during setup — clearing state so the next attempt is not blocked")
+                    _connectionState.value = PumpConnectionState.Disconnected
+                }
+
+                else                                -> Unit
             }
             reconnectManager.onDisconnect()
         }
@@ -577,25 +630,25 @@ class YpsoPumpManagerImpl private constructor(
     @SuppressLint("MissingPermission")
     private suspend fun connectDirect(mac: String): Boolean {
         val device: BluetoothDevice = bluetoothAdapter?.getRemoteDevice(mac) ?: return false
-        return suspendCancellableCoroutine { cont ->
+        return bleCall<Boolean>("connectDirect", BLE_CONNECT_TIMEOUT_MS) { cb ->
             bleManager.connect(device)
                 .useAutoConnect(false)
                 .retry(3, 200)
-                .done { cont.resume(true) }
+                .done { cb(true) }
                 .fail { _, status ->
                     log("BLE connect failed with status $status")
-                    cont.resume(false)
+                    cb(false)
                 }
                 .enqueue()
-        }
+        } ?: false
     }
 
     private suspend fun suspendDisconnect() {
         if (!bleManager.isConnected.value) return
-        suspendCancellableCoroutine { cont ->
+        bleCall<Unit>("disconnect") { cb ->
             bleManager.disconnect()
-                .done { cont.resume(Unit) }
-                .fail { _, _ -> cont.resume(Unit) }
+                .done { cb(Unit) }
+                .fail { _, _ -> cb(Unit) }
                 .enqueue()
         }
         delay(POST_AUTH_SETTLE_MS)
@@ -619,9 +672,7 @@ class YpsoPumpManagerImpl private constructor(
         updateStatusFromSystem(status)
         eventProcessor.processSystemStatus(status).forEach { emitEvent(it) }
 
-        val program = suspendCancellableCoroutine<Char?> { cont ->
-            bleManager.readActiveProgram { cont.resume(it) }
-        }
+        val program = suspendReadActiveProgram()
         val profileId = when (program) {
             'A'  -> 0
             'B'  -> 1
@@ -711,9 +762,7 @@ class YpsoPumpManagerImpl private constructor(
 
     override suspend fun readBasalProfile(profileId: Int): BasalProfile? = withConnection {
         val program = if (profileId == 0) 'A' else 'B'
-        val rates = suspendCancellableCoroutine<List<Double>?> { cont ->
-            bleManager.readBasalProfile(program) { cont.resume(it) }
-        } ?: return@withConnection null
+        val rates = suspendReadBasalProfile(program) ?: return@withConnection null
 
         BasalProfile(
             profileId = profileId,
@@ -723,9 +772,7 @@ class YpsoPumpManagerImpl private constructor(
     }
 
     override suspend fun getActiveProfileId(): Int? = withConnection {
-        val program = suspendCancellableCoroutine<Char?> { cont ->
-            bleManager.readActiveProgram { cont.resume(it) }
-        }
+        val program = suspendReadActiveProgram()
         when (program) {
             'A'  -> 0
             'B'  -> 1
@@ -852,12 +899,8 @@ class YpsoPumpManagerImpl private constructor(
     suspend fun readNewestSequence(): Long? = readHistoryWithDump(PROBE_ENTRIES).newestSequence
 
     suspend fun readHistoryWithDump(maxEntries: Int): HistoryReadResult = withConnection {
-        val events = suspendCancellableCoroutine<List<HistoryEntry>> { cont ->
-            bleManager.readHistoryEvents(maxEntries) { cont.resume(it) }
-        }
-        val alerts = suspendCancellableCoroutine<List<HistoryEntry>> { cont ->
-            bleManager.readHistoryAlerts(maxEntries) { cont.resume(it) }
-        }
+        val events = suspendReadHistoryEvents(maxEntries)
+        val alerts = suspendReadHistoryAlerts(maxEntries)
         log("History: ${events.size} event(s), ${alerts.size} alert(s)")
 
         val all = events + alerts
@@ -890,9 +933,7 @@ class YpsoPumpManagerImpl private constructor(
      */
     suspend fun probeUnknownSettings(): Map<Int, Int?> = withConnection {
         (UNKNOWN_SETTINGS_RANGE).associateWith { index ->
-            val value = suspendCancellableCoroutine<Int?> { cont ->
-                bleManager.readSetting(index) { cont.resume(it) }
-            }
+            val value = bleCall<Int?>("readSetting($index)") { cb -> bleManager.readSetting(index, cb) }
             log("Setting probe: index $index = ${value ?: "unreadable"}")
             value
         }
@@ -2054,7 +2095,7 @@ class YpsoPumpManagerImpl private constructor(
     }
 
     private suspend fun suspendCancelExtendedBolus(): Boolean =
-        suspendCancellableCoroutine { cont -> bleManager.cancelBolus("extended") { cont.resume(it) } }
+        bleCall<Boolean>("cancelExtendedBolus") { cb -> bleManager.cancelBolus("extended", cb) } ?: false
 
     /**
      * Every field of the bolus status on one line, including the ones this driver has never used.
@@ -2101,57 +2142,98 @@ class YpsoPumpManagerImpl private constructor(
 
     // ==================== SUSPEND HELPERS ====================
 
+    /**
+     * Runs one callback-style BLE call as a suspending one, and **will not wait forever for it**.
+     *
+     * [start] is handed the callback to invoke; whatever it passes back becomes the result. If
+     * nothing arrives inside [timeoutMs] the call is abandoned and this returns `null`, which every
+     * caller below already treats as failure. See [BLE_CALL_TIMEOUT_MS] for why the bound exists at
+     * all — in short, these calls run under [pumpMutex], and one that never answers used to hold
+     * that lock for good.
+     *
+     * Abandoning is safe: [suspendCancellableCoroutine] cancels the continuation, and a Nordic
+     * callback that turns up afterwards resumes a cancelled continuation, which is a no-op.
+     */
+    private suspend fun <T> bleCall(
+        what: String,
+        timeoutMs: Long = BLE_CALL_TIMEOUT_MS,
+        start: ((T) -> Unit) -> Unit
+    ): T? =
+        try {
+            withTimeout(timeoutMs) {
+                suspendCancellableCoroutine { cont -> start { cont.resume(it) } }
+            }
+        } catch (_: TimeoutCancellationException) {
+            // Not a warning about the pump so much as about the link: the call was issued and the
+            // answer never came. Named so the log says which one, because the whole failure mode
+            // used to be invisible — the last line was whatever came before the silence.
+            log("$what: no answer within ${timeoutMs / 1000}s — abandoning the call so the pump lock is released")
+            null
+        }
+
     private suspend fun suspendAuth(): Boolean =
-        suspendCancellableCoroutine { cont -> bleManager.authenticate { cont.resume(it) } }
+        bleCall<Boolean>("authenticate") { cb -> bleManager.authenticate(cb) } ?: false
 
     private suspend fun suspendGetSystemStatus(): SystemStatusData? =
-        suspendCancellableCoroutine { cont -> bleManager.getSystemStatus { cont.resume(it) } }
+        bleCall("getSystemStatus") { cb -> bleManager.getSystemStatus(cb) }
 
     private suspend fun suspendReadClock(): PumpClockData? =
-        suspendCancellableCoroutine { cont -> bleManager.readClock { cont.resume(it) } }
+        bleCall("readClock") { cb -> bleManager.readClock(cb) }
 
     private suspend fun suspendSyncTime(): Boolean =
-        suspendCancellableCoroutine { cont -> bleManager.syncTime { cont.resume(it) } }
+        bleCall<Boolean>("syncTime") { cb -> bleManager.syncTime(cb) } ?: false
 
     private suspend fun suspendGetBolusStatus(): BolusStatusData? =
-        suspendCancellableCoroutine { cont -> bleManager.getBolusStatus { cont.resume(it) } }
+        bleCall("getBolusStatus") { cb -> bleManager.getBolusStatus(cb) }
 
     /**
      * [durationMinutes] defaults to 0, which is what makes it a **standard** bolus: `startBolus`
      * sets `bolusType = 1` for a zero duration and `2` otherwise. Only [probeExtendedBolus] passes
      * anything else, so every delivery path in this driver still sends type 1.
+     *
+     * ⚠ The timeout here bounds **getting the command to the pump**, not the delivery it starts.
+     * Delivery is the pump's own from the moment it accepts the write, and the caller watches it
+     * out over `bolusTimeoutMs`. A `false` from here means the write itself went unanswered — so
+     * whether the pump took it is unknown, which is why the caller reconciles against the event log
+     * rather than assuming nothing was given.
      */
     private suspend fun suspendStartBolus(amount: Double, durationMinutes: Int = 0): Boolean =
-        suspendCancellableCoroutine { cont ->
-            bleManager.startBolus(amount.toFloat(), durationMinutes) { cont.resume(it) }
-        }
+        bleCall<Boolean>("startBolus") { cb ->
+            // Named argument: `immediateUnits` sits between the duration and the callback with a
+            // default, so a third positional would land on that rather than on the callback.
+            bleManager.startBolus(amount.toFloat(), durationMinutes, callback = cb)
+        } ?: false
 
     private suspend fun suspendCancelBolus(): Boolean =
-        suspendCancellableCoroutine { cont -> bleManager.cancelBolus("fast") { cont.resume(it) } }
+        bleCall<Boolean>("cancelBolus") { cb -> bleManager.cancelBolus("fast", cb) } ?: false
 
     private suspend fun suspendReadHistoryEvents(maxEntries: Int): List<HistoryEntry> =
-        suspendCancellableCoroutine { cont -> bleManager.readHistoryEvents(maxEntries) { cont.resume(it) } }
+        bleCall<List<HistoryEntry>>("readHistoryEvents", BLE_HISTORY_CALL_TIMEOUT_MS) { cb ->
+            bleManager.readHistoryEvents(maxEntries, cb)
+        } ?: emptyList()
 
     private suspend fun suspendReadHistoryAlerts(maxEntries: Int): List<HistoryEntry> =
-        suspendCancellableCoroutine { cont -> bleManager.readHistoryAlerts(maxEntries) { cont.resume(it) } }
+        bleCall<List<HistoryEntry>>("readHistoryAlerts", BLE_HISTORY_CALL_TIMEOUT_MS) { cb ->
+            bleManager.readHistoryAlerts(maxEntries, cb)
+        } ?: emptyList()
 
     private suspend fun suspendReadAlertsCount(): Int? =
-        suspendCancellableCoroutine { cont -> bleManager.readHistoryAlertsCount { cont.resume(it) } }
+        bleCall("readHistoryAlertsCount") { cb -> bleManager.readHistoryAlertsCount(cb) }
 
     private suspend fun suspendStartTbr(percentage: Int, durationMinutes: Int): Boolean =
-        suspendCancellableCoroutine { cont -> bleManager.startTbr(percentage, durationMinutes) { cont.resume(it) } }
+        bleCall<Boolean>("startTbr") { cb -> bleManager.startTbr(percentage, durationMinutes, cb) } ?: false
 
     private suspend fun suspendCancelTbr(): Boolean =
-        suspendCancellableCoroutine { cont -> bleManager.cancelTbr { cont.resume(it) } }
+        bleCall<Boolean>("cancelTbr") { cb -> bleManager.cancelTbr(cb) } ?: false
 
     private suspend fun suspendReadActiveProgram(): Char? =
-        suspendCancellableCoroutine { cont -> bleManager.readActiveProgram { cont.resume(it) } }
+        bleCall("readActiveProgram") { cb -> bleManager.readActiveProgram(cb) }
 
     private suspend fun suspendReadBasalProfile(program: Char): List<Double>? =
-        suspendCancellableCoroutine { cont -> bleManager.readBasalProfile(program) { cont.resume(it) } }
+        bleCall("readBasalProfile") { cb -> bleManager.readBasalProfile(program, cb) }
 
     private suspend fun suspendWriteBasalProfile(program: Char, rates: List<Double>): Boolean =
-        suspendCancellableCoroutine { cont -> bleManager.writeBasalProfile(program, rates) { cont.resume(it) } }
+        bleCall<Boolean>("writeBasalProfile") { cb -> bleManager.writeBasalProfile(program, rates, cb) } ?: false
 
     // ==================== INTERNAL ====================
 
@@ -2214,12 +2296,20 @@ class YpsoPumpManagerImpl private constructor(
         )
     }
 
+    /**
+     * Reads the three descriptive characteristics. All three are optional decoration — a pump that
+     * declines to name itself is still usable — so each one failing is shrugged off.
+     *
+     * ⚠ This is where the driver hung on 2026-08-15. These reads sit between `Authenticated` and
+     * `Session ready`, and the link dropping in that window left the read unanswered forever. They
+     * go through [bleCall] now so the worst case is a named line in the log and a missing name.
+     */
     private suspend fun readPumpInfo() {
-        suspendCancellableCoroutine<String?> { cont -> bleManager.readDeviceName { cont.resume(it) } }
+        bleCall<String?>("readDeviceName") { cb -> bleManager.readDeviceName(cb) }
             ?.let { _pumpStatus.value = (_pumpStatus.value ?: PumpStatus()).copy(serialNumber = it.cleanBleString()) }
-        suspendCancellableCoroutine<String?> { cont -> bleManager.readManufacturer { cont.resume(it) } }
+        bleCall<String?>("readManufacturer") { cb -> bleManager.readManufacturer(cb) }
             ?.let { _pumpStatus.value = (_pumpStatus.value ?: PumpStatus()).copy(manufacturer = it.cleanBleString()) }
-        suspendCancellableCoroutine<String?> { cont -> bleManager.readSoftwareRevision { cont.resume(it) } }
+        bleCall<String?>("readSoftwareRevision") { cb -> bleManager.readSoftwareRevision(cb) }
             ?.let { _pumpStatus.value = (_pumpStatus.value ?: PumpStatus()).copy(firmwareVersion = it) }
     }
 
