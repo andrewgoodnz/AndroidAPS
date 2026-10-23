@@ -150,6 +150,8 @@ androidx-wear-compose-foundation = { group = "androidx.wear.compose", name = "co
 
 io-reactivex-rxjava3-rxkotlin = { group = "io.reactivex.rxjava3", name = "rxkotlin", version = "3.0.1" }
 io-reactivex-rxjava3-rxandroid = { group = "io.reactivex.rxjava3", name = "rxandroid", version = "3.0.2" }
+# Used only by :pump:ypso:sdk, whose BLE layer extends Nordic's BleManager.
+no-nordicsemi-android-ble = { group = "no.nordicsemi.android", name = "ble", version = "2.11.0" }
 com-uber-rxdogtag2-rxdogtag = { group = "com.uber.rxdogtag2", name = "rxdogtag", version = "2.0.2" }
 com-polidea-rxandroidble3 = { group = "com.polidea.rxandroidble3", name = "rxandroidble", version = "1.19.1" }
 

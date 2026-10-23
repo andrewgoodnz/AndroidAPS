@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <string name="ypso_pump">YpsoPump</string>
+    <string name="ypso_pump_shortname">YPSO</string>
+    <string name="ypso_pump_description">Pump integration for Ypsomed YpsoPump (plaintext research pump)</string>
+    <string name="ypso_pump_setting">YpsoPump settings</string>
+
+    <string name="ypso_not_supported">Not supported by this driver</string>
+
+
+    <!--
+      The banner at the top of the YPSO tab, and a small lesson in its own history.
+
+      It read "SALINE TEST BUILD … Not for use with insulin" until that became a verdict nobody had
+      revisited. It was replaced on 2026-08-04 with facts chosen to be immune to going stale — and
+      one of them, "never against a person", was false **the same afternoon**, when the driver ran a
+      closed loop on somebody for ten minutes. Writing a fact rather than a verdict is not enough if
+      the fact is about something that can still happen.
+
+      What is here now: "verified on saline only" is durable, because the verification is what it is
+      and that trial verified nothing (it was aborted by the defect it found). The second sentence is
+      a live status deliberately tied to a **named phase**, so it is checkable rather than a mood —
+      when Phase 11 passes, this line is meant to change.
+    -->
+    <!--
+      ⚠ No percent sign in this string. It is used directly as android:text, never through
+      String.format, so a literal "%" is shown raw and "%%" is shown as two of them — and aapt
+      complains about bare substitutions besides. "zero temp basal" says the same thing and cannot
+      render wrong.
+    -->
+
+    <string name="ypso_pairing_title">Pair YpsoPump</string>
+    <string name="ypso_pairing_summary">Scan for your pump and bond to it. Confirm the code shown on the pump.</string>
+    <string name="ypso_no_device_available">No YpsoPump found. Wake the pump and keep it close.</string>
+    <string name="ypso_bonding_failed">Bonding failed. Wake the pump and try again.</string>
+    <string name="ypso_confirm_pair_title">Pair with this pump?</string>
+    <string name="ypso_confirm_pair_message">%1$s\n%2$s\n\nCheck the serial matches the pump you intend AAPS to use. Do not select a pump that another app is using to deliver insulin.</string>
+    <string name="ypso_bonding_title">Bonding</string>
+    <string name="ypso_bonding_message">Confirm the pairing request, and check the code matches the one shown on the pump.</string>
+    <string name="ypso_not_paired">Not paired</string>
+
+    <string name="ypso_connection_label">Connection</string>
+    <string name="ypso_last_connection_label">Last connection</string>
+    <string name="ypso_serial_label">Serial</string>
+    <string name="ypso_mac_label">MAC</string>
+    <string name="ypso_firmware_label">Firmware</string>
+    <string name="ypso_reservoir_label">Reservoir</string>
+    <string name="ypso_battery_label">Battery</string>
+    <string name="ypso_delivery_mode_label">Delivery mode</string>
+    <string name="ypso_active_profile_label">Active program</string>
+    <string name="ypso_basal_rate_label">Base basal</string>
+    <string name="ypso_temp_basal_label">Temp basal</string>
+    <string name="ypso_clock_label">Pump clock</string>
+
+    <string name="ypso_connected">Connected</string>
+    <string name="ypso_connecting">Connecting</string>
+    <string name="ypso_disconnected">Disconnected</string>
+
+    <string name="ypso_reservoir_value">%1$.1f U</string>
+    <string name="ypso_basal_rate_value">%1$.2f U/h</string>
+    <string name="ypso_tbr_value">%1$d%% (%2$d min left)</string>
+    <string name="ypso_tbr_running_no_detail">Running (rate and duration not readable yet)</string>
+
+    <string name="ypso_clock_ahead">%1$s ahead of phone</string>
+    <string name="ypso_clock_behind">%1$s behind phone</string>
+    <string name="ypso_clock_in_sync">In sync with phone (%1$s)</string>
+
+    <string name="ypso_refresh">Refresh</string>
+    <string name="ypso_read_history">Read history</string>
+    <string name="ypso_set_clock">Set pump clock</string>
+    <string name="ypso_history_title">Pump history (raw)</string>
+    <string name="ypso_no_history">No history read yet</string>
+    <string name="ypso_getting_pump_status">Getting pump status</string>
+    <string name="ypso_setting_pump_clock">Setting pump clock</string>
+    <string name="ypso_requested_by_user">Requested by user</string>
+
+    <string name="ypso_set_clock_confirm_title">Set the pump\'s clock?</string>
+    <string name="ypso_set_clock_confirm_message">This writes the phone\'s date and time to the pump.\n\nThe pump\'s clock is read back afterwards, and the result below reflects what the pump actually reports — not whether the write was accepted. The driver also does this by itself after a timezone change, or if the pump\'s clock drifts.</string>
+    <string name="ypso_clock_result_title">Pump clock</string>
+    <string name="ypso_clock_set_ok">Pump clock set, and confirmed by reading it back from the pump.</string>
+    <string name="ypso_clock_set_failed">Pump clock NOT confirmed. Check the clock on the pump itself and read the log before trying again.</string>
+
+    <string name="ypso_bolus_not_connected">Pump not connected — no bolus was sent</string>
+    <string name="ypso_bolus_failed">Bolus failed — the pump did not confirm any delivery</string>
+    <string name="ypso_tbr_failed">Temp basal failed — the pump did not confirm it</string>
+    <string name="ypso_tbr_cancel_failed">Temp basal cancel failed — the pump did not confirm it</string>
+    <string name="ypso_tbr_no_base_rate">Pump basal rate not read yet — cannot convert U/h to a percentage</string>
+    <string name="ypso_profile_write_failed">Basal profile NOT confirmed — check the 24 rates on the pump before relying on it</string>
+    <string name="ypso_pump_alert">YpsoPump: %1$s</string>
+    <string name="ypso_pump_suspended">YpsoPump is not delivering insulin (%1$s). Basal has stopped.</string>
+    <string name="ypso_clock_drifted">The YpsoPump\'s clock is %1$d seconds out and could not be corrected. Events the pump logs will carry the wrong time. Set it from the YPSO tab.</string>
+    <string name="ypso_clock_corrected">YpsoPump clock corrected (%1$d s out)</string>
+    <string name="ypso_clock_implausible">The YpsoPump\'s clock is %1$d hours from the phone\'s. That is too far to correct automatically — check the time on both the pump and the phone.</string>
+    <string name="ypso_clock_dst_failed">The phone\'s time changed but the YpsoPump\'s clock could not be corrected. The pump\'s clock is now wrong, and events it logs will carry the wrong time. Set it from the YPSO tab.</string>
+    <string name="ypso_bolus_over_pump_max">Bolus of %1$.2f U exceeds the pump maximum of %2$.2f U</string>
+
+    <string name="ypso_bolus_speed_title">Bolus speed</string>
+    <string name="ypso_bolus_speed_summary">The pump has no speed setting. Slower speeds are produced by the phone, which splits a large bolus into several small ones a few seconds apart — more comfortable, and each small bolus still goes in at the pump\'s full rate. AAPS cannot reach the pump until the whole sequence has finished.</string>
+    <string name="ypso_nano_bolus_title">Nano bolus</string>
+    <string name="ypso_nano_bolus_summary">Pump is configured for tiny bolus steps</string>
+    <string name="ypso_rssi_threshold_title">Scan signal threshold (dBm)</string>
+    <string name="ypso_rssi_threshold_summary">Pumps weaker than this are hidden when pairing</string>
+
+    <string name="ypso_history_read_count_title">History entries to read</string>
+    <string name="ypso_history_read_count_summary">How many recent entries to pull from each pump log</string>
+    <string name="ypso_sync_history_title">Write history to AAPS treatments</string>
+    <string name="ypso_sync_history_summary">Brings boluses and temp basals given on the pump itself into AAPS. Without it, a bolus from the pump\'s own menu is invisible and AAPS may dose on top of it. The first sync after enabling imports nothing — it records where to start.</string>
+    <string name="ypso_legacy_auth_salt_title">Use legacy auth salt</string>
+    <string name="ypso_legacy_auth_salt_summary">Try this if the pump accepts the auth write but then refuses to answer reads</string>
+
+    <string name="ypso_log_insulin_change_title">Log reservoir change</string>
+    <string name="ypso_log_insulin_change_summary">Record pump reservoir changes as Insulin Change</string>
+    <string name="ypso_log_site_change_title">Log cannula change</string>
+    <string name="ypso_log_site_change_summary">Record pump cannula changes as Site Change</string>
+    <string name="ypso_log_tube_change_title">Log tubing change</string>
+    <string name="ypso_log_tube_change_summary">Record pump tubing changes as Tube Change</string>
+    <string name="ypso_log_battery_change_title">Log battery change</string>
+    <string name="ypso_log_battery_change_summary">Record pump battery changes as Battery Change</string>
+
+    <string name="ypso_bolus_speed_unlimited" comment="Bolus delivery option. No splitting: one command at the pump's own rate, about 33 units per minute.">Unlimited — no splitting (~33 U/min)</string>
+    <string name="ypso_bolus_speed_twelve" comment="Bolus delivery option: 12 units per minute, delivered as 1 unit every 5 seconds.">12 U/min — 1 U every 5 s</string>
+    <string name="ypso_bolus_speed_six" comment="Bolus delivery option: 6 units per minute, delivered as 0.5 units every 5 seconds.">6 U/min — 0.5 U every 5 s</string>
+    <string name="ypso_bolus_speed_three" comment="Bolus delivery option: 3 units per minute, delivered as 0.4 units every 8 seconds.">3 U/min — 0.4 U every 8 s</string>
+    <string name="ypso_battery_value" comment="%1$d=battery charge percentage. Example: 85%">%1$d%%</string>
+    <string name="ypso_duration_seconds" comment="%1$d=number of seconds. Short duration label. Example: 45 s">%1$d s</string>
+    <string name="ypso_duration_minutes" comment="%1$d=number of minutes. Short duration label. Example: 12 min">%1$d min</string>
+    <string name="ypso_duration_hours_minutes" comment="%1$d=hours, %2$d=minutes padded to two digits. Example: 3 h 07 min">%1$d h %2$02d min</string>
+</resources>
