@@ -1,6 +1,8 @@
 package app.aaps.pump.ypso
 
 import app.aaps.core.data.pump.defs.PumpType
+import app.aaps.core.interfaces.protection.ProtectionCheck
+import app.aaps.core.interfaces.pump.BlePreCheck
 import app.aaps.core.interfaces.pump.DetailedBolusInfo
 import app.aaps.core.interfaces.pump.PumpSync
 import app.aaps.core.interfaces.queue.CommandQueue
@@ -42,6 +44,11 @@ class YpsoPluginTest : TestBaseWithProfile() {
 
     @Mock lateinit var commandQueue: CommandQueue
 
+    // Only needed to construct the plugin: both are handed to the Compose content, which this
+    // test does not render.
+    @Mock lateinit var protectionCheck: ProtectionCheck
+    @Mock lateinit var blePreCheck: BlePreCheck
+
     private lateinit var ypsoPump: YpsoPump
     private lateinit var plugin: YpsoPlugin
 
@@ -62,7 +69,8 @@ class YpsoPluginTest : TestBaseWithProfile() {
         ypsoPump = YpsoPump(aapsLogger, preferences, dateUtil)
         plugin = YpsoPlugin(
             aapsLogger, rh, preferences, commandQueue, aapsSchedulers, rxBus, context,
-            fabricPrivacy, ypsoPump, notificationManager, pumpEnactResultProvider
+            fabricPrivacy, ypsoPump, protectionCheck, blePreCheck, notificationManager,
+            pumpEnactResultProvider
         )
     }
 
