@@ -3607,5 +3607,13 @@ machine the kernel kills the build and Gradle reports it as *"Gradle build daemo
 unexpectedly"*, which reads like a crash and is not. Override it per machine in
 `~/.gradle/gradle.properties`, which takes precedence over the project file.
 
+⚠ **Run the test suite with `TZ=UTC`.** `AutotunePrepTest.autotunePrepTest2` and
+`autotunePrepTest3` compare AAPS's autotune categorization against OpenAPS reference fixtures
+dated 2022-05-21 and bin glucose by time of day. Nothing in the build pins a timezone and the
+GitHub runners are UTC, so they fail on any machine that is not. Measured both ways on
+2026-10-23 with `--rerun-tasks`: Pacific/Auckland fails both, `TZ=UTC` passes, and the whole
+suite is green under UTC. It has nothing to do with this driver and is worth reporting
+upstream - the test should pin its own timezone.
+
 ⚠ And `./gradlew … | tail` makes the reported exit code `tail`'s, so a FAILED build looks like it
 passed. Redirect to a log and grep for `BUILD SUCCESSFUL` / `BUILD FAILED`.
