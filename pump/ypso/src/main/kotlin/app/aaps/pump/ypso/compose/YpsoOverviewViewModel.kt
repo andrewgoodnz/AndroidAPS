@@ -17,9 +17,8 @@ import app.aaps.core.interfaces.rx.collectResilient
 import app.aaps.core.interfaces.rx.events.EventPumpStatusChanged
 import app.aaps.core.interfaces.utils.DateUtil
 import app.aaps.core.interfaces.utils.fabric.FabricPrivacy
+import app.aaps.core.ui.compose.ScreenAction
 import app.aaps.core.ui.compose.StatusLevel
-import app.aaps.core.ui.compose.pump.ActionCategory
-import app.aaps.core.ui.compose.pump.PumpAction
 import app.aaps.core.ui.compose.pump.PumpCommunicationStatus
 import app.aaps.core.ui.compose.pump.PumpInfoRow
 import app.aaps.core.ui.compose.pump.PumpOverviewUiState
@@ -139,27 +138,26 @@ class YpsoOverviewViewModel(
             ),
             infoRows = infoRows(),
             primaryActions = listOf(
-                PumpAction(
+                ScreenAction(
                     label = rh.gs(R.string.ypso_refresh),
                     icon = Icons.Filled.Refresh,
                     onClick = ::onRefresh
                 ),
-                PumpAction(
+                ScreenAction(
                     label = rh.gs(R.string.ypso_read_history),
                     icon = Icons.Filled.History,
                     onClick = ::onReadHistory
                 ),
-                PumpAction(
+                ScreenAction(
                     label = rh.gs(R.string.ypso_set_clock),
                     icon = Icons.Filled.Schedule,
                     onClick = ::onSetClockRequested
                 )
             ),
             managementActions = listOf(
-                PumpAction(
+                ScreenAction(
                     label = rh.gs(R.string.ypso_pairing_title),
                     icon = Icons.Filled.Bluetooth,
-                    category = ActionCategory.MANAGEMENT,
                     onClick = ::onPairRequested
                 )
             ),
